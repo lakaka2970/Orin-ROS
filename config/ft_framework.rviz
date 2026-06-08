@@ -1,0 +1,76 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Radar Points
+      Enabled: true
+      Topic:
+        Depth: 5
+        Reliability: 1
+        Value: /ft/radar_display
+      Style: Flat Squares
+      Size (m): 0.5
+      Size (Pixels): 3
+      Color Transformer: RGB8
+      Decay Time: 0.5
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Radar Boxes
+      Enabled: true
+      Topic:
+        Depth: 5
+        Reliability: 1
+        Value: /ft/radar_boxes
+    - Class: rviz_default_plugins/Image
+      Name: Video Display
+      Enabled: true
+      Topic:
+        Depth: 5
+        Reliability: 1
+        Value: /ft/video_display
+    - Class: rviz_default_plugins/Image
+      Name: Colorbar
+      Enabled: true
+      Topic:
+        Depth: 5
+        Reliability: 1
+        Value: /ft/radar_colorbar
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Frame Info
+      Enabled: true
+      Topic:
+        Depth: 5
+        Reliability: 1
+        Value: /ft/radar_frame_info
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: radar
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Target Frame: radar
+      Value: TopDownOrtho (rviz_default_plugins)
+    Saved:
+      - Class: rviz_default_plugins/Orbit
+        Name: Orbit View
+        Target Frame: radar
+      - Class: rviz_default_plugins/TopDownOrtho
+        Name: TopDownOrtho
+        Target Frame: radar
+  Window Geometry:
+    Width: 1400
+    Height: 900

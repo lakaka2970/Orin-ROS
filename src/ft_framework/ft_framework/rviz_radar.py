@@ -300,13 +300,14 @@ class RvizRadarNode(Node):
                 combined, colors, self.fixed_frame, stamp)
             self.pub_points.publish(pc_msg)
 
-        # ---- 转发 3D 目标框 ----
+        # ---- 合并并发布 3D 目标框 + 标尺数据 ----
+        merged_markers = MarkerArray()
         if self._latest_obj is not None:
-            self.pub_boxes.publish(self._latest_obj)
-
-        # ---- 转发标尺数据 ----
+            merged_markers.markers.extend(self._latest_obj.markers)
         if self._latest_ruler is not None:
-            self.pub_boxes.publish(self._latest_ruler)
+            merged_markers.markers.extend(self._latest_ruler.markers)
+        if merged_markers.markers:
+            self.pub_boxes.publish(merged_markers)
 
         # ---- 发布色带 ----
         if self.bridge is not None:

@@ -57,6 +57,7 @@ import rclpy
 from rclpy.node import Node
 
 from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
+from ft_framework.common import filter_det_points
 
 
 # ============================================================================
@@ -208,11 +209,18 @@ class RspCudaNode(Node):
             det.idx = 128
             det_list.points.append(det)
 
+        # ---- 应用 spec 6 条过滤规则 ----
+        filtered, fstats = filter_det_points(det_list.points)
+        det_list.points = filtered
+
         self.pub_det.publish(det_list)
         self.get_logger().info(
             f'[RSP-CUDA] 帧 #{self.frame_count}: '
-            f'生成 {len(det_list.points)} 个 DetPoint '
-            f'(SNR>{self.snr_threshold}dB, GPU 模式)')
+            f'{fstats["total"]} 候选 → {len(filtered)} 有效 '
+            f'(过滤: ROI={fstats["roi"]} 高度={fstats["height"]} '
+            f'RCS={fstats["rcs"]} 存在概率={fstats["exist_prob"]} '
+            f'SNA={fstats["sna"]} 模糊概率={fstats["ambgt_prob"]}, '
+            f'GPU 模式)')
 
     # ------------------------------------------------------------------
     # 销毁

@@ -38,17 +38,82 @@ from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch.conditions import IfCondition
+import os
+
+
+# ============================================================================
+# YAML 配置加载
+# ============================================================================
+
+def _load_yaml_config():
+    """从默认路径加载全局 YAML 配置文件。"""
+    config_path = os.path.join(os.getcwd(), 'config', 'ft_radar_params.yaml')
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f) or {}
+
+
+def _flatten_logging_cfg(cfg: dict) -> dict:
+    """将嵌套的 logging YAML 配置平展为 ROS2 参数名。"""
+    flat = {}
+    for k, v in cfg.items():
+        if k == 'max_frames':
+            for mk, mv in v.items():
+                flat[f'max_frames.{mk}'] = mv
+        elif k == 'switches':
+            for sk, sv in v.items():
+                flat[f'enable_{sk}'] = sv
+        else:
+            flat[k] = v
+    return flat
+
+
+def _flatten_vehicle_cfg(cfg: dict) -> dict:
+    """将嵌套的 vehicle_data_rx YAML 配置平展为 ROS2 参数名。"""
+    flat = {}
+    for k, v in cfg.items():
+        if k == 'defaults':
+            for dk, dv in v.items():
+                flat[f'defaults.{dk}'] = dv
+        else:
+            flat[k] = v
+    return flat
 
 
 def generate_launch_description():
     ld = LaunchDescription()
 
     # ========================================================================
+    # 加载 YAML 配置
+    # ========================================================================
+
+    yaml_config = _load_yaml_config()
+
+    adc_cfg      = yaml_config.get('adc_rx', {})
+    camera_cfg   = yaml_config.get('camera_rx', {})
+    vehicle_cfg  = _flatten_vehicle_cfg(yaml_config.get('vehicle_data_rx', {}))
+    rsp_cfg      = yaml_config.get('rsp', {})
+    rsp_py_cfg   = rsp_cfg.get('python', {})
+    rsp_cu_cfg   = rsp_cfg.get('cuda', {})
+    obj_cfg      = yaml_config.get('object_detection_3d', {})
+    ruler_cfg    = yaml_config.get('rviz_ruler', {})
+    log_cfg      = _flatten_logging_cfg(yaml_config.get('logging', {}))
+    system_cfg   = yaml_config.get('system', {})
+
+    # YAML 默认 RSP mode → Launch 参数的默认值
+    yaml_rsp_mode = rsp_cfg.get('default_mode', 'cuda')
+
+    # ========================================================================
     # Launch 参数声明
     # ========================================================================
 
     ld.add_action(DeclareLaunchArgument(
-        'rsp_mode', default_value='cuda',
+        'rsp_mode', default_value=yaml_rsp_mode,
         description='RSP 启动模式: python | cuda (default) | both | both_compare'))
 
     ld.add_action(DeclareLaunchArgument(
@@ -86,7 +151,7 @@ def generate_launch_description():
     # ========================================================================
 
     ld.add_action(LogInfo(
-        msg='=== FT Radar Framework: rsp_mode=[' + rsp_mode + '] ==='))
+        msg=['=== FT Radar Framework: rsp_mode=[', rsp_mode, '] ===']))
 
     # ========================================================================
     # 第一层：数据采集层 (3 个节点)
@@ -95,15 +160,15 @@ def generate_launch_description():
     ld.add_action(Node(
         package='ft_framework', executable='adc_rx', name='adc_rx',
         output='screen',
-        parameters=[{'fps': 15}]))
+        parameters=[{**adc_cfg, 'fps': 15}]))
     ld.add_action(Node(
         package='ft_framework', executable='camera_rx', name='camera_rx',
         output='screen',
-        parameters=[{'fps': 30}]))
+        parameters=[{**camera_cfg, 'fps': 30}]))
     ld.add_action(Node(
         package='ft_framework', executable='vehicle_data_rx',
         name='vehicle_data_rx', output='screen',
-        parameters=[{'fps': 50}]))
+        parameters=[{**vehicle_cfg, 'fps': 50}]))
 
     # ========================================================================
     # 第二层：雷达信号处理层 (按 mode 条件启动)
@@ -115,7 +180,7 @@ def generate_launch_description():
             package='ft_framework', executable='rsp_mil_python',
             name='rsp_mil_python', output='screen',
             condition=IfCondition(python_enabled),
-            parameters=[{'rsp_mode': rsp_mode}])]))
+            parameters=[{**rsp_py_cfg, 'rsp_mode': rsp_mode}])]))
 
     ld.add_action(TimerAction(
         period=0.5,
@@ -123,7 +188,7 @@ def generate_launch_description():
             package='ft_framework', executable='rsp_cuda',
             name='rsp_cuda', output='screen',
             condition=IfCondition(cuda_enabled),
-            parameters=[{'rsp_mode': rsp_mode}])]))
+            parameters=[{**rsp_cu_cfg, 'rsp_mode': rsp_mode}])]))
 
     # ========================================================================
     # 第三层：可视化与日志层
@@ -141,6 +206,7 @@ def generate_launch_description():
         package='ft_framework', executable='logging_node',
         name='logging_node', output='screen',
         parameters=[{
+            **log_cfg,
             'enable_adc':        LaunchConfiguration('log_adc'),
             'enable_image':      LaunchConfiguration('log_image'),
             'enable_det_list':   LaunchConfiguration('log_det_list'),
@@ -154,11 +220,13 @@ def generate_launch_description():
 
     ld.add_action(TimerAction(period=1.5, actions=[Node(
         package='ft_framework', executable='object_detection_3d',
-        name='object_detection_3d', output='screen')]))
+        name='object_detection_3d', output='screen',
+        parameters=[obj_cfg])]))
 
     ld.add_action(TimerAction(period=1.5, actions=[Node(
         package='ft_framework', executable='rviz_ruler',
-        name='rviz_ruler', output='screen')]))
+        name='rviz_ruler', output='screen',
+        parameters=[ruler_cfg])]))
 
     # ========================================================================
     # 完成日志

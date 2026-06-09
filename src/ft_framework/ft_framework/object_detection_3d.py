@@ -60,12 +60,40 @@ from ft_radar_msgs.msg import DetList, ObjList, Object3D
 from ft_framework.common import monotonic_us_stamp, create_header
 
 
-def simple_clustering(points_xyz: np.ndarray, dist_threshold: float) -> list:
-    """
-    简单欧氏距离聚类（BFS 实现）。
-    points_xyz: [N, 3] — (x, y, z)
-    返回: list of np.ndarray，每个元素是一个簇的点集
-    """
+def _clustering_kdtree(points_xyz: np.ndarray, dist_threshold: float) -> list:
+    """KDTree 空间索引聚类 — O(N log N)，适用于中大点云。"""
+    from scipy.spatial import KDTree
+    tree = KDTree(points_xyz)
+    visited = np.zeros(len(points_xyz), dtype=bool)
+    clusters = []
+
+    for i in range(len(points_xyz)):
+        if visited[i]:
+            continue
+        # 半径搜索获取邻居
+        indices = tree.query_ball_point(points_xyz[i], dist_threshold)
+        # BFS 扩展簇（防止单次半径搜索遗漏链接结构）
+        cluster_set = set(indices)
+        frontier = list(indices)
+        visited[i] = True  # 标记起始点
+        while frontier:
+            idx = frontier.pop()
+            if visited[idx]:
+                continue
+            visited[idx] = True
+            new_neighbors = tree.query_ball_point(points_xyz[idx], dist_threshold)
+            for nn in new_neighbors:
+                if nn not in cluster_set:
+                    cluster_set.add(nn)
+                    frontier.append(nn)
+        if cluster_set:
+            clusters.append(points_xyz[list(cluster_set)])
+
+    return clusters
+
+
+def _clustering_bfs(points_xyz: np.ndarray, dist_threshold: float) -> list:
+    """BFS 欧氏距离聚类 — O(N²) 最坏情况，用于 KDTree 不可用时的回退。"""
     if len(points_xyz) == 0:
         return []
 
@@ -90,6 +118,25 @@ def simple_clustering(points_xyz: np.ndarray, dist_threshold: float) -> list:
             clusters.append(points_xyz[indices])
 
     return clusters
+
+
+def simple_clustering(points_xyz: np.ndarray, dist_threshold: float) -> list:
+    """
+    欧氏距离聚类。
+
+    优先使用 scipy.spatial.KDTree (O(N log N))，
+    若 scipy 不可用则回退到 BFS 实现 (O(N²))。
+
+    points_xyz: [N, 3] — (x, y, z)
+    返回: list of np.ndarray，每个元素是一个簇的点集
+    """
+    if len(points_xyz) == 0:
+        return []
+
+    try:
+        return _clustering_kdtree(points_xyz, dist_threshold)
+    except ImportError:
+        return _clustering_bfs(points_xyz, dist_threshold)
 
 
 def create_box_marker(center: tuple, size: tuple, yaw: float,

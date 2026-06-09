@@ -36,6 +36,90 @@ def monotonic_us_stamp() -> tuple:
     return (sec, nsec)
 
 
+def filter_det_points(points: list,
+                       roi_x: tuple = (-80.0, 200.0),
+                       roi_y: tuple = (-40.0, 40.0),
+                       roi_z: tuple = (-15.0, 15.0),
+                       rcs_near_threshold: float = -40.0,
+                       rcs_far_threshold: float = -20.0,
+                       rcs_range_split: float = 10.0,
+                       exist_prob_min: int = 30,
+                       ambgt_prob_min: int = 40) -> list:
+    """
+    按 FT_radar_dataset_requirement.md §5.6 的 6 条规则过滤检测点。
+
+    过滤规则:
+      1. ROI 包围盒:   x∈[rx0, rx1], y∈[ry0, ry1], z∈[rz0, rz1]
+      2. 高度自适应:   |z| >= |x| × 0.1 + 2 → 剔除
+      3. RCS 分段:     range≤10m 且 RCS≤-40; range>10m 且 RCS≤-20 → 剔除
+      4. 存在概率:     exist_prob < 30 → 剔除
+      5. SNA 无效点:   idx == 255 → 剔除
+      6. 模糊概率:     ambgt_prob < 40 → 剔除
+
+    参数:
+      points:        DetPoint 对象列表
+      roi_x/y/z:     ROI 包围盒边界 (m)
+      rcs_near/far_threshold:  近/远场 RCS 阈值 (dBsm)
+      rcs_range_split:         近/远场分界距离 (m)
+      exist_prob_min:          存在概率最小阈值
+      ambgt_prob_min:          模糊概率最小阈值
+
+    返回:
+      过滤后的 DetPoint 列表及统计信息 dict:
+        {'passed': [...], 'total': N, 'filtered': K,
+         'roi': n1, 'height': n2, 'rcs': n3,
+         'exist_prob': n4, 'sna': n5, 'ambgt_prob': n6}
+    """
+    stats = {'total': len(points), 'filtered': 0,
+             'roi': 0, 'height': 0, 'rcs': 0,
+             'exist_prob': 0, 'sna': 0, 'ambgt_prob': 0}
+
+    passed = []
+    for p in points:
+        # 规则 1: ROI 包围盒
+        if not (roi_x[0] <= p.x <= roi_x[1] and
+                roi_y[0] <= p.y <= roi_y[1] and
+                roi_z[0] <= p.z <= roi_z[1]):
+            stats['roi'] += 1
+            continue
+
+        # 规则 2: 高度自适应过滤
+        if abs(p.z) >= abs(p.x) * 0.1 + 2.0:
+            stats['height'] += 1
+            continue
+
+        # 规则 3: RCS 分段过滤
+        if p.range <= rcs_range_split:
+            if p.rcs <= rcs_near_threshold:
+                stats['rcs'] += 1
+                continue
+        else:
+            if p.rcs <= rcs_far_threshold:
+                stats['rcs'] += 1
+                continue
+
+        # 规则 4: 存在概率
+        if p.exist_prob < exist_prob_min:
+            stats['exist_prob'] += 1
+            continue
+
+        # 规则 5: SNA 无效点 (idx == 255)
+        if p.idx == 255:
+            stats['sna'] += 1
+            continue
+
+        # 规则 6: 模糊概率
+        if p.ambgt_prob < ambgt_prob_min:
+            stats['ambgt_prob'] += 1
+            continue
+
+        passed.append(p)
+
+    stats['filtered'] = stats['total'] - len(passed)
+    stats['passed'] = passed
+    return passed, stats
+
+
 def create_header(frame_id: str, stamp) -> Header:
     """
     创建 ROS2 标准消息头。

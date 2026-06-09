@@ -241,7 +241,7 @@ ros2 param set /node param value   ← 运行时动态修改
 | rsp_mil_python | `snr_threshold` | 10.0 | SNR 阈值 (dB) |
 | rsp_cuda | `snr_threshold` | 8.0 | SNR 阈值 (dB) |
 | object_detection_3d | `cluster_distance` | 5.0 | 聚类距离 (m) |
-| logging_node | `output_dir` | ~/ft_radar_dataset | 日志输出目录 |
+| logging_node | `output_dir` | output/ft_dataset | 日志输出根目录（相对于工作区根目录） |
 
 ---
 
@@ -251,11 +251,12 @@ ros2 param set /node param value   ← 运行时动态修改
 
 | 通道 | 开关参数 | 最大帧数 | 输出文件 |
 |:----:|----------|:--------:|----------|
-| ADC | `enable_adc` | 100 | `adc.bin` |
-| Image | `enable_image` | 1000 | `{timestamp_us}.jpg` |
-| Det_List | `enable_det_list` | 1000 | `{timestamp_us}.csv` + `{timestamp_us}.pcd` |
-| Ego_Motion | `enable_ego_motion` | 1000 | `ego_motion.csv` (追加) |
-| Obj_List | `enable_obj_list` | 1000 | `{timestamp_us}.csv` |
+| ADC | `enable_adc` | 100 | `adc_data/{timestamp_us}.bin` (逐帧) |
+| Image | `enable_image` | 1000 | `camera_front_center/{timestamp_us}.jpg` |
+| Det_List | `enable_det_list` | 1000 | `pc_pcd_radar_front_center/{ts}.pcd` + `pc_csv_radar_front_center/{ts}.csv` |
+| Det_List_CUDA | `enable_det_list` | 1000 | `pc_pcd_radar_front_center/{ts}_cuda.pcd` + `pc_csv_radar_front_center/{ts}_cuda.csv` |
+| Ego_Motion | `enable_ego_motion` | 1000 | `ego_motion.csv` (单文件追加，位于数据集根目录) |
+| Obj_List | `enable_obj_list` | 1000 | `obj_csv_radar/{timestamp_us}.csv` |
 
 ### 运行时控制
 
@@ -274,9 +275,10 @@ ros2 param set /logging_node output_dir /home/lzy/my_dataset
 
 - **异步写入**: 独立线程 + 队列，不阻塞 ROS2 节点主循环
 - **帧数上限**: 达到上限自动停止并告警，**不循环覆盖**
-- **自动创建目录**: 首次运行自动创建 `output_dir` 及其子目录
-- **ego_motion.csv**: 单文件追加写入，带 CSV 表头
-- **逐帧文件**: 图片/DetList/ObjList 按 `{timestamp_us}` 命名
+- **自动创建目录**: 首次运行自动创建完整的 dataset 子目录结构
+- **ego_motion.csv**: 位于数据集根目录，单文件追加写入，带 CSV 表头
+- **逐帧文件**: ADC / 图片 / DetList / ObjList 按 `{timestamp_us}.ext` 命名，分目录存储
+- **DetList 双路**: `both` 模式下，CUDA 检测数据以 `{ts}_cuda` 后缀保存，与 Python 输出区分
 
 ### 启动 Logging
 
@@ -286,10 +288,10 @@ Logging 节点随 `ros2 launch ft_framework ft_radar_launch.py` 自动启动（1
 ```bash
 # 1. 检查启动日志中的错误信息
 # 2. 确认输出目录可写
-ls -la ~/ft_radar_dataset
+ls -la output/ft_dataset
 
 # 3. 手动启动（调试用）
-ros2 run ft_framework logging_node --ros-args -p output_dir:=~/ft_radar_dataset
+ros2 run ft_framework logging_node --ros-args -p output_dir:=output/ft_dataset
 ```
 
 ---

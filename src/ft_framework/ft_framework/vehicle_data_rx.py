@@ -172,7 +172,7 @@ class VehicleDataRxNode(Node):
             msg.gear = self._defaults['gear']
             msg.is_default = True
 
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'车辆数据超时 ({elapsed_ns / 1e9:.2f}s)，使用默认值')
         else:
             # 模拟 CAN 总线有效数据
@@ -205,7 +205,7 @@ class VehicleDataRxNode(Node):
         """(测试用) 强制触发超时，模拟总线数据丢失"""
         self._last_valid_time = self.get_clock().now() - \
             rclpy.duration.Duration(seconds=2 * self._timeout_ns / 1e9)
-        self.get_logger().warn('模拟车辆数据丢失...')
+        self.get_logger().warning('模拟车辆数据丢失...')
 
     # ------------------------------------------------------------------
     # 销毁

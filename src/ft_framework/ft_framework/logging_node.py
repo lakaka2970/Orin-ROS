@@ -109,7 +109,11 @@ class AsyncWriter:
         self._thread.start()
 
     def enqueue(self, file_path: str, data: bytes, mode: str = 'wb'):
-        self._queue.put((file_path, data, mode))
+        self._queue.put(('write', (file_path, data, mode)))
+
+    def enqueue_task(self, task):
+        """将可调用任务入队，在写入线程中执行（用于卸载重计算）。"""
+        self._queue.put(('task', task))
 
     def stop(self):
         self._stop_event.set()
@@ -122,14 +126,18 @@ class AsyncWriter:
                 item = self._queue.get(timeout=1)
                 if item is None:
                     break
-                fpath, data, mode = item
-                os.makedirs(os.path.dirname(fpath), exist_ok=True)
-                with open(fpath, mode) as f:
-                    f.write(data)
+                tag, payload = item
+                if tag == 'write':
+                    fpath, data, mode = payload
+                    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+                    with open(fpath, mode) as f:
+                        f.write(data)
+                elif tag == 'task':
+                    payload()
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f'[AsyncWriter] 写入失败 {fpath}: {e}')
+                print(f'[AsyncWriter] 任务失败: {e}')
 
 
 # ============================================================================
@@ -170,11 +178,12 @@ class LoggingNode(Node):
 
         # ---- 帧数上限 ----
         self._max_frames = {
-            'adc':        int(self.get_parameter('max_frames.adc').value),
-            'image':      int(self.get_parameter('max_frames.image').value),
-            'det_list':   int(self.get_parameter('max_frames.det_list').value),
-            'ego_motion': int(self.get_parameter('max_frames.ego_motion').value),
-            'obj_list':   int(self.get_parameter('max_frames.obj_list').value),
+            'adc':          int(self.get_parameter('max_frames.adc').value),
+            'image':        int(self.get_parameter('max_frames.image').value),
+            'det_list':     int(self.get_parameter('max_frames.det_list').value),
+            'det_list_cuda':int(self.get_parameter('max_frames.det_list').value),
+            'ego_motion':   int(self.get_parameter('max_frames.ego_motion').value),
+            'obj_list':     int(self.get_parameter('max_frames.obj_list').value),
         }
 
         # ---- 创建子目录 ----
@@ -216,6 +225,9 @@ class LoggingNode(Node):
             Image, '/camera/image_raw', self._on_image, 10)
         self.sub_det = self.create_subscription(
             DetList, '/processing/radar/det_list', self._on_det_list, 10)
+        self.sub_det_cu = self.create_subscription(
+            DetList, '/processing/radar/det_list_cuda',
+            self._on_det_list_cuda, 10)
         self.sub_ego = self.create_subscription(
             EgoMotion, '/vehicle/ego_motion', self._on_ego, 10)
         self.sub_obj = self.create_subscription(
@@ -273,60 +285,84 @@ class LoggingNode(Node):
         except Exception as e:
             self.get_logger().error(f'Image 写入失败: {e}')
 
-    def _on_det_list(self, msg: DetList):
+    def _on_det_list(self, msg: DetList, source: str = ''):
         """
         DetList → 同时输出:
-          pc_pcd_radar_front_center/<timestamp_us>.pcd
-          pc_csv_radar_front_center/<timestamp_us>.csv
+          pc_pcd_radar_front_center/<timestamp_us>[source].pcd
+          pc_csv_radar_front_center/<timestamp_us>[source].csv
+        source 参数: '' = 主话题 (单路模式), '_cuda' = CUDA 双路模式
         """
-        if not self._get_switch('enable_det_list', 'det_list'):
+        channel = 'det_list_cuda' if source == '_cuda' else 'det_list'
+        if not self._get_switch('enable_det_list', channel):
             return
         ts = get_timestamp_us(msg)
         n = len(msg.points)
         if n == 0:
             return
 
-        # ---- PCD (v0.7 ASCII) ----
-        pcd_lines = [
-            '# .PCD v0.7 - Point Cloud Data file format',
-            'VERSION 0.7',
-            'FIELDS x y z range azimuth elevation RCS SNR ambgt '
-            'exist_prob multi_tgt_prob ambgt_prob raw_doppler idx',
-            'SIZE 4 4 4 4 4 4 4 4 4 1 1 1 4 1',
-            'TYPE F F F F F F F F F U U U F U',
-            'COUNT 1 1 1 1 1 1 1 1 1 1 1 1 1 1',
-            f'WIDTH {n}',
-            'HEIGHT 1',
-            'VIEWPOINT 0 0 0 1 0 0 0',
-            f'POINTS {n}',
-            'DATA ascii',
-        ]
-        for p in msg.points:
-            pcd_lines.append(
-                f'{p.x} {p.y} {p.z} {p.range} {p.azimuth} {p.elevation} '
-                f'{p.rcs} {p.snr} {p.ambgt} '
-                f'{p.exist_prob} {p.multi_tgt_prob} {p.ambgt_prob} '
-                f'{p.raw_doppler} {p.idx}')
+        # ---- 将 PCD/CSV 字符串构建移入异步写线程 ----
+        self._writer.enqueue_task(
+            self._build_det_list_task(ts, msg, source))
 
-        pcd_path = os.path.join(self._dirs['det_list_pcd'], f'{ts}.pcd')
-        self._writer.enqueue(pcd_path, '\n'.join(pcd_lines).encode(), 'wb')
+        self._frame_counts[channel] += 1
 
-        # ---- CSV（逗号分隔） ----
-        csv_lines = [
-            'x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,'
-            'exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx'
-        ]
-        for p in msg.points:
-            csv_lines.append(
-                f'{p.x},{p.y},{p.z},{p.range},{p.azimuth},{p.elevation},'
-                f'{p.rcs},{p.snr},{p.ambgt},'
-                f'{p.exist_prob},{p.multi_tgt_prob},{p.ambgt_prob},'
-                f'{p.raw_doppler},{p.idx}')
+    def _on_det_list_cuda(self, msg: DetList):
+        """CUDA 专属话题回调（双路模式）"""
+        self._on_det_list(msg, source='_cuda')
 
-        csv_path = os.path.join(self._dirs['det_list_csv'], f'{ts}.csv')
-        self._writer.enqueue(csv_path, '\n'.join(csv_lines).encode(), 'wb')
+    def _build_det_list_task(self, ts: int, msg: DetList, source: str = ''):
+        """构建 PCD + CSV 写入任务（在 AsyncWriter 线程中执行）。"""
+        n = len(msg.points)
+        suffix = source  # '' or '_cuda'
 
-        self._frame_counts['det_list'] += 1
+        def _task():
+            # ---- PCD (v0.7 ASCII) ----
+            pcd_lines = [
+                '# .PCD v0.7 - Point Cloud Data file format',
+                'VERSION 0.7',
+                'FIELDS x y z range azimuth elevation RCS SNR ambgt '
+                'exist_prob multi_tgt_prob ambgt_prob raw_doppler idx',
+                'SIZE 4 4 4 4 4 4 4 4 4 1 1 1 4 1',
+                'TYPE F F F F F F F F F U U U F U',
+                'COUNT 1 1 1 1 1 1 1 1 1 1 1 1 1 1',
+                f'WIDTH {n}',
+                'HEIGHT 1',
+                'VIEWPOINT 0 0 0 1 0 0 0',
+                f'POINTS {n}',
+                'DATA ascii',
+            ]
+            for p in msg.points:
+                pcd_lines.append(
+                    f'{p.x} {p.y} {p.z} {p.range} {p.azimuth} {p.elevation} '
+                    f'{p.rcs} {p.snr} {p.ambgt} '
+                    f'{p.exist_prob} {p.multi_tgt_prob} {p.ambgt_prob} '
+                    f'{p.raw_doppler} {p.idx}')
+
+            pcd_path = os.path.join(
+                self._dirs['det_list_pcd'], f'{ts}{suffix}.pcd')
+            os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
+            with open(pcd_path, 'wb') as f:
+                f.write('\n'.join(pcd_lines).encode())
+
+            # ---- CSV（逗号分隔） ----
+            csv_lines = [
+                'x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,'
+                'exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx'
+            ]
+            for p in msg.points:
+                csv_lines.append(
+                    f'{p.x},{p.y},{p.z},{p.range},{p.azimuth},{p.elevation},'
+                    f'{p.rcs},{p.snr},{p.ambgt},'
+                    f'{p.exist_prob},{p.multi_tgt_prob},{p.ambgt_prob},'
+                    f'{p.raw_doppler},{p.idx}')
+
+            csv_path = os.path.join(
+                self._dirs['det_list_csv'], f'{ts}{suffix}.csv')
+            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            with open(csv_path, 'wb') as f:
+                f.write('\n'.join(csv_lines).encode())
+
+        return _task
 
     def _on_ego(self, msg: EgoMotion):
         """EgoMotion → ego_motion.csv（单文件追加，逗号分隔）"""

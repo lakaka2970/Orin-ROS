@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FT 雷达信号处理节点 —— Python/MIL 实现 (R SP MIL Python)
+FT 雷达信号处理节点 —— Python/MIL 实现 (RSP MIL Python)
 ================================================================================
-融合 ADC 数据和车辆数据，执行雷达信号处理（模拟实现），
-解决速度模糊问题，输出检测目标列表。
+融合 ADC 数据和车辆数据，执行雷达信号处理（模拟），
+输出检测目标列表 DetList。
 
-订阅话题：
-  /ft/adc_data       PointCloud2    雷达 ADC 原始点云
-  /ft/vehicle_data   TwistStamped   车辆动态数据
+规格:
+  - 处理帧率: 10 Hz
+  - 输出字段: DetPoint 14 字段与 FT_radar_dataset_requirement 完全对齐
+  - 启动模式: 通过 rsp_mode 参数控制启停
 
-发布话题：
-  /ft/det_list_py    PointCloud2    检测目标列表 (x, y, z, velocity, snr)
+话题:
+  订阅: /adc/raw_data         ft_radar_msgs/AdcRawData
+        /vehicle/ego_motion   ft_radar_msgs/EgoMotion
+  发布: /processing/radar/det_list  ft_radar_msgs/DetList（仅在 python/both/both_compare 模式）
 
-连接关系：
+连接关系:
   ← ADC Rx (sub)
   ← Vehicle Data Rx (sub)
   → Rviz_radar (pub)
   → 3D Object Detection (pub)
   → Logging (pub)
 
-作者：zhengyuan.liu
-日期：2026.6.8
+作者: zhengyuan.liu
+日期: 2026.6.8
 ================================================================================
 """
 
@@ -30,9 +33,15 @@ FT 雷达信号处理节点 —— Python/MIL 实现 (R SP MIL Python)
 # ============================================================================
 
 # ---------- 处理参数 ----------
-PROCESSING_FPS = 10.0        # 处理帧率 (Hz)
-SNR_THRESHOLD  = 10.0        # 信噪比阈值 (dB)，低于此值的点被过滤
-VELOCITY_SCALE = 0.5         # 速度估算缩放因子
+PROCESSING_FPS  = 10.0        # 处理帧率 (Hz)
+SNR_THRESHOLD   = 10.0        # 信噪比阈值 (dB)
+VELOCITY_SCALE  = 0.5         # 速度估算缩放因子
+
+# ---------- 模拟检测参数 ----------
+SIM_NUM_TARGETS = 30          # 每帧模拟检测目标数
+SIM_RANGE_MAX   = 300.0       # 最大探测距离 (m)
+SIM_RANGE_MIN   = 30.0        # 最小探测距离 (m)
+SIM_AZ_RANGE    = 45.0        # 方位角范围 (±°)
 
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
@@ -41,57 +50,26 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
+import time
+import math
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
-from sensor_msgs.msg import PointCloud2, PointField
-from geometry_msgs.msg import TwistStamped
+
+from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
 
 
 # ============================================================================
-# 工具函数
+# 时间戳工具函数
 # ============================================================================
 
-def create_header(frame_id: str, stamp) -> Header:
-    """创建 ROS2 消息头"""
-    h = Header()
-    h.frame_id = frame_id
-    h.stamp = stamp
-    return h
-
-
-def create_det_list_pointcloud2(points: np.ndarray, frame_id: str,
-                                 stamp) -> PointCloud2:
-    """
-    创建检测列表 PointCloud2。
-
-    points: [N, 5] — (x, y, z, velocity_mps, snr_db)
-    """
-    N = len(points)
-
-    fields = [
-        PointField(name='x',        offset=0,  datatype=PointField.FLOAT32, count=1),
-        PointField(name='y',        offset=4,  datatype=PointField.FLOAT32, count=1),
-        PointField(name='z',        offset=8,  datatype=PointField.FLOAT32, count=1),
-        PointField(name='velocity', offset=12, datatype=PointField.FLOAT32, count=1),
-        PointField(name='snr',      offset=16, datatype=PointField.FLOAT32, count=1),
-    ]
-
-    cloud = points.astype(np.float32)
-
-    msg = PointCloud2()
-    msg.header = create_header(frame_id, stamp)
-    msg.height = 1
-    msg.width = N
-    msg.fields = fields
-    msg.is_bigendian = False
-    msg.point_step = 20
-    msg.row_step = 20 * N
-    msg.is_dense = True
-    msg.data = cloud.tobytes() if N > 0 else b''
-    return msg
+def monotonic_us_stamp() -> tuple:
+    """获取单调时钟的微秒时间戳，返回 (sec, nanosec)"""
+    now_ns = time.monotonic_ns()
+    sec = int(now_ns // 1_000_000_000)
+    nsec = int(now_ns % 1_000_000_000)
+    return (sec, nsec)
 
 
 # ============================================================================
@@ -102,12 +80,16 @@ class RspMilPythonNode(Node):
     """
     Python 雷达信号处理节点
 
-    订阅话题：
-      /ft/adc_data       PointCloud2
-      /ft/vehicle_data   TwistStamped
+    话题:
+      订阅: /adc/raw_data       (AdcRawData)
+            /vehicle/ego_motion (EgoMotion)
+      发布: /processing/radar/det_list (DetList)
 
-    发布话题：
-      /ft/det_list_py    PointCloud2
+    功能说明:
+      - 接收 ADC 原始数据和车辆数据
+      - 执行 SNR 滤波和速度补偿（模拟）
+      - 输出 14 字段 DetPoint
+      - 通过 rsp_mode 参数控制: 仅 python/both/both_compare 模式时运行
     """
 
     def __init__(self):
@@ -115,48 +97,55 @@ class RspMilPythonNode(Node):
 
         # ---------- ROS2 参数声明 ----------
         self.declare_parameter('processing_fps', PROCESSING_FPS)
-        self.declare_parameter('snr_threshold',  SNR_THRESHOLD)
+        self.declare_parameter('snr_threshold', SNR_THRESHOLD)
         self.declare_parameter('velocity_scale', VELOCITY_SCALE)
-        self.declare_parameter('fixed_frame',    FIXED_FRAME)
+        self.declare_parameter('rsp_mode', 'cuda')       # 外部通过 node 参数传入
+        self.declare_parameter('fixed_frame', FIXED_FRAME)
 
         self.processing_fps = float(self.get_parameter('processing_fps').value)
         self.snr_threshold  = float(self.get_parameter('snr_threshold').value)
         self.velocity_scale = float(self.get_parameter('velocity_scale').value)
+        self.rsp_mode       = self.get_parameter('rsp_mode').value
         self.fixed_frame    = self.get_parameter('fixed_frame').value
 
         # ---------- 数据缓存 ----------
-        self._latest_adc = None
-        self._latest_vehicle = None
+        self._latest_adc     = None
+        self._latest_ego     = None
 
-        # ---------- 订阅者 ----------
-        self.sub_adc = self.create_subscription(
-            PointCloud2, '/ft/adc_data', self._on_adc, 10)
-        self.sub_vehicle = self.create_subscription(
-            TwistStamped, '/ft/vehicle_data', self._on_vehicle, 10)
+        # ---------- 订阅 ----------
+        self.create_subscription(
+            AdcRawData, '/adc/raw_data', self._on_adc, 10)
+        self.create_subscription(
+            EgoMotion, '/vehicle/ego_motion', self._on_ego, 10)
 
-        # ---------- 发布者 ----------
-        self.pub_det = self.create_publisher(PointCloud2, '/ft/det_list_py', 10)
+        # ---------- 发布（按模式条件） ----------
+        self._pub_enabled = self.rsp_mode in ('python', 'both', 'both_compare')
+        if self._pub_enabled:
+            self.pub_det = self.create_publisher(
+                DetList, '/processing/radar/det_list', 10)
+            self.get_logger().info(
+                f'RSP MIL Python 发布: /processing/radar/det_list')
+        else:
+            self.get_logger().info(
+                f'RSP MIL Python 已禁用 (rsp_mode={self.rsp_mode})')
 
-        # ---------- 处理定时器 ----------
-        period = 1.0 / self.processing_fps
-        self.timer = self.create_timer(period, self._on_process)
+        # ---------- 定时器 ----------
+        self.timer = self.create_timer(1.0 / self.processing_fps, self._on_process)
         self.frame_count = 0
 
         self.get_logger().info(
-            f'R SP MIL Python 启动: {self.processing_fps:.0f} Hz, '
-            f'SNR 阈值={self.snr_threshold} dB')
+            f'RSP MIL Python 启动: {self.processing_fps:.0f} Hz, '
+            f'SNR={self.snr_threshold} dB')
 
     # ------------------------------------------------------------------
     # 数据回调
     # ------------------------------------------------------------------
 
-    def _on_adc(self, msg: PointCloud2):
-        """接收 ADC 原始数据"""
+    def _on_adc(self, msg: AdcRawData):
         self._latest_adc = msg
 
-    def _on_vehicle(self, msg: TwistStamped):
-        """接收车辆动态数据"""
-        self._latest_vehicle = msg
+    def _on_ego(self, msg: EgoMotion):
+        self._latest_ego = msg
 
     # ------------------------------------------------------------------
     # 处理回调
@@ -164,69 +153,82 @@ class RspMilPythonNode(Node):
 
     def _on_process(self):
         """
-        模拟雷达信号处理 pipeline：
-        1. 读取缓存的 ADC 数据
-        2. SNR 滤波（去噪）
-        3. 车辆速度补偿（解决速度模糊）
-        4. 发布检测目标列表
+        模拟雷达信号处理 pipeline:
+          1. 从 ADC 数据提取时间戳
+          2. 获取车辆速度用于补偿
+          3. 生成模拟检测目标（SNR 滤波 + 速度补偿）
+          4. 填充 DetPoint 14 字段
+          5. 发布 DetList
         """
-        if self._latest_adc is None:
+        if not self._pub_enabled or self._latest_adc is None:
             return
 
         self.frame_count += 1
-        stamp = self.get_clock().now().to_msg()
+        sec, nsec = monotonic_us_stamp()
 
-        # 解析 ADC PointCloud2 → numpy
-        adc_data = np.frombuffer(self._latest_adc.data, dtype=np.float32)
-        if len(adc_data) == 0:
-            return
-        adc_data = adc_data.reshape(-1, 4)      # [x, y, z, intensity]
-
-        # 获取车辆速度用于补偿
+        # 获取车辆速度
         ego_vx = 0.0
-        ego_vy = 0.0
-        if self._latest_vehicle is not None:
-            ego_vx = self._latest_vehicle.twist.linear.x
-            ego_vy = self._latest_vehicle.twist.linear.y
+        if self._latest_ego is not None and not self._latest_ego.is_default:
+            ego_vx = self._latest_ego.vx
 
-        # 提取各字段
-        x = adc_data[:, 0]
-        y = adc_data[:, 1]
-        z = adc_data[:, 2]
-        intensity = adc_data[:, 3]
+        # ---- 模拟检测处理（替换为真实 RSP 算法） ----
+        n = SIM_NUM_TARGETS
+        ranges   = np.random.uniform(SIM_RANGE_MIN, SIM_RANGE_MAX, n)
+        azimuths = np.random.uniform(
+            -math.radians(SIM_AZ_RANGE), math.radians(SIM_AZ_RANGE), n)
+        elevations = np.random.uniform(-math.radians(5.0), math.radians(5.0), n)
 
-        # ---- SNR 滤波 ----
-        mask = intensity >= self.snr_threshold
-        x, y, z = x[mask], y[mask], z[mask]
-        snr = intensity[mask]
+        # 球→笛卡尔（车辆系）
+        x = ranges * np.cos(elevations) * np.cos(azimuths)
+        y = ranges * np.cos(elevations) * np.sin(azimuths)
+        z = ranges * np.sin(elevations)
 
-        if len(x) == 0:
-            self.get_logger().debug(
-                f'[RSP-PY] 帧 #{self.frame_count}: 所有点低于 SNR 阈值，跳过')
-            return
+        # SNR 过滤模拟
+        snrs = 20.0 * np.log10(SIM_RANGE_MAX / (ranges + 1e-3))
+        snrs = np.clip(snrs, 0, 60)
+        mask = snrs >= self.snr_threshold
+        valid_idx = np.where(mask)[0]
 
-        # ---- 模拟速度估算（含速度补偿） ----
-        distances = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-        # 径向速度 ≈ 距离变化率 - 车辆速度分量（简化模型）
-        radial_velocity = self.velocity_scale * (distances * 0.1 - ego_vx)
+        # 速度补偿
+        distances = ranges * 1.0
+        dopplers = self.velocity_scale * (distances * 0.01 - ego_vx)
 
-        # 构造检测列表 [N, 5]: (x, y, z, velocity, snr)
-        det_points = np.column_stack([x, y, z, radial_velocity, snr])
+        # ---- 构造 DetList ----
+        det_list = DetList()
+        det_list.header.stamp.sec = sec
+        det_list.header.stamp.nanosec = nsec
+        det_list.header.frame_id = self.fixed_frame
 
-        msg = create_det_list_pointcloud2(det_points, self.fixed_frame, stamp)
-        self.pub_det.publish(msg)
+        for i in valid_idx:
+            det = DetPoint()
+            det.x = float(x[i])
+            det.y = float(y[i])
+            det.z = float(z[i])
+            det.range = float(ranges[i])
+            det.azimuth = float(azimuths[i])
+            det.elevation = float(elevations[i])
+            det.rcs = -20.0 + np.random.uniform(-10, 10)   # 模拟 RCS
+            det.snr = float(snrs[i])
+            det.ambgt = 21.82                                # 典型值
+            det.exist_prob = int(np.random.randint(30, 100))  # ≥30 保留
+            det.multi_tgt_prob = 100
+            det.ambgt_prob = int(np.random.randint(40, 100))  # ≥40 保留
+            det.raw_doppler = float(dopplers[i])
+            det.idx = 128                                     # 有效值
+            det_list.points.append(det)
 
+        self.pub_det.publish(det_list)
         self.get_logger().info(
             f'[RSP-PY] 帧 #{self.frame_count}: '
-            f'输入 {len(adc_data)} 点 → SNR 过滤后 {len(det_points)} 点 → '
-            f'车速补偿 ego_vx={ego_vx:.1f} m/s → 发布 Det List')
+            f'生成 {len(det_list.points)} 个 DetPoint '
+            f'(SNR>{self.snr_threshold}dB, ego_vx={ego_vx:.1f}m/s)')
 
     # ------------------------------------------------------------------
     # 销毁
     # ------------------------------------------------------------------
 
     def destroy_node(self):
-        self.get_logger().info('R SP MIL Python 已停止')
+        self.get_logger().info(f'RSP MIL Python 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()
 
 
@@ -240,7 +242,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('R SP MIL Python 收到中断信号，正在退出...')
+        node.get_logger().info('RSP MIL Python 收到中断信号，正在退出...')
     finally:
         node.destroy_node()
         rclpy.shutdown()

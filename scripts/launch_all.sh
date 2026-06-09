@@ -1,13 +1,16 @@
 #!/bin/bash
 # ============================================================================
-# FT Framework — 一键启动脚本
+# FT Radar Framework — 一键启动脚本
 # ============================================================================
-# 用法：
-#   bash scripts/launch_all.sh       # 使用 launch 文件启动全部节点
-#   bash scripts/launch_all.sh --rviz # 同时启动 RViz2
+# 用法:
+#   bash scripts/launch_all.sh                      # 默认 CUDA 模式
+#   bash scripts/launch_all.sh python               # Python 模式
+#   bash scripts/launch_all.sh cuda --rviz          # CUDA 模式 + RViz
+#   bash scripts/launch_all.sh both_compare         # 双路对比模式
+#   bash scripts/launch_all.sh cuda log_image:=false # 自定义 Logging 开关
 #
-# 作者：zhengyuan.liu
-# 日期：2026.6.8
+# 作者: zhengyuan.liu
+# 日期: 2026.6.8
 # ============================================================================
 
 set -e
@@ -15,8 +18,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+RSP_MODE="${1:-cuda}"        # 默认 CUDA 模式
+RVIZ_FLAG="$2"               # --rviz 标志
+
 echo "=============================================="
-echo "  FT Framework — 启动脚本"
+echo "  FT Radar Framework — 启动脚本"
+echo "  模式: $RSP_MODE"
 echo "=============================================="
 
 # 加载 ROS2 环境
@@ -33,44 +40,33 @@ fi
 
 cd "$PROJECT_ROOT"
 
-# 启动全部节点
-echo "[INFO] 启动 FT Framework (10 个节点)..."
-ros2 launch ft_framework ft_framework.launch.py &
+# 启动所有节点
+echo "[INFO] 启动 FT Radar Framework (rsp_mode=$RSP_MODE)..."
+ros2 launch ft_framework ft_radar_launch.py rsp_mode:=$RSP_MODE &
 LAUNCH_PID=$!
 
 # 可选启动 RViz2
-if [ "$1" = "--rviz" ]; then
-    echo "[INFO] 等待节点初始化..."
-    sleep 2
+if [ "$RVIZ_FLAG" = "--rviz" ]; then
     echo "[INFO] 启动 RViz2..."
-    if [ -f config/ft_framework.rviz ]; then
-        rviz2 -d config/ft_framework.rviz &
-        RVIZ_PID=$!
+    sleep 2
+    if [ -f config/ft_radar.rviz ]; then
+        rviz2 -d config/ft_radar.rviz &
     else
         rviz2 &
-        RVIZ_PID=$!
     fi
+    RVIZ_PID=$!
 fi
 
 echo ""
-echo "=============================================="
-echo "  FT Framework 已启动"
 echo "  按 Ctrl+C 停止所有节点"
-echo "=============================================="
 
-# 捕获退出信号
 cleanup() {
     echo ""
-    echo "[INFO] 正在停止所有节点..."
-    kill $LAUNCH_PID 2>/dev/null
-    if [ -n "$RVIZ_PID" ]; then
-        kill $RVIZ_PID 2>/dev/null
-    fi
-    echo "[OK] 已停止"
+    echo "[INFO] 正在停止..."
+    kill $LAUNCH_PID 2>/dev/null || true
+    [ -n "$RVIZ_PID" ] && kill $RVIZ_PID 2>/dev/null || true
     exit 0
 }
 
 trap cleanup SIGINT SIGTERM
-
-# 等待
 wait $LAUNCH_PID

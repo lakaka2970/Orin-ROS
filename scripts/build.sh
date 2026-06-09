@@ -1,13 +1,17 @@
 #!/bin/bash
 # ============================================================================
-# FT Framework — 一键构建脚本
+# FT Radar Framework — 一键构建脚本
 # ============================================================================
-# 用法：
-#   bash scripts/build.sh           # 增量构建
-#   bash scripts/build.sh --clean   # 清理后重新构建
+# 用法:
+#   bash scripts/build.sh                # 增量构建
+#   bash scripts/build.sh --clean        # 清理后重新构建
 #
-# 作者：zhengyuan.liu
-# 日期：2026.6.8
+# 构建两个包:
+#   ft_radar_msgs  — 自定义消息类型
+#   ft_framework   — 10 个 ROS2 节点
+#
+# 作者: zhengyuan.liu
+# 日期: 2026.6.8
 # ============================================================================
 
 set -e
@@ -16,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 echo "=============================================="
-echo "  FT Framework — 构建脚本"
+echo "  FT Radar Framework — 构建脚本"
 echo "  项目根目录: $PROJECT_ROOT"
 echo "=============================================="
 
@@ -39,8 +43,13 @@ if [ "$1" = "--clean" ]; then
     echo "[OK] 清理完成"
 fi
 
-# 构建
-echo "[INFO] 开始构建 ft_framework..."
+# 构建（先消息包，再功能包）
+echo "[INFO] 开始构建 ft_radar_msgs (自定义消息)..."
+colcon build --packages-select ft_radar_msgs --symlink-install
+
+source install/setup.bash
+
+echo "[INFO] 开始构建 ft_framework (节点)..."
 colcon build --packages-select ft_framework --symlink-install
 
 if [ $? -eq 0 ]; then
@@ -48,9 +57,9 @@ if [ $? -eq 0 ]; then
     echo "=============================================="
     echo "  构建成功！"
     echo ""
-    echo "  下一步："
+    echo "  下一步:"
     echo "    source install/setup.bash"
-    echo "    ros2 launch ft_framework ft_framework.launch.py"
+    echo "    ros2 launch ft_framework ft_radar_launch.py"
     echo "=============================================="
 else
     echo ""

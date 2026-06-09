@@ -1,6 +1,6 @@
-# FT Radar-Camera-Vehicle Fusion Framework
+# FT Radar Fusion Framework — ROS2 Humble
 
-基于 ROS2 Humble 的雷达-相机-车辆数据融合感知框架，运行于 **NVIDIA Jetson AGX Orin 64GB** 嵌入式计算平台。
+基于 ROS2 Humble 的雷达-相机-车辆多传感器融合感知框架，运行于 **NVIDIA Jetson AGX Orin 64GB**。
 
 [![ROS2](https://img.shields.io/badge/ROS2-Humble-brightgreen)](https://docs.ros.org/en/humble/)
 [![Python](https://img.shields.io/badge/Python-3.10-blue)](https://www.python.org/)
@@ -12,346 +12,372 @@
 ## 目录
 
 - [系统概述](#系统概述)
-- [项目结构](#项目结构)
-- [环境要求](#环境要求)
 - [快速开始](#快速开始)
-- [框架架构](#框架架构)
+- [启动模式](#启动模式)
+- [系统架构](#系统架构)
 - [节点说明](#节点说明)
-- [话题列表](#话题列表)
-- [RViz 可视化](#rviz-可视化)
+- [话题总表](#话题总表)
+- [消息定义](#消息定义)
+- [数据格式](#数据格式)
+- [时间戳机制](#时间戳机制)
 - [参数配置](#参数配置)
+- [Logging 系统](#logging-系统)
 - [开发指南](#开发指南)
-- [参考文档](#参考文档)
+- [项目结构](#项目结构)
 
 ---
 
 ## 系统概述
 
-本框架实现了一个完整的 **雷达-相机-车辆多传感器融合感知系统**，包含 10 个 ROS2 节点，分布在四个逻辑层级中，通过发布/订阅机制进行通信。
+本框架实现了一个完整的 **雷达-相机-车辆多传感器融合感知系统**，共 10 个 ROS2 节点，分布在四个逻辑层级中：
+
+### 数据流架构
 
 ```
-[ADC Rx] ──pub──→ [R SP MIL Python] ──pub──→ [3D Object Detection] ──pub──→ [Rviz_radar]
-    │                    │                        ↑
-    ├──pub──→ [R SP Cuda] ─pub───────────────────┘
-    │
-    └──pub──→ [Logging] ←──pub── [Camera Rx] ─pub──→ [Rviz_Image]
-                        ↑
-[Vehicle Data Rx] ──pub──┘
-                        ↑
-[Rviz_Ruler] ──pub──────→ [Rviz_radar]
+[ADC Rx] ─pub→ /adc/raw_data ─────────────────────────────────→ [Logging]
+                      │
+              ┌───────┴───────┐
+              ▼               ▼
+    [RSP MIL Python]     [RSP Cuda]         [Camera Rx] ─pub→ /camera/image_raw ─→ [Rviz_Image]
+              │               │                                        │
+     ┌────────┘               └────────┐                               └─→ [Logging]
+     ▼                                 ▼
+/processing/radar/det_list   /processing/radar/det_list_cuda
+     │                                                    │
+     ├────────────→ [3D Object Detection] ──pub→ /perception/objects ──→ [Rviz_radar, Logging]
+     │                                                         │
+     └─────────────────────→ [Rviz_radar] ←──────pub← [Rviz_Ruler] ← /visualization/ruler
+
+[Vehicle Rx] ─pub→ /vehicle/ego_motion ──→ [RSP Python, RSP Cuda, Logging]
 ```
 
-**核心数据流向：**
-1. **三条数据输入流**：雷达 ADC 数据、相机视频数据、车辆 CAN/ETH 数据
-2. **双路径雷达信号处理**：Python 版与 CUDA 版并行处理，均执行速度模糊消除
-3. **3D 目标检测**：基于 AI 模型（模拟）的 3D 目标检测与分类
-4. **统一可视化**：Rviz_radar 汇聚多源数据进行综合显示
-5. **全量日志**：Logging 节点收集所有原始数据和中间结果
+### 核心特性
 
----
-
-## 项目结构
-
-```
-Orin-ROS/
-├── README.md                         # 项目主文档（本文件）
-├── .gitignore                        # Git 忽略规则
-│
-├── src/
-│   └── ft_framework/                 # ROS2 功能包
-│       ├── package.xml               # 包清单（依赖声明）
-│       ├── setup.py                  # Python 包安装脚本（10 个节点入口）
-│       ├── setup.cfg                 # ROS2 Python 包配置
-│       ├── resource/
-│       │   └── ft_framework          # ament 资源标记
-│       ├── launch/
-│       │   └── ft_framework.launch.py  # 全系统启动文件
-│       └── ft_framework/
-│           ├── __init__.py
-│           ├── adc_rx.py             # 节点 1：雷达 ADC 数据接收
-│           ├── camera_rx.py          # 节点 2：相机数据接收
-│           ├── vehicle_data_rx.py    # 节点 3：车辆数据接收
-│           ├── rsp_mil_python.py     # 节点 4：Python 雷达信号处理
-│           ├── rsp_cuda.py           # 节点 5：CUDA 雷达信号处理
-│           ├── rviz_radar.py         # 节点 6：雷达可视化
-│           ├── rviz_image.py         # 节点 7：图像可视化
-│           ├── logging_node.py       # 节点 8：数据日志记录
-│           ├── object_detection_3d.py  # 节点 9：3D 目标检测
-│           └── rviz_ruler.py         # 节点 10：标尺参考
-│
-├── config/
-│   └── ft_framework.rviz             # RViz2 配置文件
-│
-├── docs/
-│   ├── architecture.md               # 架构设计文档
-│   └── user_guide.md                 # 用户使用指南
-│
-├── scripts/
-│   ├── build.sh                      # 一键构建脚本
-│   └── launch_all.sh                 # 一键启动脚本
-│
-└── 参考/                             # 参考资料
-    ├── 框架描述.md                    # 原始框架描述文档
-    └── FT_visualizer/                # 参考可视化工具
-        ├── README.md
-        ├── rviz_FT_visualizer_xy.py
-        ├── rviz_FT_visualizer_xy_simple.py
-        └── data/
-```
-
----
-
-## 环境要求
-
-| 项目 | 版本/说明 |
-|------|-----------|
-| 操作系统 | Ubuntu 20.04 (Jetpack 5.1.2) |
-| ROS2 发行版 | Humble |
-| Python | 3.10+ |
-| 关键依赖 | `rclpy`, `sensor_msgs`, `visualization_msgs`, `geometry_msgs`, `tf2_ros`, `cv_bridge` |
-| Python 依赖 | `numpy>=1.21.0`, `opencv-python>=4.5.0` |
-
-> **注意**：`cv_bridge`、`numpy` 随 ROS2 完整安装，无需额外 pip 安装。  
-> 上电顺序：**Radar（雷达）和 Camera（相机）先上电，然后再启动 Orin 计算平台。**
+| 特性 | 说明 |
+|------|------|
+| **自定义消息** | 6 种 .msg 类型，与 FT_radar_dataset_requirement 完全对齐 |
+| **双路径 RSP** | Python 和 CUDA 可切换/并行，4 种启动模式 |
+| **全局时间戳** | 微秒 (μs) 精度，`time.monotonic_ns()` 统一时钟源，全程透传 |
+| **参数集中管理** | 所有节点参数统一配置于 `config/ft_radar_params.yaml` |
+| **Logging 系统** | 5 通道独立开关、帧数上限、异步写入、多格式输出（CSV/PCD/JPEG/BIN）|
+| **运行时动态配置** | Logging 开关支持 `ros2 param set` 运行时切换 |
+| **条件启动** | Launch 文件根据 `rsp_mode` 选择性启动 RSP 节点，0 冗余进程 |
 
 ---
 
 ## 快速开始
 
-### 1. 克隆并构建
-
 ```bash
-# 进入工作空间
 cd ~/Orin-ROS
 
-# 构建（首次）
-colcon build --packages-select ft_framework --symlink-install
-
-# 或使用脚本
-bash scripts/build.sh
-```
-
-### 2. 加载环境
-
-```bash
+# 1. 加载环境
 source /opt/ros/humble/setup.bash
+
+# 2. 构建消息包（首次需先构建 msg）
+colcon build --packages-select ft_radar_msgs --symlink-install
 source install/setup.bash
-```
 
-### 3. 启动全部节点
+# 3. 构建功能包
+colcon build --packages-select ft_framework --symlink-install
+source install/setup.bash
 
-```bash
-# 方式一：Launch 文件（推荐）
-ros2 launch ft_framework ft_framework.launch.py
+# 4. 启动（默认 CUDA 模式）
+ros2 launch ft_framework ft_radar_launch.py
 
-# 方式二：脚本启动
+# 5. 或使用一键脚本
 bash scripts/launch_all.sh
 ```
 
-### 4. 单独启动某个节点
+### 构建脚本
 
 ```bash
-ros2 run ft_framework adc_rx                    # 雷达 ADC 接收
-ros2 run ft_framework camera_rx                 # 相机接收
-ros2 run ft_framework vehicle_data_rx           # 车辆数据接收
-ros2 run ft_framework rsp_mil_python            # Python 信号处理
-ros2 run ft_framework rsp_cuda                  # CUDA 信号处理
-ros2 run ft_framework rviz_radar                # 雷达可视化
-ros2 run ft_framework rviz_image                # 图像可视化
-ros2 run ft_framework logging_node              # 数据日志
-ros2 run ft_framework object_detection_3d       # 3D 目标检测
-ros2 run ft_framework rviz_ruler                # 标尺参考
-```
-
-### 5. 启动 RViz2 可视化
-
-```bash
-# 使用预配置文件
-rviz2 -d config/ft_framework.rviz
-
-# 或手动配置
-rviz2
-# 在 RViz 中设置 Fixed Frame 为 "radar"
-# 添加 /ft/radar_display (PointCloud2)、/ft/radar_boxes (MarkerArray)、/ft/video_display (Image)
-```
-
-### 6. 查看运行状态
-
-```bash
-# 查看所有节点
-ros2 node list
-
-# 查看所有话题
-ros2 topic list
-
-# 查看话题连接详情
-ros2 topic info /ft/adc_data --verbose
-ros2 topic info /ft/det_list_py --verbose
-
-# 实时查看话题数据
-ros2 topic echo /ft/vehicle_data
+bash scripts/build.sh            # 增量构建
+bash scripts/build.sh --clean    # 全量重构建
 ```
 
 ---
 
-## 框架架构
+## 启动模式
+
+框架支持 **4 种 RSP 启动模式**，通过 `rsp_mode` Launch 参数控制：
+
+### 模式一览
+
+```bash
+# CUDA 模式（默认）— 仅启动 CUDA RSP
+ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda
+
+# Python 模式 — 仅启动 Python RSP
+ros2 launch ft_framework ft_radar_launch.py rsp_mode:=python
+
+# 双路并行 — Python + CUDA 独立运行
+ros2 launch ft_framework ft_radar_launch.py rsp_mode:=both
+
+# 双路对比 — 并行 + 输出差异对比
+ros2 launch ft_framework ft_radar_launch.py rsp_mode:=both_compare
+```
+
+### 模式对比
+
+| 模式 | Python RSP | CUDA RSP | 主话题 | CUDA 话题 | 适用场景 |
+|------|:----------:|:--------:|--------|-----------|----------|
+| `cuda` | ✗ | ✓ | `/processing/radar/det_list` | — | 生产部署，GPU 加速 |
+| `python` | ✓ | ✗ | `/processing/radar/det_list` | — | 开发调试，算法验证 |
+| `both` | ✓ | ✓ | `/processing/radar/det_list` | `/processing/radar/det_list_cuda` | 对比验证 |
+| `both_compare` | ✓ | ✓ | `/processing/radar/det_list` | `/processing/radar/det_list_cuda` | 差异分析 |
+
+### 自定义 Logging 开关
+
+```bash
+# 仅录制 ADC 和 EgoMotion，关闭其他通道
+ros2 launch ft_framework ft_radar_launch.py \
+  rsp_mode:=cuda \
+  log_image:=false \
+  log_det_list:=false \
+  log_obj_list:=false
+```
+
+---
+
+## 系统架构
 
 ### 四层逻辑架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ 第四层：高级感知与辅助层                                       │
-│  ┌─────────────────────┐    ┌──────────────┐                │
-│  │ 3D Object Detection │    │  Rviz_Ruler  │                │
-│  │   (AI 目标检测)      │    │  (标尺参考)   │                │
-│  └──────────┬──────────┘    └──────┬───────┘                │
-│             │ obj_list              │ ruler                   │
-├─────────────┼──────────────────────┼────────────────────────┤
-│ 第三层：可视化与日志层                  │                        │
-│  ┌──────────┴──────────┐  ┌─────────┴──────┐  ┌──────────┐ │
-│  │    Rviz_radar       │  │  Rviz_Image    │  │ Logging  │ │
-│  │   (雷达可视化)       │  │  (图像可视化)   │  │ (日志记录) │ │
-│  └──────────┬──────────┘  └────────┬───────┘  └────┬─────┘ │
-│             ↑ det_list              ↑ video          ↑ all   │
-├─────────────┼──────────────────────┼────────────────┼───────┤
-│ 第二层：雷达信号处理层                                           │
-│  ┌──────────┴──────────┐  ┌─────────┴──────┐                  │
-│  │ R SP MIL Python     │  │  R SP Cuda     │                  │
-│  │  (Python 实现)       │  │  (CUDA 模拟)    │                  │
-│  └──────────┬──────────┘  └────────┬───────┘                  │
-│             ↑ adc + vehicle         ↑ adc + vehicle            │
-├─────────────┼──────────────────────┼──────────────────────────┤
-│ 第一层：数据采集层                                              │
-│  ┌──────────┴──────────┐  ┌────────┴───────┐  ┌──────────┐  │
-│  │     ADC Rx          │  │   Camera Rx    │  │Vehicle Rx│  │
-│  │  (v4l2 雷达采集)     │  │  (v4l2 相机采集) │  │(CAN/ETH) │  │
-│  └─────────────────────┘  └────────────────┘  └──────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ 第四层：高级感知与辅助层                                               │
+│  ┌─────────────────────────┐    ┌──────────────────┐                 │
+│  │   3D Object Detection   │    │   Rviz_Ruler     │                 │
+│  │   (ObjList 14 字段)     │    │   (标尺参考)      │                 │
+│  └──────────┬──────────────┘    └────────┬─────────┘                 │
+│             │ /perception/objects        │ /visualization/ruler       │
+├─────────────┼────────────────────────────┼──────────────────────────┤
+│ 第三层：可视化与日志层                      │                           │
+│  ┌──────────┴──────────┐  ┌───────────────┴──┐  ┌────────────────┐ │
+│  │    Rviz_radar       │  │   Rviz_Image     │  │   Logging      │ │
+│  │ 4 in / 4 out topics │  │ image→overlay    │  │ 5 channel I/O  │ │
+│  └──────────┬──────────┘  └──────────────────┘  └───────┬────────┘ │
+│     ↑ det_list ↑ obj_list  ↑ ruler                      ↑ all 5     │
+├──────────────┴────────────┴───────────────────────────────┴────────┤
+│ 第二层：雷达信号处理层（按 mode 条件启动）                              │
+│  ┌──────────────────┐       ┌──────────────────┐                     │
+│  │  RSP MIL Python  │       │   RSP Cuda       │                     │
+│  │  SNR≥10dB, 30pts │       │  SNR≥8dB, 45pts  │                     │
+│  │  DetPoint 14字段 │       │  DetPoint 14字段  │                     │
+│  └────────┬─────────┘       └────────┬─────────┘                     │
+│     ↑ /adc/raw_data + /vehicle/ego_motion                            │
+├──────────┴──────────────────────────┴──────────────────────────────┤
+│ 第一层：数据采集层                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐            │
+│  │  ADC Rx      │  │  Camera Rx   │  │  Vehicle Data Rx │            │
+│  │  15Hz, 32MB  │  │  30Hz, TBD   │  │  50Hz, 7 fields  │            │
+│  │  μs timestamp│  │  μs timestamp│  │  +default fallback│            │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘            │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 节点说明
 
-| 层级 | 节点名 | 可执行文件 | 功能 | 实现方式 |
-|------|--------|-----------|------|----------|
-| 1 | ADC Rx | `adc_rx` | 雷达 ADC 数据接收 | 模拟 v4l2，生成随机点云 |
-| 1 | Camera Rx | `camera_rx` | 相机视频数据接收 | 模拟 v4l2，生成测试图案 |
-| 1 | Vehicle Data Rx | `vehicle_data_rx` | 车辆数据接收 | 模拟 CAN/ETH，生成车速航向 |
-| 2 | R SP MIL Python | `rsp_mil_python` | 雷达信号处理 (Python) | SNR 滤波 + 速度补偿 |
-| 2 | R SP Cuda | `rsp_cuda` | 雷达信号处理 (CUDA) | 更低 SNR 阈值，更高灵敏度 |
-| 3 | Rviz_radar | `rviz_radar` | 雷达数据 RViz 可视化 | 汇聚多源，发布着色点云和标记 |
-| 3 | Rviz_Image | `rviz_image` | 图像 RViz 可视化 | 接收视频，叠加帧信息发布 |
-| 3 | Logging | `logging_node` | 数据日志记录 | 订阅计数（文件写入待实现） |
-| 4 | 3D Object Detection | `object_detection_3d` | 3D 目标检测 | 欧氏聚类模拟 AI 检测 |
-| 4 | Rviz_Ruler | `rviz_ruler` | 标尺参考 | 发布坐标尺标记 |
+### 第一层：数据采集
+
+| 节点 | 频率 | 消息类型 | 话题 | 功能 |
+|------|:----:|----------|------|------|
+| **ADC Rx** | 15 Hz | [`AdcRawData`](src/ft_radar_msgs/msg/AdcRawData.msg) | `/adc/raw_data` | 采集雷达 ADC 数据，注入 μs 时间戳 |
+| **Camera Rx** | 30 Hz | `sensor_msgs/Image` | `/camera/image_raw` | 采集相机图像（格式 TBD，占位实现） |
+| **Vehicle Data Rx** | 50 Hz | [`EgoMotion`](src/ft_radar_msgs/msg/EgoMotion.msg) | `/vehicle/ego_motion` | 采集车辆动态数据，含默认值机制 |
+
+### 第二层：信号处理
+
+| 节点 | 输入 | 输出 | 消息类型 | 功能 |
+|------|------|------|----------|------|
+| **RSP MIL Python** | ADC + EgoMotion | [`DetList`](src/ft_radar_msgs/msg/DetList.msg) | SNR 滤波 + 速度补偿 |
+| **RSP Cuda** | ADC + EgoMotion | [`DetList`](src/ft_radar_msgs/msg/DetList.msg) | 同上，更低 SNR 阈值（更高灵敏度） |
+
+### 第三层：可视化与日志
+
+| 节点 | 输入 | 输出 | 功能 |
+|------|------|------|------|
+| **Rviz_radar** | DetList×2, ObjList, Ruler | PointCloud2 + MarkerArray + Image | 汇聚显示，按高度着色 |
+| **Rviz_Image** | Image | Image (overlay) | 叠加帧号和时间戳 |
+| **Logging** | 5 通道全部数据 | 6 种文件格式 | 5 独立开关，帧上限，异步写入 |
+
+### 第四层：高级感知
+
+| 节点 | 输入 | 输出 | 消息类型 | 功能 |
+|------|------|------|----------|------|
+| **3D Object Detection** | DetList | [`ObjList`](src/ft_radar_msgs/msg/ObjList.msg) | 欧氏聚类模拟 AI 检测 |
+| **Rviz_Ruler** | — | MarkerArray | 发布坐标尺/参考标记 |
 
 ---
 
-## 话题列表
+## 话题总表
 
 | 话题 | 消息类型 | 发布者 | 订阅者 | 频率 |
-|------|----------|--------|--------|------|
-| `/ft/adc_data` | `PointCloud2` | `adc_rx` | `rsp_mil_python`, `rsp_cuda`, `logging_node` | 10 Hz |
-| `/ft/video_raw` | `Image` | `camera_rx` | `rviz_image`, `logging_node` | 15 Hz |
-| `/ft/vehicle_data` | `TwistStamped` | `vehicle_data_rx` | `rsp_mil_python`, `rsp_cuda`, `logging_node` | 20 Hz |
-| `/ft/det_list_py` | `PointCloud2` | `rsp_mil_python` | `rviz_radar`, `object_detection_3d`, `logging_node` | 10 Hz |
-| `/ft/det_list_cu` | `PointCloud2` | `rsp_cuda` | `rviz_radar`, `logging_node` | 10 Hz |
-| `/ft/obj_list` | `MarkerArray` | `object_detection_3d` | `rviz_radar` | — |
-| `/ft/ruler` | `MarkerArray` | `rviz_ruler` | `rviz_radar` | 2 Hz |
-| `/ft/radar_display` | `PointCloud2` | `rviz_radar` | (RViz) | 10 Hz |
-| `/ft/radar_boxes` | `MarkerArray` | `rviz_radar` | (RViz) | 10 Hz |
-| `/ft/radar_colorbar` | `Image` | `rviz_radar` | (RViz) | 10 Hz |
-| `/ft/video_display` | `Image` | `rviz_image` | (RViz) | — |
-
-### PointCloud2 字段说明
-
-**`/ft/adc_data`** (ADC 原始数据):
-| 字段 | 偏移 | 类型 | 说明 |
-|------|------|------|------|
-| `x` | 0 | float32 | 笛卡尔 X 坐标 (m) |
-| `y` | 4 | float32 | 笛卡尔 Y 坐标 (m) |
-| `z` | 8 | float32 | 笛卡尔 Z 坐标 (m) |
-| `intensity` | 12 | float32 | 信号强度 (dB) |
-
-**`/ft/det_list_py` `/ft/det_list_cu`** (检测目标列表):
-| 字段 | 偏移 | 类型 | 说明 |
-|------|------|------|------|
-| `x` | 0 | float32 | 目标 X 坐标 (m) |
-| `y` | 4 | float32 | 目标 Y 坐标 (m) |
-| `z` | 8 | float32 | 目标 Z 坐标 (m) |
-| `velocity` | 12 | float32 | 径向速度 (m/s) |
-| `snr` | 16 | float32 | 信噪比 (dB) |
+|------|----------|--------|--------|:----:|
+| `/adc/raw_data` | `ft_radar_msgs/AdcRawData` | `adc_rx` | `rsp_mil_python`, `rsp_cuda`, `logging_node` | 15 Hz |
+| `/camera/image_raw` | `sensor_msgs/Image` | `camera_rx` | `rviz_image`, `logging_node` | 30 Hz |
+| `/vehicle/ego_motion` | `ft_radar_msgs/EgoMotion` | `vehicle_data_rx` | `rsp_mil_python`, `rsp_cuda`, `logging_node` | 50 Hz |
+| `/processing/radar/det_list` | `ft_radar_msgs/DetList` | `rsp_mil_python` / `rsp_cuda` | `rviz_radar`, `object_detection_3d`, `logging_node` | 10 Hz |
+| `/processing/radar/det_list_cuda` | `ft_radar_msgs/DetList` | `rsp_cuda` (双路模式) | `rviz_radar`, `logging_node` | 10 Hz |
+| `/perception/objects` | `ft_radar_msgs/ObjList` | `object_detection_3d` | `rviz_radar`, `logging_node` | — |
+| `/visualization/ruler` | `visualization_msgs/MarkerArray` | `rviz_ruler` | `rviz_radar` | 2 Hz |
+| `/visualization/radar/display` | `sensor_msgs/PointCloud2` | `rviz_radar` | (RViz) | 10 Hz |
+| `/visualization/radar/boxes` | `visualization_msgs/MarkerArray` | `rviz_radar` / `object_detection_3d` | (RViz) | 10 Hz |
+| `/visualization/radar/colorbar` | `sensor_msgs/Image` | `rviz_radar` | (RViz) | 10 Hz |
+| `/visualization/radar/frame_info` | `visualization_msgs/MarkerArray` | `rviz_radar` | (RViz) | 10 Hz |
+| `/visualization/camera/display` | `sensor_msgs/Image` | `rviz_image` | (RViz) | — |
 
 ---
 
-## RViz 可视化
+## 消息定义
 
-### 快速启动
+### 自定义消息包 `ft_radar_msgs`
 
-```bash
-# 使用预配置的 RViz 文件
-rviz2 -d config/ft_framework.rviz
+| 消息 | 字段数 | 说明 |
+|------|:------:|------|
+| [`AdcRawData.msg`](src/ft_radar_msgs/msg/AdcRawData.msg) | 4 + header | ADC 原始数据（int16[] 大数组） |
+| [`DetPoint.msg`](src/ft_radar_msgs/msg/DetPoint.msg) | **14** | 雷达检测目标点 |
+| [`DetList.msg`](src/ft_radar_msgs/msg/DetList.msg) | header + DetPoint[] | 检测目标列表 |
+| [`Object3D.msg`](src/ft_radar_msgs/msg/Object3D.msg) | **14** | 3D 目标（含跟踪信息、包围盒、运动状态） |
+| [`ObjList.msg`](src/ft_radar_msgs/msg/ObjList.msg) | header + Object3D[] | 3D 目标列表 |
+| [`EgoMotion.msg`](src/ft_radar_msgs/msg/EgoMotion.msg) | **7** + header + is_default | 自车运动数据 |
 
-# 手动配置：
-# 1. 打开 rviz2
-# 2. Global Options → Fixed Frame: radar
-# 3. Add → By topic → /ft/radar_display (PointCloud2)
-#    - Color Transformer: RGB8
-# 4. Add → By topic → /ft/radar_boxes (MarkerArray)
-# 5. Add → By topic → /ft/video_display (Image)
+### DetPoint 14 字段
+
+```
+  x, y, z           — 车辆系空间坐标 (m)
+  range, azimuth, elevation — 雷达系原视测量 (m, rad, rad)
+  RCS, SNR          — 信号特征 (dBsm, dB)
+  ambgt             — 速度模糊窗宽 (m/s)
+  exist_prob        — 存在概率 [0,255]
+  multi_tgt_prob    — 多目标概率 [0,255]
+  ambgt_prob        — 模糊概率 [0,255]
+  raw_doppler       — 原始多普勒速度 (m/s)
+  idx               — 多普勒解模糊索引
 ```
 
-### 坐标系
+### Object3D 14 字段
 
-| 坐标系 | 父坐标系 | 说明 |
-|--------|---------|------|
-| `map` | — | 世界坐标系（根） |
-| `radar` | `map` | 雷达坐标系（偏移 z=0.5m） |
-| `camera` | `radar` | 相机坐标系（偏移 z=1.2m） |
-| `base_link` | — | 车辆本体坐标系 |
+```
+  object_id         — 跟踪 ID
+  tracked_times     — 跟踪帧数
+  score             — 置信度 [0,1]
+  x, y, z           — bbox 中心 (m)
+  l, w, h           — bbox 长宽高 (m)
+  yaw               — 航向角 (rad)
+  vx/vy/vz_absolute — 对地速度 (m/s)
+  moving_state      — 运动状态枚举
+```
+
+---
+
+## 时间戳机制
+
+### 设计原则
+
+- **时钟源**: 统一使用 `time.monotonic_ns()`（开发阶段），预留 PTP 硬件时钟接口
+- **精度**: 微秒 (μs)
+- **注入位置**: 所有 Rx 节点在数据采集第一时间注入
+- **透传规则**: 后续节点**不得覆盖** `header.stamp`，仅在消息头中传递
+
+### 实现
+
+```python
+def monotonic_us_stamp() -> tuple:
+    now_ns = time.monotonic_ns()
+    sec = int(now_ns // 1_000_000_000)
+    nsec = int(now_ns % 1_000_000_000)
+    return (sec, nsec)
+```
+
+所有节点共享此函数，Logging 系统使用 `get_timestamp_us()` 从中提取微秒整数用于文件命名。
 
 ---
 
 ## 参数配置
 
-所有节点支持通过 ROS2 参数系统进行配置。
+所有节点参数统一管理于 [`config/ft_radar_params.yaml`](config/ft_radar_params.yaml)。
 
-### 通过 Launch 文件配置（推荐）
+### 配置层级
 
-编辑 `src/ft_framework/launch/ft_framework.launch.py` 中的 `parameters` 字典。
-
-### 通过命令行覆盖
-
-```bash
-# 调整雷达帧率
-ros2 run ft_framework adc_rx --ros-args -p radar_fps:=20.0
-
-# 调整 SNR 阈值
-ros2 run ft_framework rsp_mil_python --ros-args -p snr_threshold:=15.0
-
-# 调整标尺参数
-ros2 run ft_framework rviz_ruler --ros-args \
-  -p ruler_axis:=y \
-  -p ruler_offset:=30.0 \
-  -p ruler_length:=200.0
+```
+config/ft_radar_params.yaml        ★ 默认参数（全局）
+  ↓
+ros2 launch ... parameters=[...]    ★ Launch 时覆盖
+  ↓
+ros2 param set /node param value    ★ 运行时动态修改（Logging 开关支持）
 ```
 
 ### 主要参数速查
 
 | 节点 | 参数 | 默认值 | 说明 |
-|------|------|--------|------|
-| `adc_rx` | `radar_fps` | 10.0 | 雷达帧率 (Hz) |
-| `adc_rx` | `num_targets` | 50 | 每帧目标数 |
-| `adc_rx` | `range_max` | 300.0 | 最大探测距离 (m) |
-| `camera_rx` | `camera_fps` | 15.0 | 相机帧率 (Hz) |
-| `vehicle_data_rx` | `sim_speed_mean` | 15.0 | 模拟车速 (m/s) |
+|------|------|:------:|------|
+| `adc_rx` | `fps` | 15 | 采集帧率 |
+| `camera_rx` | `fps` | 30 | 采集帧率 |
+| `vehicle_data_rx` | `fps` | 50 | 采集帧率 |
+| `vehicle_data_rx` | `timeout_cycles` | 3 | 超时周期数 |
 | `rsp_mil_python` | `snr_threshold` | 10.0 | SNR 阈值 (dB) |
-| `rsp_cuda` | `snr_threshold` | 8.0 | SNR 阈值 (CUDA版) |
+| `rsp_cuda` | `snr_threshold` | 8.0 | SNR 阈值 (dB) |
 | `object_detection_3d` | `cluster_distance` | 5.0 | 聚类距离 (m) |
-| `object_detection_3d` | `min_cluster_size` | 3 | 最小簇大小 |
-| `rviz_ruler` | `ruler_axis` | x | 标尺方向 (x/y) |
-| `rviz_ruler` | `ruler_length` | 300.0 | 标尺长度 (m) |
+| `rviz_ruler` | `ruler_axis` | x | 标尺方向 |
+| `logging` | `max_frames.adc` | 100 | ADC 最大帧数 |
+
+---
+
+## Logging 系统
+
+### 5 个独立通道
+
+| 通道 | 开关参数 | 最大帧数 | 输出文件 |
+|:----:|----------|:--------:|----------|
+| ADC | `enable_adc` | 100 | `adc.bin`（二进制连续） |
+| Image | `enable_image` | 1000 | `{timestamp_us}.jpg` |
+| Det_List | `enable_det_list` | 1000 | `{timestamp_us}.csv` + `{timestamp_us}.pcd` |
+| Ego_Motion | `enable_ego_motion` | 1000 | `ego_motion.csv`（单文件追加） |
+| Obj_List | `enable_obj_list` | 1000 | `{timestamp_us}.csv` |
+
+### 运行时切换
+
+```bash
+# 关闭 ADC 录制
+ros2 param set /logging_node enable_adc false
+ros2 param get /logging_node enable_adc   # 验证
+```
+
+### 帧上限策略
+
+达到上限后**停止记录并输出告警日志**，不循环覆盖。
+
+### 异步写入
+
+所有文件写入通过独立线程 + 队列完成（`AsyncWriter` 类），不阻塞 ROS2 主回调循环。
+
+---
+
+## RViz 可视化
+
+```bash
+# 使用预配置的 RViz 文件
+rviz2 -d config/ft_radar.rviz
+
+# 或手动配置
+rviz2  →  Fixed Frame: radar
+  →  Add → /visualization/radar/display     (PointCloud2, Color Transformer: RGB8)
+  →  Add → /visualization/radar/boxes       (MarkerArray)
+  →  Add → /visualization/camera/display    (Image)
+  →  Add → /visualization/radar/colorbar    (Image)
+```
+
+### 坐标系
+
+| 坐标系 | 父坐标系 | 偏移 | 说明 |
+|--------|---------|------|------|
+| `map` | — | — | 世界坐标系 |
+| `radar` | `map` | z=0.5m | 雷达 |
+| `camera` | `radar` | z=1.2m | 相机 |
+| `base_link` | — | — | 车辆本体 |
 
 ---
 
@@ -359,50 +385,117 @@ ros2 run ft_framework rviz_ruler --ros-args \
 
 ### 代码规范
 
-- 所有节点遵循统一的代码结构：`配置区 → 工具函数 → 节点类 → main()`
-- 使用 `★ 用户配置区` 标记集中管理可调参数
-- 每个节点包含完整的中文 docstring 说明话题和连接关系
-- 遵循 ROS2 src guideline 开发规范
-- 作者：zhengyuan.liu
+- 所有节点遵循统一结构：`配置区 → 工具函数 → 节点类 → main()`
+- 使用 `★ 用户配置区` 标记集中管理可调参数，配中文说明
+- Docstring 包含规格、话题列表、连接关系
+- 使用 ROS2 标准 `declare_parameter()` + `get_parameter()` 模式
+- 所有节点包含 `destroy_node()` + `finally` 清理逻辑
 
 ### 添加新节点
 
-1. 在 `ft_framework/` 目录下创建 `your_node.py`
-2. 按照现有节点模板编写代码（参考 `adc_rx.py` 作为最简示例）
-3. 在 `setup.py` 的 `entry_points` 中添加入口：
-   ```python
-   'your_node = ft_framework.your_node:main',
-   ```
-4. 在 `launch/ft_framework.launch.py` 中添加节点启动配置
+1. 在 `ft_framework/ft_framework/` 下创建 `your_node.py`
+2. 参照现有节点模板编写
+3. 在 `setup.py` 的 `entry_points` 中添加入口
+4. 在 `launch/ft_radar_launch.py` 中添加启动配置
 
-### 实现具体算法
+### 接入真实硬件
 
-当前算法节点使用模拟/占位实现。要实现真实算法，修改对应节点中的处理方法：
-
-- **ADC 数据采集** → 修改 `adc_rx.py` 的 `_on_timer()` 接入真实 v4l2 驱动
-- **雷达信号处理** → 修改 `rsp_mil_python.py` / `rsp_cuda.py` 的 `_on_process()` 
-- **3D 目标检测** → 修改 `object_detection_3d.py` 的 `_on_det_list()` 接入 AI 模型
-- **数据日志** → 修改 `logging_node.py` 添加文件写入逻辑
+| 当前模拟实现 | 替换为 |
+|-------------|--------|
+| `adc_rx._on_timer()` 随机 int16 | v4l2 驱动读取 |
+| `camera_rx._on_timer()` 测试图案 | 相机驱动 |
+| `vehicle_data_rx._on_timer()` 模拟数据 | CAN/ETH 总线读取 |
+| `rsp_mil_python._on_process()` 模拟检测 | 真实 FFT + CFAR 处理 |
+| `object_detection_3d._on_det_list()` 欧氏聚类 | TensorRT AI 模型 |
 
 ---
 
-## 参考文档
+## 项目结构
 
-- [架构设计文档](docs/architecture.md) — 详细的系统架构设计
-- [用户使用指南](docs/user_guide.md) — 节点参数详解和调试技巧
-- [框架描述](参考/框架描述.md) — 原始框架需求文档
-- [FT Visualizer 参考](参考/FT_visualizer/README.md) — 参考可视化工具文档
-- [ROS2 Humble 文档](https://docs.ros.org/en/humble/)
-- [NVIDIA Jetson Orin 文档](https://developer.nvidia.com/embedded/jetson-orin)
+```
+Orin-ROS/
+├── README.md                               # 本文件
+├── .gitignore
+│
+├── src/
+│   ├── ft_radar_msgs/                      # 自定义消息包 (ament_cmake)
+│   │   ├── CMakeLists.txt
+│   │   ├── package.xml
+│   │   └── msg/
+│   │       ├── AdcRawData.msg
+│   │       ├── DetPoint.msg / DetList.msg
+│   │       ├── Object3D.msg / ObjList.msg
+│   │       └── EgoMotion.msg
+│   │
+│   └── ft_framework/                       # 节点功能包 (ament_python)
+│       ├── package.xml / setup.py
+│       ├── launch/
+│       │   └── ft_radar_launch.py
+│       └── ft_framework/
+│           ├── adc_rx.py                   # Layer 1
+│           ├── camera_rx.py
+│           ├── vehicle_data_rx.py
+│           ├── rsp_mil_python.py           # Layer 2
+│           ├── rsp_cuda.py
+│           ├── rviz_radar.py              # Layer 3
+│           ├── rviz_image.py
+│           ├── logging_node.py
+│           ├── object_detection_3d.py      # Layer 4
+│           └── rviz_ruler.py
+│
+├── config/
+│   ├── ft_radar_params.yaml               # 全局参数配置
+│   └── ft_radar.rviz                      # RViz2 预配置
+│
+├── scripts/
+│   ├── build.sh                           # 一键构建
+│   └── launch_all.sh                      # 一键启动
+│
+├── docs/
+│   ├── architecture.md                    # 架构设计
+│   └── user_guide.md                     # 使用指南
+│
+└── 参考/                                   # 原始需求文档
+    ├── 框架描述.md
+    ├── 详细化开发方案.md
+    ├── FT_radar_dataset_requirement.md
+    └── FT_visualizer/
+```
+
+---
+
+## 运行验证
+
+```bash
+# 验证节点
+ros2 node list
+# 应显示全部 10 个节点
+
+# 验证话题
+ros2 topic list | grep /ft/   # 旧版不支持此模式
+ros2 topic list | grep '^/'   # 新版话题
+
+# 验证连接
+ros2 topic info /adc/raw_data --verbose
+ros2 topic info /processing/radar/det_list --verbose
+ros2 topic info /perception/objects --verbose
+
+# 验证消息内容
+ros2 interface show ft_radar_msgs/msg/DetPoint
+ros2 interface show ft_radar_msgs/msg/Object3D
+ros2 interface show ft_radar_msgs/msg/EgoMotion
+
+# 验证 Logging 运行时开关
+ros2 param set /logging_node enable_adc false
+ros2 param get /logging_node enable_adc
+```
 
 ---
 
 ## 许可证
 
-本项目采用 [Apache-2.0](LICENSE) 许可证。
+本项目采用 **Apache-2.0** 许可证。
 
----
-
-**作者：** zhengyuan.liu  
-**创建日期：** 2026.6.8  
-**最后更新：** 2026.6.8
+**作者**: zhengyuan.liu  
+**创建日期**: 2026.6.8  
+**最后更新**: 2026.6.9

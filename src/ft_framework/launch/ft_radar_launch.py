@@ -102,6 +102,8 @@ def generate_launch_description():
     rsp_cu_cfg   = rsp_cfg.get('cuda', {})
     obj_cfg      = yaml_config.get('object_detection_3d', {})
     ruler_cfg    = yaml_config.get('rviz_ruler', {})
+    rviz_radar_cfg = yaml_config.get('rviz_radar', {})
+    rviz_image_cfg = yaml_config.get('rviz_image', {})
     log_cfg      = _flatten_logging_cfg(yaml_config.get('logging', {}))
     system_cfg   = yaml_config.get('system', {})
 
@@ -196,11 +198,13 @@ def generate_launch_description():
 
     ld.add_action(TimerAction(period=1.0, actions=[Node(
         package='ft_framework', executable='rviz_radar',
-        name='rviz_radar', output='screen')]))
+        name='rviz_radar', output='screen',
+        parameters=[rviz_radar_cfg])]))
 
     ld.add_action(TimerAction(period=1.0, actions=[Node(
         package='ft_framework', executable='rviz_image',
-        name='rviz_image', output='screen')]))
+        name='rviz_image', output='screen',
+        parameters=[rviz_image_cfg])]))
 
     ld.add_action(TimerAction(period=1.0, actions=[Node(
         package='ft_framework', executable='logging_node',

@@ -209,10 +209,54 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 
 ## 时间戳机制
 
-- **时钟源**: `time.monotonic_ns()`，精度纳秒 → 微秒
-- **注入位置**: Rx 节点采集数据第一时间注入 `header.stamp`
-- **透传规则**: 下游节点**禁止覆盖**时间戳，必须原样传递
-- **文件命名**: Logging 节点从 `header.stamp` 提取微秒整数作为文件名
+### 规则
+
+- **时钟源**: `time.monotonic_ns()`，纳秒精度 → 微秒时间戳
+- **注入位置**: Layer-1 Rx 节点采集数据第一时间调用 `monotonic_us_stamp()` 注入 `header.stamp`
+- **透传规则**: Layer-2/3/4 下游节点**禁止覆盖**时间戳，必须原样传递
+- **可视化例外**: 仅 `rviz_radar` / `rviz_ruler` 可使用 `get_clock().now()` 生成展示时间戳
+- **文件命名**: Logging 节点从 `header.stamp` 提取微秒整数 (`sec*1e6 + nanosec/1e3`) 作为文件名
+
+### 时间戳链路
+
+```
+Layer-1 (SOURCE)
+  adc_rx           → monotonic_us_stamp() ─→ header.stamp
+  camera_rx        → monotonic_us_stamp() ─→ header.stamp
+  vehicle_data_rx  → monotonic_us_stamp() ─→ header.stamp
+
+Layer-2 (PASSTHRU)
+  rsp_mil_python   → adc_stamp = _latest_adc.header.stamp ─→ DetList.header.stamp
+  rsp_cuda         → adc_stamp = _latest_adc.header.stamp ─→ DetList.header.stamp
+
+Layer-3/4 (PASSTHRU)
+  object_detection_3d → msg.header.stamp ─→ ObjList.header.stamp
+  rviz_image          → msg.header ─→ display Image
+  logging_node        → get_timestamp_us(msg) ─→ 文件名 + CSV列
+
+Layer-3/4 (NEW — 可视化)
+  rviz_radar       → self.get_clock().now().to_msg()
+  rviz_ruler       → self.get_clock().now().to_msg()
+```
+
+### 话题频率总览
+
+| 话题 | 频率 | 发布节点 | 驱动方式 |
+|------|:----:|------|:--------:|
+| `/adc/raw_data` | **15 Hz** | adc_rx | 定时器 |
+| `/camera/image_raw` | **30 Hz** | camera_rx | 定时器 |
+| `/vehicle/ego_motion` | **50 Hz** | vehicle_data_rx | 定时器 |
+| `/processing/radar/det_list` | **10 Hz** ⚠ | rsp_mil_python / rsp_cuda | 定时器 |
+| `/processing/radar/det_list_cuda` | **10 Hz** ⚠ | rsp_cuda (双路) | 定时器 |
+| `/perception/objects` | ~10 Hz | object_detection_3d | 事件驱动 |
+| `/visualization/radar/display` | 10 Hz | rviz_radar | 定时合成 |
+| `/visualization/radar/boxes` | 10 Hz | rviz_radar + obj_det | 定时合成 |
+| `/visualization/radar/frame_info` | 10 Hz | rviz_radar | 定时合成 |
+| `/visualization/camera/display` | ~30 Hz | rviz_image | 事件驱动 |
+| `/visualization/ruler` | 2 Hz | rviz_ruler | 定时器 |
+
+> ⚠ **RSP processing_fps (10Hz) 低于 ADC 帧率 (15Hz)**，约 33% ADC 帧不会被处理。
+> 如需全帧处理，将 `rsp.python.processing_fps` / `rsp.cuda.processing_fps` 改为 15.0。
 
 ---
 

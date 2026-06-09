@@ -6,8 +6,32 @@
 #   2. ros2 launch 时传入参数:
 #      ros2 launch ft_radar_launch.py rsp_mode:=cuda log_image:=false
 #
+# ════════════════════════════════════════════════════════════════════════════
+# 话题频率概览 (Hz)
+# ════════════════════════════════════════════════════════════════════════════
+#   /adc/raw_data                    15 Hz  ← adc_rx
+#   /camera/image_raw                30 Hz  ← camera_rx
+#   /vehicle/ego_motion              50 Hz  ← vehicle_data_rx
+#   /processing/radar/det_list       10 Hz  ← rsp_* (⚠ 低于ADC 15Hz)
+#   /processing/radar/det_list_cuda  10 Hz  ← rsp_cuda (双路模式)
+#   /perception/objects             ~10 Hz  ← object_detection_3d (事件驱动)
+#   /visualization/radar/display     10 Hz  ← rviz_radar (定时合成)
+#   /visualization/radar/boxes       10 Hz  ← rviz_radar + object_detection_3d
+#   /visualization/radar/frame_info  10 Hz  ← rviz_radar
+#   /visualization/camera/display   ~30 Hz  ← rviz_image (事件驱动)
+#   /visualization/ruler              2 Hz  ← rviz_ruler
+#
+# ════════════════════════════════════════════════════════════════════════════
+# 时间戳机制
+# ════════════════════════════════════════════════════════════════════════════
+#   SOURCE:  Layer-1 Rx 节点 → time.monotonic_ns() → (sec, nanosec) → header.stamp
+#            三节点统一调用 common.monotonic_us_stamp()
+#   PASSTHR: Layer-2/3/4 下游节点 → 透传上游 header.stamp，禁止重新生成
+#            仅 Rviz_radar / Rviz_Ruler 使用 get_clock().now() 生成可视化时间戳
+#   LOGGING: Logging 节点 → 从 header.stamp 提取微秒整数 → 文件名 + CSV timestamp_us
+#
 # 作者: zhengyuan.liu
-# 日期: 2026.6.8
+# 日期: 2026.6.9
 # ============================================================================
 
 # ====================================================================
@@ -67,10 +91,12 @@ rsp:
   default_mode: "cuda"
   # Python 版参数
   python:
+    processing_fps: 10.0                     # 处理帧率 (Hz), 当前低于 ADC 15Hz
     snr_threshold: 10.0                   # SNR 阈值 (dB)
     velocity_scale: 0.5                   # 速度估算缩放因子
   # CUDA 版参数
   cuda:
+    processing_fps: 10.0                     # 处理帧率 (Hz), 当前低于 ADC 15Hz
     snr_threshold: 8.0                    # SNR 阈值 (dB)，更低 = 更高灵敏度
     velocity_scale: 0.5                   # 速度估算缩放因子
 
@@ -86,12 +112,30 @@ object_detection_3d:
 # 节点: Rviz_Ruler — 标尺参考
 # ====================================================================
 rviz_ruler:
+  publish_hz: 2.0                         # 标尺发布频率 (Hz)
   ruler_axis: "x"                         # 标尺方向: x | y
   ruler_offset: -50.0                     # 正交偏移量 (m)
   ruler_interval: 20.0                    # 标记间隔 (m)
   ruler_length: 300.0                     # 总长度 (m)
   ruler_font: 0.8                         # 字体大小
   ruler_color: [0.8, 0.8, 0.8]           # RGB 颜色 (0~1)
+
+# ====================================================================
+# 节点: Rviz_radar — 雷达可视化
+# ====================================================================
+rviz_radar:
+  publish_hz: 10.0                        # 可视化发布频率 (Hz)
+  min_z: -5.0                             # 高度色带下限 (m)
+  max_z: 15.0                             # 高度色带上限 (m)
+  marker_lifetime: 1.0                    # Marker 生命周期 (s)
+  fixed_frame: "radar"                    # RViz 固定坐标系
+
+# ====================================================================
+# 节点: Rviz_Image — 图像可视化
+# ====================================================================
+rviz_image:
+  show_overlay: true                      # 是否显示叠加信息（帧号、时间戳）
+  fixed_frame: "camera"                   # RViz 固定坐标系
 
 # ====================================================================
 # 节点: Logging — 数据日志记录

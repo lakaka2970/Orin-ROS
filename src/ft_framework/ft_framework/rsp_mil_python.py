@@ -50,7 +50,6 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
-import time
 import math
 import numpy as np
 
@@ -58,18 +57,6 @@ import rclpy
 from rclpy.node import Node
 
 from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
-
-
-# ============================================================================
-# 时间戳工具函数
-# ============================================================================
-
-def monotonic_us_stamp() -> tuple:
-    """获取单调时钟的微秒时间戳，返回 (sec, nanosec)"""
-    now_ns = time.monotonic_ns()
-    sec = int(now_ns // 1_000_000_000)
-    nsec = int(now_ns % 1_000_000_000)
-    return (sec, nsec)
 
 
 # ============================================================================
@@ -164,7 +151,8 @@ class RspMilPythonNode(Node):
             return
 
         self.frame_count += 1
-        sec, nsec = monotonic_us_stamp()
+        # 透传 ADC 时间戳，不得重新生成（全局时间戳规则）
+        adc_stamp = self._latest_adc.header.stamp
 
         # 获取车辆速度
         ego_vx = 0.0
@@ -195,8 +183,7 @@ class RspMilPythonNode(Node):
 
         # ---- 构造 DetList ----
         det_list = DetList()
-        det_list.header.stamp.sec = sec
-        det_list.header.stamp.nanosec = nsec
+        det_list.header.stamp = adc_stamp          # 透传 ADC 原始时间戳
         det_list.header.frame_id = self.fixed_frame
 
         for i in valid_idx:

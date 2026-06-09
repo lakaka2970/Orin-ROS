@@ -50,28 +50,17 @@ import cv2
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
 from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import PointCloud2, PointField, Image
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ft_radar_msgs.msg import DetList, ObjList
+from ft_framework.common import create_header
 
 try:
     from cv_bridge import CvBridge
 except ImportError:
     CvBridge = None
-
-
-# ============================================================================
-# 工具函数
-# ============================================================================
-
-def create_header(frame_id: str, stamp) -> Header:
-    h = Header()
-    h.frame_id = frame_id
-    h.stamp = stamp
-    return h
 
 
 def jet_color_scalar(t: float):

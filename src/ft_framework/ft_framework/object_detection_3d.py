@@ -48,39 +48,16 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
-import time
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
 from builtin_interfaces.msg import Duration
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-from ft_radar_msgs.msg import DetList, DetPoint, ObjList, Object3D
-
-
-# ============================================================================
-# 时间戳工具函数
-# ============================================================================
-
-def monotonic_us_stamp() -> tuple:
-    now_ns = time.monotonic_ns()
-    sec = int(now_ns // 1_000_000_000)
-    nsec = int(now_ns % 1_000_000_000)
-    return (sec, nsec)
-
-
-# ============================================================================
-# 工具函数
-# ============================================================================
-
-def create_header(frame_id: str, stamp) -> Header:
-    h = Header()
-    h.frame_id = frame_id
-    h.stamp = stamp
-    return h
+from ft_radar_msgs.msg import DetList, ObjList, Object3D
+from ft_framework.common import monotonic_us_stamp, create_header
 
 
 def simple_clustering(points_xyz: np.ndarray, dist_threshold: float) -> list:

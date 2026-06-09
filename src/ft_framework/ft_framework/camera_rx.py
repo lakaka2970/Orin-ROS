@@ -46,7 +46,6 @@ FIXED_FRAME = 'camera'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
-import time
 import numpy as np
 import cv2
 
@@ -56,22 +55,12 @@ from sensor_msgs.msg import Image
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
+from ft_framework.common import monotonic_us_stamp
+
 try:
     from cv_bridge import CvBridge
 except ImportError:
     CvBridge = None
-
-
-# ============================================================================
-# 时间戳工具函数
-# ============================================================================
-
-def monotonic_us_stamp() -> tuple:
-    """获取单调时钟的微秒时间戳，返回 (sec, nanosec)"""
-    now_ns = time.monotonic_ns()
-    sec = int(now_ns // 1_000_000_000)
-    nsec = int(now_ns % 1_000_000_000)
-    return (sec, nsec)
 
 
 # ============================================================================

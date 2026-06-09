@@ -84,11 +84,7 @@ except ImportError:
 # 时间戳工具函数
 # ============================================================================
 
-def monotonic_us_stamp() -> tuple:
-    now_ns = time.monotonic_ns()
-    sec = int(now_ns // 1_000_000_000)
-    nsec = int(now_ns % 1_000_000_000)
-    return (sec, nsec)
+from ft_framework.common import monotonic_us_stamp
 
 
 def get_timestamp_us(msg) -> int:

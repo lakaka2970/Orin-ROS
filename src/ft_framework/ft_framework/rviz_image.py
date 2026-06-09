@@ -29,7 +29,6 @@ FIXED_FRAME  = 'camera'
 # ============================================================================
 
 import cv2
-import numpy as np
 
 import rclpy
 from rclpy.node import Node

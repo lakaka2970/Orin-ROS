@@ -35,16 +35,10 @@ FIXED_FRAME    = 'radar'
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-
-def create_header(frame_id: str, stamp) -> Header:
-    h = Header()
-    h.frame_id = frame_id
-    h.stamp = stamp
-    return h
+from ft_framework.common import create_header
 
 
 def create_ruler_markers(axis: str, offset: float, interval: float,

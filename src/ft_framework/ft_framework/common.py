@@ -42,10 +42,14 @@ def create_header(frame_id: str, stamp) -> Header:
 
     参数:
       frame_id: 坐标系名称 (如 'radar', 'map', 'camera')
-      stamp:    ROS2 Time 对象或 (sec, nsec) 元组
+      stamp:    builtin_interfaces/Time 对象（来自 msg.header.stamp 或
+                self.get_clock().now().to_msg()）
 
     返回:
       std_msgs/Header，包含 frame_id 和时间戳
+
+    注意:
+      stamp 必须是 rclpy Time 对象，不能直接传入 (sec, nsec) 元组。
     """
     h = Header()
     h.frame_id = frame_id

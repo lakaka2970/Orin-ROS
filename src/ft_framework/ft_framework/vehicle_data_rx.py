@@ -117,7 +117,8 @@ class VehicleDataRxNode(Node):
 
         # ---------- 超时检测状态 ----------
         self._last_valid_time = self.get_clock().now()
-        self._timeout_ns = self.timeout_cycles * (1.0 / self.fps) * 1e9
+        # timeout 以纳秒为单位，与 Duration.nanoseconds 类型一致
+        self._timeout_ns = int(self.timeout_cycles * (1.0 / self.fps) * 1e9)
 
         # ---------- 模拟状态 ----------
         self._heading = 0.0

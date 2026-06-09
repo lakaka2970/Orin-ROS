@@ -15,7 +15,6 @@ FT 雷达数据 RViz 可视化节点 (Rviz_radar)
   发布:
     /visualization/radar/display     sensor_msgs/PointCloud2     (着色点云)
     /visualization/radar/boxes       visualization_msgs/MarkerArray (目标框+标尺)
-    /visualization/radar/colorbar    sensor_msgs/Image           (高度色带)
     /visualization/radar/frame_info  visualization_msgs/MarkerArray (帧信息)
 
 连接关系:
@@ -46,29 +45,15 @@ FIXED_FRAME = 'radar'
 # ============================================================================
 
 import numpy as np
-import cv2
 
 import rclpy
 from rclpy.node import Node
 from builtin_interfaces.msg import Duration
-from sensor_msgs.msg import PointCloud2, PointField, Image
+from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ft_radar_msgs.msg import DetList, ObjList
 from ft_framework.common import create_header
-
-try:
-    from cv_bridge import CvBridge
-except ImportError:
-    CvBridge = None
-
-
-def jet_color_scalar(t: float):
-    t = float(np.clip(t, 0.0, 1.0))
-    r = float(np.clip(1.5 - abs(4 * t - 3), 0, 1))
-    g = float(np.clip(1.5 - abs(4 * t - 2), 0, 1))
-    b = float(np.clip(1.5 - abs(4 * t - 1), 0, 1))
-    return (int(r * 255), int(g * 255), int(b * 255))
 
 
 def height_to_rgb_array(z_arr: np.ndarray, z_min: float, z_max: float) -> np.ndarray:
@@ -113,28 +98,6 @@ def create_pointcloud2_rgb(points_xyz: np.ndarray, colors_rgb: np.ndarray,
     return msg
 
 
-def create_colorbar_image(z_min: float, z_max: float,
-                           img_height: int = 300,
-                           bar_width: int = 30,
-                           label_width: int = 65) -> np.ndarray:
-    img = np.zeros((img_height, bar_width + label_width, 3), dtype=np.uint8)
-    for i in range(img_height):
-        t = 1.0 - i / max(img_height - 1, 1)
-        r, g, b = jet_color_scalar(t)
-        img[i, :bar_width] = [b, g, r]
-    for i in range(6):
-        t = i / 5.0
-        z_val = z_min + t * (z_max - z_min)
-        y = int((1.0 - t) * (img_height - 1))
-        cv2.line(img, (bar_width, y), (bar_width + 6, y), (255, 255, 255), 1)
-        cv2.putText(img, f'{z_val:.2f}m',
-                    (bar_width + 8, min(y + 5, img_height - 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-    cv2.putText(img, 'Z(m)', (2, 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    return img
-
-
 # ============================================================================
 # ROS2 节点
 # ============================================================================
@@ -157,9 +120,6 @@ class RvizRadarNode(Node):
         self.publish_hz      = float(self.get_parameter('publish_hz').value)
         self.fixed_frame     = self.get_parameter('fixed_frame').value
 
-        self._colorbar_img = create_colorbar_image(self.min_z, self.max_z)
-        self.bridge = CvBridge() if CvBridge is not None else None
-
         # ---------- 数据缓存 ----------
         self._latest_det     = None
         self._latest_det_cu  = None
@@ -181,8 +141,6 @@ class RvizRadarNode(Node):
             PointCloud2, '/visualization/radar/display', 10)
         self.pub_boxes    = self.create_publisher(
             MarkerArray, '/visualization/radar/boxes', 10)
-        self.pub_colorbar = self.create_publisher(
-            Image, '/visualization/radar/colorbar', 10)
         self.pub_info     = self.create_publisher(
             MarkerArray, '/visualization/radar/frame_info', 10)
 
@@ -190,8 +148,7 @@ class RvizRadarNode(Node):
         self.frame_count = 0
 
         self.get_logger().info(
-            f'Rviz_radar 启动: {self.publish_hz:.0f} Hz, '
-            f'色带 [{self.min_z}, {self.max_z}] m')
+            f'Rviz_radar 启动: {self.publish_hz:.0f} Hz')
 
     # ------------------------------------------------------------------
     # 数据回调
@@ -259,16 +216,6 @@ class RvizRadarNode(Node):
             merged.markers.extend(self._latest_ruler.markers)
         if merged.markers:
             self.pub_boxes.publish(merged)
-
-        # ---- 色带 ----
-        if self.bridge is not None:
-            try:
-                cbar_msg = self.bridge.cv2_to_imgmsg(
-                    self._colorbar_img, encoding='bgr8')
-                cbar_msg.header = create_header(self.fixed_frame, stamp)
-                self.pub_colorbar.publish(cbar_msg)
-            except Exception as e:
-                self.get_logger().error(f'色带发布失败: {e}')
 
         # ---- 帧信息 ----
         det_count = len(self._latest_det.points) if self._latest_det else 0

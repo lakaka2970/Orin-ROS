@@ -7,7 +7,7 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 
 规格:
   - 帧率: 15 Hz
-  - 数据量: 32 MB/帧 (512 chirps × 16 antennas × 2048 samples × int16)
+  - 数据量: 32 MB/帧 (512 rows × 16 chirps/row × 2048 samples/chirp × int16)
   - 时间戳: 全局统一，微秒 (μs) 精度，使用 time.monotonic_ns()
 
 话题:
@@ -28,13 +28,13 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 # ============================================================================
 
 # ---------- 采集参数 ----------
-ADC_FPS                 = 15        # 帧率 (Hz)
-NUM_CHIRPS              = 512       # chirp 数量
-NUM_RX_ANTENNAS         = 16        # RX 天线通道数
-NUM_SAMPLES_PER_CHIRP   = 2048      # 每个 chirp 的采样点数
+ADC_FPS                    = 15        # 帧率 (Hz)
+NUM_ROWS                   = 512       # 行数
+NUM_CHIRPS_PER_ROW         = 16        # 每行的 chirp 数量
+NUM_SAMPLES_PER_CHIRP      = 2048      # 每个 chirp 的采样点数
 
 # ---------- 模拟参数 ----------
-SIM_NOISE_LEVEL         = 100       # 模拟噪声幅度（±）
+SIM_NOISE_LEVEL            = 100       # 模拟噪声幅度（±）
 
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
@@ -76,14 +76,14 @@ class AdcRxNode(Node):
 
         # ---------- ROS2 参数声明 ----------
         self.declare_parameter('fps', ADC_FPS)
-        self.declare_parameter('num_chirps', NUM_CHIRPS)
-        self.declare_parameter('num_rx_antennas', NUM_RX_ANTENNAS)
+        self.declare_parameter('num_rows', NUM_ROWS)
+        self.declare_parameter('num_chirps_per_row', NUM_CHIRPS_PER_ROW)
         self.declare_parameter('num_samples_per_chirp', NUM_SAMPLES_PER_CHIRP)
         self.declare_parameter('fixed_frame', FIXED_FRAME)
 
         self.fps                = int(self.get_parameter('fps').value)
-        self.num_chirps         = int(self.get_parameter('num_chirps').value)
-        self.num_rx_antennas    = int(self.get_parameter('num_rx_antennas').value)
+        self.num_rows           = int(self.get_parameter('num_rows').value)
+        self.num_chirps_per_row = int(self.get_parameter('num_chirps_per_row').value)
         self.num_samples        = int(self.get_parameter('num_samples_per_chirp').value)
         self.fixed_frame        = self.get_parameter('fixed_frame').value
 
@@ -108,12 +108,12 @@ class AdcRxNode(Node):
         period = 1.0 / self.fps
         self.timer = self.create_timer(period, self._on_timer)
         self.frame_count = 0
-        self._total_samples = self.num_chirps * self.num_rx_antennas * self.num_samples
+        self._total_samples = self.num_rows * self.num_chirps_per_row * self.num_samples
 
         self.get_logger().info(
             f'ADC Rx 启动: {self.fps} Hz, '
-            f'{self.num_chirps} chirps × {self.num_rx_antennas} antennas × '
-            f'{self.num_samples} samples, '
+            f'{self.num_rows} rows × {self.num_chirps_per_row} chirps/row × '
+            f'{self.num_samples} samples/chirp, '
             f'每帧 {self._total_samples * 2 / 1024 / 1024:.1f} MB')
 
     # ------------------------------------------------------------------
@@ -145,8 +145,8 @@ class AdcRxNode(Node):
         msg.header.stamp.sec = sec
         msg.header.stamp.nanosec = nsec
         msg.header.frame_id = self.fixed_frame
-        msg.num_chirps = self.num_chirps
-        msg.num_rx_antennas = self.num_rx_antennas
+        msg.num_rows = self.num_rows
+        msg.num_chirps_per_row = self.num_chirps_per_row
         msg.num_samples_per_chirp = self.num_samples
         msg.data = data_array.tolist()
 

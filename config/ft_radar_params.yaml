@@ -23,8 +23,8 @@ system:
 # 规格: 15 Hz, 32 MB/帧, 512×16×2048×int16
 adc_rx:
   fps: 15
-  num_chirps: 512
-  num_rx_antennas: 16
+  num_rows: 512
+  num_chirps_per_row: 16
   num_samples_per_chirp: 2048
   frame_size_bytes: 33554432              # 512×16×2048×2
 
@@ -99,6 +99,22 @@ rviz_ruler:
 # 5 个独立开关分别控制各数据通道的录制启停。
 # 可通过 `ros2 param set /logging_node <param> <value>` 运行时动态切换。
 #
+# 输出目录结构（仅前向中心雷达）:
+#   <output_dir>/
+#   ├── ego_motion.csv                       # 自车运动，单文件追加
+#   ├── calibration/                         # 标定文件
+#   │   └── radar_front_center_ft.yaml
+#   ├── pc_pcd_radar_front_center/          # 雷达点云 PCD（逐帧）
+#   │   └── <timestamp_us>.pcd
+#   ├── pc_csv_radar_front_center/          # 雷达点云 CSV（逐帧）
+#   │   └── <timestamp_us>.csv
+#   ├── obj_csv_radar/                      # 雷达目标 CSV（逐帧）
+#   │   └── <timestamp_us>.csv
+#   ├── camera_front_center/                # 相机图像（逐帧）
+#   │   └── <timestamp_us>.jpg
+#   └── adc_data/                           # ADC 原始数据（逐帧）
+#       └── <timestamp_us>.bin
+#
 # 帧数上限策略:
 #   ADC:     100 帧 → 约 3.2 GB (100 × 32 MB)
 #   Image:   1000 帧
@@ -107,7 +123,7 @@ rviz_ruler:
 #   Obj_List:  1000 帧
 # 达到上限后停止记录并输出警告日志
 logging:
-  output_dir: "/data/ft_radar_dataset"     # 输出根目录
+  output_dir: "output/ft_dataset"            # 输出根目录（相对路径基于工作区根）
   max_frames:
     adc: 100                              # ADC 原始数据最大帧数
     image: 1000                           # 相机图像最大帧数

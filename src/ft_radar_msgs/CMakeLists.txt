@@ -1,11 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(ft_radar_msgs)
 
-# 默认 C++ 标准
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
+# 纯消息包，无自定义 C++ 代码；rosidl 生成的 C++ 代码可能有编译警告，属正常现象
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)

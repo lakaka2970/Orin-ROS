@@ -78,23 +78,19 @@ ls config/        # 应显示 ft_radar_params.yaml 和 ft_radar.rviz
 
 ## 阶段 0：环境和构建验证
 
-### 0.1 构建
+### 0.1 构建（一步式）
 
 ```bash
 cd ~/Orin-ROS
-source /opt/ros/humble/setup.bash
 
-# 先构建消息包
-colcon build --packages-select ft_radar_msgs --symlink-install
-# 预期: Summary: 1 package finished
-
-# 再构建节点包
-source install/setup.bash
-colcon build --packages-select ft_framework --symlink-install
-# 预期: Summary: 1 package finished
-
-source install/setup.bash
+# 一键加载环境 + 构建（自动按依赖顺序编译两个包）
+bash scripts/build.sh
+# 预期: ✅ 构建成功！（Summary: 2 packages finished）
 ```
+
+> `bash scripts/build.sh` 自动完成：加载 ROS2 Humble → 编译 `ft_radar_msgs` → 加载 → 编译 `ft_framework` → 加载工作空间。一步到位。
+
+如需分步手动构建，也可使用 colcon 命令操作。
 
 ### 0.2 验证可执行文件
 
@@ -164,11 +160,11 @@ ros2 interface show ft_radar_msgs/msg/EgoMotion
 cd ~/Orin-ROS && source install/setup.bash
 ros2 run ft_framework adc_rx --ros-args \
   -p fps:=15 \
-  -p num_chirps:=512 \
-  -p num_rx_antennas:=16 \
+  -p num_rows:=512 \
+  -p num_chirps_per_row:=16 \
   -p num_samples_per_chirp:=2048
 # 预期日志:
-#   [INFO] ADC Rx 启动: 15 Hz, 512 chirps × 16 antennas × 2048 samples, 每帧 32.0 MB
+#   [INFO] ADC Rx 启动: 15 Hz, 512 rows × 16 chirps/row × 2048 samples/chirp, 每帧 32.0 MB
 
 # 终端 2: 验证话题
 cd ~/Orin-ROS && source install/setup.bash
@@ -188,8 +184,8 @@ ros2 topic hz /adc/raw_data
 # 检查单条消息内容
 ros2 topic echo /adc/raw_data --once
 # 预期输出:
-#   num_chirps: 512
-#   num_rx_antennas: 16
+#   num_rows: 512
+#   num_chirps_per_row: 16
 #   num_samples_per_chirp: 2048
 #   data: [-100, 85, -32, ...] (int16 数组)
 
@@ -555,7 +551,7 @@ ls -la $OUT_DIR/
 #   {timestamp}.csv   (至少 1 个，对应 obj_list)
 
 # === 验证 adc.bin ===
-# 前 20 bytes = 8B 时间戳 + 4B chirps + 4B antennas + 4B samples
+# 前 20 bytes = 8B 时间戳 + 4B rows + 4B chirps_per_row + 4B samples
 hexdump -C $OUT_DIR/adc.bin | head -2
 # 预期: 有数据输出
 
@@ -736,7 +732,7 @@ ros2 topic echo /vehicle/ego_motion --once 2>&1 | grep -E "sec|nanosec"
 ```bash
 # ADC 数据
 ros2 topic echo /adc/raw_data --once 2>&1 | head -10
-# 预期: num_chirps: 512, data: [...] (int16 数组非空)
+# 预期: num_rows: 512, data: [...] (int16 数组非空)
 
 # EgoMotion 字段完整性
 ros2 topic echo /vehicle/ego_motion --once 2>&1

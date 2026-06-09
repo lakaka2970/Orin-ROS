@@ -3,14 +3,32 @@
 """
 FT 数据日志记录节点 (Logging)
 ================================================================================
-集中订阅所有传感器数据和检测结果，支持 5 个独立开关控制各通道录制。
+集中订阅所有传感器数据和检测结果，按 FT_radar_dataset_requirement.md 规定的
+目录结构和数据格式写入磁盘。
+
+目录结构（仅前向中心雷达，无角雷达）:
+  <dataset_root>/                             # 例: output/ft_dataset
+  ├── ego_motion.csv                          # 自车运动，单文件追加
+  ├── calibration/
+  │   └── radar_front_center_ft.yaml          # 标定外参
+  ├── pc_pcd_radar_front_center/             # 雷达点云 PCD（逐帧）
+  │   └── <timestamp_us>.pcd
+  ├── pc_csv_radar_front_center/             # 雷达点云 CSV（逐帧）
+  │   └── <timestamp_us>.csv
+  ├── obj_csv_radar/                         # 雷达目标 CSV（逐帧）
+  │   └── <timestamp_us>.csv
+  ├── camera_front_center/                   # 相机图像（逐帧）
+  │   └── <timestamp_us>.jpg
+  └── adc_data/                              # ADC 原始数据（逐帧，非spec但保留）
+      └── <timestamp_us>.bin
 
 规格:
   - 5 独立通道: ADC / Image / Det_List / Ego_Motion / Obj_List
   - 每个通道独立开关，支持运行时动态切换 (ros2 param set)
   - 帧数上限: ADC 100 帧, 其他 1000 帧（超过停止记录并告警）
   - 异步写入: 独立写入线程 + 队列
-  - 时间戳对齐: 以 ADC 帧时钟为主基准（如 ADC 未启用则使用 ROS 时间）
+  - 文件名: {timestamp_us}.ext（微秒时间戳）
+  - CSV: 逗号分隔，首行为列名 header
 
 话题:
   订阅: /adc/raw_data             ft_radar_msgs/AdcRawData
@@ -19,35 +37,20 @@ FT 数据日志记录节点 (Logging)
         /vehicle/ego_motion       ft_radar_msgs/EgoMotion
         /perception/objects       ft_radar_msgs/ObjList
 
-输出文件:
-  adc.bin             ADC 原始数据（二进制连续存储）
-  {timestamp}.jpg     相机图像帧
-  {timestamp}.csv     det_list 雷达检测列表
-  {timestamp}.pcd     det_list 雷达检测点云
-  ego_motion.csv      自车运动数据（单文件追加）
-  {timestamp}.csv     obj_list 3D 目标列表
-
-连接关系:
-  ← ADC Rx (sub)
-  ← Camera Rx (sub)
-  ← RSP MIL Python (sub)
-  ← Vehicle Data Rx (sub)
-  ← 3D Object Detection (sub)
-
 作者: zhengyuan.liu
-日期: 2026.6.8
+日期: 2026.6.9
 ================================================================================
 """
 
 # ============================================================================
-# ★ 用户配置区 —— 所有常用参数集中在此，修改后重启节点即可生效
+# ★ 用户配置区
 # ============================================================================
 
-# ---------- 全局日志参数 ----------
-OUTPUT_DIR       = "/data/ft_radar_dataset"   # 输出根目录（实际部署时修改）
-STATUS_INTERVAL  = 5.0                        # 状态输出间隔 (s)
-FRAME_LIMIT_ADC  = 100                        # ADC 最大帧数
-FRAME_LIMIT_OTHER = 1000                      # 其他通道最大帧数
+# ---------- 全局参数 ----------
+OUTPUT_DIR        = "output/ft_dataset"          # 输出根目录（相对于工作区根目录）
+STATUS_INTERVAL   = 5.0                         # 状态输出间隔 (s)
+FRAME_LIMIT_ADC   = 100                         # ADC 最大帧数
+FRAME_LIMIT_OTHER = 1000                        # 其他通道最大帧数
 
 # ---------- 5 个独立开关（默认全部开启） ----------
 ENABLE_ADC        = True
@@ -57,7 +60,7 @@ ENABLE_EGO_MOTION = True
 ENABLE_OBJ_LIST   = True
 
 # ---------- 标定文件 ----------
-CALIBRATION_FILE = ""                          # 标定文件路径，空=不加载
+CALIBRATION_FILE = ""
 
 # ============================================================================
 # 以下为程序实现，一般无需修改
@@ -67,6 +70,7 @@ import os
 import time
 import threading
 import queue
+import array
 
 import rclpy
 from rclpy.node import Node
@@ -79,20 +83,15 @@ try:
 except ImportError:
     CvBridge = None
 
-
-# ============================================================================
-# 时间戳工具函数
-# ============================================================================
-
 from ft_framework.common import monotonic_us_stamp
 
 
+# ============================================================================
+# 时间戳工具
+# ============================================================================
+
 def get_timestamp_us(msg) -> int:
-    """
-    从消息的 header.stamp 获取微秒时间戳。
-    ROS2 Header.stamp 为 (sec, nanosec)，组合为微秒:
-      timestamp_us = sec * 1_000_000 + nanosec / 1_000
-    """
+    """从 header.stamp 提取微秒时间戳"""
     return msg.header.stamp.sec * 1_000_000 + msg.header.stamp.nanosec // 1000
 
 
@@ -101,47 +100,36 @@ def get_timestamp_us(msg) -> int:
 # ============================================================================
 
 class AsyncWriter:
-    """
-    异步文件写入器。
+    """异步文件写入器。独立线程 + 队列，不阻塞 ROS2 主回调。"""
 
-    使用独立线程 + 队列，不阻塞 ROS2 主回调。
-    """
-
-    def __init__(self, output_dir: str):
-        self._output_dir = output_dir
+    def __init__(self):
         self._queue = queue.Queue()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-        # 确保输出目录存在
-        os.makedirs(output_dir, exist_ok=True)
-
-    def enqueue(self, file_name: str, data: bytes, mode: str = 'wb'):
-        """提交写入任务到队列（线程安全）"""
-        self._queue.put((file_name, data, mode))
+    def enqueue(self, file_path: str, data: bytes, mode: str = 'wb'):
+        self._queue.put((file_path, data, mode))
 
     def stop(self):
-        """停止写入线程"""
         self._stop_event.set()
-        self._queue.put(None)      # 哨兵
+        self._queue.put(None)
         self._thread.join(timeout=5)
 
     def _run(self):
-        """后台写入线程"""
         while not self._stop_event.is_set():
             try:
                 item = self._queue.get(timeout=1)
                 if item is None:
                     break
-                fname, data, mode = item
-                fpath = os.path.join(self._output_dir, fname)
+                fpath, data, mode = item
+                os.makedirs(os.path.dirname(fpath), exist_ok=True)
                 with open(fpath, mode) as f:
                     f.write(data)
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f'[AsyncWriter] 写入失败 {fname}: {e}')
+                print(f'[AsyncWriter] 写入失败 {fpath}: {e}')
 
 
 # ============================================================================
@@ -149,24 +137,12 @@ class AsyncWriter:
 # ============================================================================
 
 class LoggingNode(Node):
-    """
-    数据日志记录节点
-
-    5 个独立开关分别控制各通道录制:
-      enable_adc / enable_image / enable_det_list / enable_ego_motion / enable_obj_list
-
-    所有开关支持运行时动态切换:
-      ros2 param set /logging_node enable_adc false
-
-    帧数上限:
-      ADC: 100 帧，其他: 1000 帧
-      达到上限后停止记录并输出警告日志
-    """
+    """数据日志记录节点"""
 
     def __init__(self):
         super().__init__('logging_node')
 
-        # ---------- ROS2 参数声明 ----------
+        # ---- ROS2 参数 ----
         self.declare_parameter('output_dir', OUTPUT_DIR)
         self.declare_parameter('status_interval', STATUS_INTERVAL)
         self.declare_parameter('max_frames.adc', FRAME_LIMIT_ADC)
@@ -181,12 +157,18 @@ class LoggingNode(Node):
         self.declare_parameter('enable_obj_list', ENABLE_OBJ_LIST)
         self.declare_parameter('calibration_file', CALIBRATION_FILE)
 
-        self._output_dir = self.get_parameter('output_dir').value
+        # 路径处理：相对路径相对于工作区根目录
+        raw_dir = self.get_parameter('output_dir').value
+        if os.path.isabs(raw_dir):
+            self._root = raw_dir
+        else:
+            # 相对路径 → 基于当前工作目录
+            self._root = os.path.abspath(raw_dir)
         self._status_interval = float(
             self.get_parameter('status_interval').value)
         self._calibration_file = self.get_parameter('calibration_file').value
 
-        # ---------- 帧数上限 ----------
+        # ---- 帧数上限 ----
         self._max_frames = {
             'adc':        int(self.get_parameter('max_frames.adc').value),
             'image':      int(self.get_parameter('max_frames.image').value),
@@ -195,22 +177,39 @@ class LoggingNode(Node):
             'obj_list':   int(self.get_parameter('max_frames.obj_list').value),
         }
 
-        # ---------- 异步写入器 ----------
-        self._writer = AsyncWriter(self._output_dir)
+        # ---- 创建子目录 ----
+        self._dirs = {
+            'adc':        os.path.join(self._root, 'adc_data'),
+            'image':      os.path.join(self._root, 'camera_front_center'),
+            'det_list_pcd': os.path.join(self._root, 'pc_pcd_radar_front_center'),
+            'det_list_csv': os.path.join(self._root, 'pc_csv_radar_front_center'),
+            'ego_motion': os.path.join(self._root),       # ego_motion.csv 在根
+            'obj_list':   os.path.join(self._root, 'obj_csv_radar'),
+            'calib':      os.path.join(self._root, 'calibration'),
+        }
+        for _, d in self._dirs.items():
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                self.get_logger().error(f'无法创建目录 {d}: {e}')
+                raise
 
-        # ---------- 帧计数器 ----------
+        # ---- 异步写入器 ----
+        self._writer = AsyncWriter()
+
+        # ---- 帧计数器 ----
         self._frame_counts = {k: 0 for k in self._max_frames}
         self._frame_reached_limit = {k: False for k in self._max_frames}
 
-        # ---------- cv_bridge（用于 image→jpg） ----------
+        # ---- cv_bridge ----
         self._bridge = CvBridge() if CvBridge is not None else None
         if self._bridge is None:
-            self.get_logger().warn('cv_bridge 未安装，Image 录制不可用')
+            self.get_logger().warning('cv_bridge 未安装，Image 录制不可用')
 
-        # ---------- ego_motion.csv 初始化 ----------
+        # ---- ego_motion.csv 初始化 ----
         self._init_ego_csv()
 
-        # ---------- 5 通道订阅 ----------
+        # ---- 5 通道订阅 ----
         self.sub_adc = self.create_subscription(
             AdcRawData, '/adc/raw_data', self._on_adc, 10)
         self.sub_image = self.create_subscription(
@@ -222,61 +221,64 @@ class LoggingNode(Node):
         self.sub_obj = self.create_subscription(
             ObjList, '/perception/objects', self._on_obj, 10)
 
-        # ---------- 标定文件处理 ----------
+        # ---- 标定文件复制 ----
         if self._calibration_file and os.path.exists(self._calibration_file):
             import shutil
-            dst = os.path.join(self._output_dir, 'calibration.yaml')
+            dst = os.path.join(
+                self._dirs['calib'], 'radar_front_center_ft.yaml')
             shutil.copy2(self._calibration_file, dst)
-            self.get_logger().info(f'标定文件已复制: {self._calibration_file} → {dst}')
+            self.get_logger().info(f'标定文件已复制 → {dst}')
 
-        # ---------- 状态定时器 ----------
+        # ---- 状态定时器 ----
         self.create_timer(self._status_interval, self._on_status)
         self._start_time = time.time()
 
         self.get_logger().info(
-            f'Logging 节点启动 | 输出: {self._output_dir} | '
-            f'帧上限: ADC={self._max_frames["adc"]}, '
-            f'其他={self._max_frames["image"]}')
+            f'Logging 启动 → {self._root} | '
+            f'ADC上限={self._max_frames["adc"]}, '
+            f'其他上限={self._max_frames["image"]}')
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 5 通道数据回调
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _on_adc(self, msg: AdcRawData):
-        """ADC 原始数据 → adc.bin（二进制追加）"""
+        """ADC → adc_data/<timestamp_us>.bin（逐帧二进制）"""
         if not self._get_switch('enable_adc', 'adc'):
             return
-
         ts = get_timestamp_us(msg)
-        # 帧头: 8 bytes 时间戳 + 12 bytes 元数据 + 数据
-        header = ts.to_bytes(8, 'little')
-        header += msg.num_chirps.to_bytes(4, 'little')
-        header += msg.num_rx_antennas.to_bytes(4, 'little')
-        header += msg.num_samples_per_chirp.to_bytes(4, 'little')
-
-        import struct
-        data_array = struct.pack(f'<{len(msg.data)}h', *msg.data)
-
-        self._writer.enqueue('adc.bin', header + data_array, 'ab')
+        # 帧头: 8B 时间戳 + 12B 元数据
+        hdr = ts.to_bytes(8, 'little')
+        hdr += msg.num_rows.to_bytes(4, 'little')
+        hdr += msg.num_chirps_per_row.to_bytes(4, 'little')
+        hdr += msg.num_samples_per_chirp.to_bytes(4, 'little')
+        payload = array.array('h', msg.data).tobytes()
+        fpath = os.path.join(self._dirs['adc'], f'{ts}.bin')
+        self._writer.enqueue(fpath, hdr + payload, 'wb')
         self._frame_counts['adc'] += 1
 
     def _on_image(self, msg: Image):
-        """相机图像 → {timestamp_us}.jpg"""
+        """Image → camera_front_center/<timestamp_us>.jpg"""
         if not self._get_switch('enable_image', 'image') or self._bridge is None:
             return
         try:
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             ts = get_timestamp_us(msg)
             import cv2
-            success, jpg_data = cv2.imencode('.jpg', cv_img)
+            success, jpg = cv2.imencode('.jpg', cv_img)
             if success:
-                self._writer.enqueue(f'{ts}.jpg', jpg_data.tobytes(), 'wb')
+                fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')
+                self._writer.enqueue(fpath, jpg.tobytes(), 'wb')
                 self._frame_counts['image'] += 1
         except Exception as e:
             self.get_logger().error(f'Image 写入失败: {e}')
 
     def _on_det_list(self, msg: DetList):
-        """检测列表 → {timestamp_us}.csv + {timestamp_us}.pcd"""
+        """
+        DetList → 同时输出:
+          pc_pcd_radar_front_center/<timestamp_us>.pcd
+          pc_csv_radar_front_center/<timestamp_us>.csv
+        """
         if not self._get_switch('enable_det_list', 'det_list'):
             return
         ts = get_timestamp_us(msg)
@@ -284,20 +286,7 @@ class LoggingNode(Node):
         if n == 0:
             return
 
-        # ---- CSV ----
-        csv_lines = [
-            'x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,'
-            'exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx'
-        ]
-        for p in msg.points:
-            csv_lines.append(
-                f'{p.x},{p.y},{p.z},{p.range},{p.azimuth},{p.elevation},'
-                f'{p.rcs},{p.snr},{p.ambgt},'
-                f'{p.exist_prob},{p.multi_tgt_prob},{p.ambgt_prob},'
-                f'{p.raw_doppler},{p.idx}')
-        self._writer.enqueue(f'{ts}.csv', '\n'.join(csv_lines).encode(), 'wb')
-
-        # ---- PCD (ASCII) ----
+        # ---- PCD (v0.7 ASCII) ----
         pcd_lines = [
             '# .PCD v0.7 - Point Cloud Data file format',
             'VERSION 0.7',
@@ -318,22 +307,40 @@ class LoggingNode(Node):
                 f'{p.rcs} {p.snr} {p.ambgt} '
                 f'{p.exist_prob} {p.multi_tgt_prob} {p.ambgt_prob} '
                 f'{p.raw_doppler} {p.idx}')
-        self._writer.enqueue(f'{ts}.pcd', '\n'.join(pcd_lines).encode(), 'wb')
+
+        pcd_path = os.path.join(self._dirs['det_list_pcd'], f'{ts}.pcd')
+        self._writer.enqueue(pcd_path, '\n'.join(pcd_lines).encode(), 'wb')
+
+        # ---- CSV（逗号分隔） ----
+        csv_lines = [
+            'x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,'
+            'exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx'
+        ]
+        for p in msg.points:
+            csv_lines.append(
+                f'{p.x},{p.y},{p.z},{p.range},{p.azimuth},{p.elevation},'
+                f'{p.rcs},{p.snr},{p.ambgt},'
+                f'{p.exist_prob},{p.multi_tgt_prob},{p.ambgt_prob},'
+                f'{p.raw_doppler},{p.idx}')
+
+        csv_path = os.path.join(self._dirs['det_list_csv'], f'{ts}.csv')
+        self._writer.enqueue(csv_path, '\n'.join(csv_lines).encode(), 'wb')
 
         self._frame_counts['det_list'] += 1
 
     def _on_ego(self, msg: EgoMotion):
-        """自车运动 → ego_motion.csv（单文件追加）"""
+        """EgoMotion → ego_motion.csv（单文件追加，逗号分隔）"""
         if not self._get_switch('enable_ego_motion', 'ego_motion'):
             return
         ts = get_timestamp_us(msg)
-        line = f'{ts},{msg.vx},{msg.yaw_rate},{msg.steering_angle},' \
-               f'{msg.ax},{msg.ay},{msg.gear}\n'
-        self._writer.enqueue('ego_motion.csv', line.encode(), 'ab')
+        line = (f'{ts},{msg.vx},{msg.yaw_rate},{msg.steering_angle},'
+                f'{msg.ax},{msg.ay},{msg.gear}\n')
+        fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
+        self._writer.enqueue(fpath, line.encode(), 'ab')
         self._frame_counts['ego_motion'] += 1
 
     def _on_obj(self, msg: ObjList):
-        """3D 目标列表 → {timestamp_us}.csv"""
+        """ObjList → obj_csv_radar/<timestamp_us>.csv（逗号分隔）"""
         if not self._get_switch('enable_obj_list', 'obj_list'):
             return
         ts = get_timestamp_us(msg)
@@ -350,63 +357,68 @@ class LoggingNode(Node):
                 f'{obj.x},{obj.y},{obj.z},{obj.l},{obj.w},{obj.h},{obj.yaw},'
                 f'{obj.vx_absolute},{obj.vy_absolute},{obj.vz_absolute},'
                 f'{obj.moving_state}')
-        self._writer.enqueue(f'{ts}.csv', '\n'.join(csv_lines).encode(), 'wb')
+
+        fpath = os.path.join(self._dirs['obj_list'], f'{ts}.csv')
+        self._writer.enqueue(fpath, '\n'.join(csv_lines).encode(), 'wb')
         self._frame_counts['obj_list'] += 1
 
-    # ------------------------------------------------------------------
-    # 开关控制辅助
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # 开关控制
+    # ==================================================================
 
     def _get_switch(self, param_name: str, channel: str) -> bool:
         """
-        统一检查:
-          1. 通道开关是否开启
-          2. 帧数是否达到上限
-        返回 True = 可以录制
+        双重检查: ① 通道开关 ② 帧数上限
+        支持 bool 和 str 类型参数值（Launch 传入的为字符串）
         """
-        if not self.get_parameter(param_name).value:
+        val = self.get_parameter(param_name).value
+        if isinstance(val, str):
+            enabled = val.lower() in ('true', '1', 'yes')
+        else:
+            enabled = bool(val)
+        if not enabled:
             return False
         if self._frame_reached_limit[channel]:
             return False
-        frame_count = self._frame_counts[channel]
-        max_frames = self._max_frames[channel]
-        if frame_count >= max_frames:
+        fc = self._frame_counts[channel]
+        if fc >= self._max_frames[channel]:
             if not self._frame_reached_limit[channel]:
                 self._frame_reached_limit[channel] = True
-                self.get_logger().warn(
-                    f'{channel} 已达帧数上限 ({max_frames})，停止录制')
+                self.get_logger().warning(
+                    f'{channel} 已达上限 ({self._max_frames[channel]}帧)，停止录制')
             return False
         return True
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # ego_motion.csv 初始化
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _init_ego_csv(self):
-        """初始化 ego_motion.csv，写入 CSV 表头"""
-        output_dir = self._output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        csv_path = os.path.join(output_dir, 'ego_motion.csv')
-        header = 'timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n'
-        with open(csv_path, 'w') as f:
-            f.write(header)
-        self.get_logger().info(f'ego_motion.csv 初始化完成: {csv_path}')
+        """ego_motion.csv 写入 CSV 表头"""
+        try:
+            fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+            header = 'timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n'
+            with open(fpath, 'w') as f:
+                f.write(header)
+            self.get_logger().info(f'ego_motion.csv → {fpath}')
+        except OSError as e:
+            self.get_logger().error(f'ego_motion.csv 初始化失败: {e}')
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 状态输出
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _on_status(self):
-        """定期输出录制统计"""
         elapsed = time.time() - self._start_time
         parts = [f'{k}={v}/{self._max_frames[k]}'
                  for k, v in self._frame_counts.items()]
         self.get_logger().info(
-            f'[Logging 状态] 运行 {elapsed:.1f}s | ' + ' | '.join(parts))
+            f'[状态] {elapsed:.0f}s | ' + ' | '.join(parts))
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 销毁
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def destroy_node(self):
         self._on_status()
@@ -425,7 +437,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Logging 收到中断信号，正在退出...')
+        node.get_logger().info('Logging 收到中断信号')
     finally:
         node.destroy_node()
         rclpy.shutdown()

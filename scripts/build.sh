@@ -2,24 +2,18 @@
 # ============================================================================
 # FT Radar Framework — 一步式环境加载与构建脚本
 # ============================================================================
+# 自动检测 ROS2 发行版:
+#   Ubuntu 20.04 → Foxy   (/opt/ros/foxy/setup.bash)
+#   Ubuntu 22.04 → Humble (/opt/ros/humble/setup.bash)
+#
 # 用法:
 #   bash scripts/build.sh                          # 增量构建
 #   bash scripts/build.sh --clean                  # 清理后重新构建
 #   bash scripts/build.sh --launch                 # 构建后直接启动
 #   bash scripts/build.sh --clean --launch         # 清理→构建→启动
 #
-# 特性:
-#   - 自动加载 ROS2 Humble 环境
-#   - 一步完成两个包的按序构建
-#   - 输出启动所需的 exact 命令
-#
-# 注意:
-#   脚本内的 source 仅影响脚本自身。构建完成后，
-#   必须在当前终端手动执行以下命令加载工作空间:
-#     source install/setup.bash
-#
 # 作者: zhengyuan.liu
-# 日期: 2026.6.8
+# 日期: 2026.6.10
 # ============================================================================
 
 set -e
@@ -38,18 +32,43 @@ for arg in "$@"; do
     esac
 done
 
+# ===== 自动检测 ROS2 发行版 =====
+_detect_ros2() {
+    for d in humble foxy; do
+        if [ -f "/opt/ros/$d/setup.bash" ]; then
+            echo "$d"; return
+        fi
+    done
+    # 回退: 从 Ubuntu 版本推断
+    case "$(lsb_release -rs 2>/dev/null)" in
+        20.04) echo "foxy" ;;
+        22.04) echo "humble" ;;
+        *)     echo "" ;;
+    esac
+}
+
+ROS2_DISTRO=$(_detect_ros2)
+
+if [ -z "$ROS2_DISTRO" ]; then
+    echo "[ERROR] 无法检测 ROS2 安装。请先运行:"
+    echo "          bash scripts/install_deps.sh --with-ros2"
+    exit 1
+fi
+
+ROS2_SETUP="/opt/ros/$ROS2_DISTRO/setup.bash"
+
 echo "=============================================="
 echo "  FT Radar Framework — 一步式构建"
 echo "  项目根目录: $PROJECT_ROOT"
+echo "  ROS2:     $ROS2_DISTRO"
 echo "=============================================="
 
 # ===== 步骤 1: 加载 ROS2 环境 =====
-if [ -f /opt/ros/humble/setup.bash ]; then
-    source /opt/ros/humble/setup.bash
-    echo "[1/4] ✅ ROS2 Humble 环境已加载"
+if [ -f "$ROS2_SETUP" ]; then
+    source "$ROS2_SETUP"
+    echo "[1/4] ✅ ROS2 $ROS2_DISTRO 环境已加载"
 else
-    echo "[ERROR] 未找到 /opt/ros/humble/setup.bash"
-    echo "        请确认 ROS2 Humble 已安装"
+    echo "[ERROR] 未找到 $ROS2_SETUP"
     exit 1
 fi
 

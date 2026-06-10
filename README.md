@@ -1,9 +1,15 @@
-# FT Radar Fusion Framework — ROS2 Humble
+# FT Radar Fusion Framework — ROS2
 
-基于 ROS2 Humble 的雷达-相机-车辆多传感器融合感知框架，运行于 **NVIDIA Jetson AGX Orin**。
+基于 ROS2 的雷达-相机-车辆多传感器融合感知框架，运行于 **NVIDIA Jetson AGX Orin**。
+
+| 操作系统 | ROS2 发行版 | Python | 说明 |
+|---------|------------|--------|------|
+| Ubuntu 20.04 | **Foxy** | 3.8 | 官方原生支持 |
+| Ubuntu 22.04 | **Humble** | 3.10 | 官方原生支持 |
+
+> 两个发行版 rclpy API 兼容，项目代码无需修改。脚本自动检测并加载对应环境。
 
 [![ROS2](https://img.shields.io/badge/ROS2-Humble-brightgreen)](https://docs.ros.org/en/humble/)
-[![Python](https://img.shields.io/badge/Python-3.10-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Jetson%20AGX%20Orin-orange)](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/)
 
 ---
@@ -30,7 +36,13 @@
 ```bash
 cd ~/Orin-ROS
 
-# 1. 一键构建（自动加载 ROS2 环境，按序编译消息包和节点包）
+# 0. (仅首次) 安装依赖 — 含 ROS2 Humble 本体 + 项目所需功能包
+bash scripts/install_deps.sh --with-ros2
+
+#   (已有 ROS2 Humble 时，仅安装项目依赖)
+bash scripts/install_deps.sh
+
+# 1. 一键构建（自动加载 ROS2 Humble 环境，按序编译消息包和节点包）
 bash scripts/build.sh
 
 # 2. 加载工作空间
@@ -39,6 +51,16 @@ source install/setup.bash
 # 3. 启动全部节点（默认 CUDA 模式）
 ros2 launch ft_framework ft_radar_launch.py
 ```
+
+### 安装说明
+
+| 场景 | 命令 |
+|------|------|
+| **全新系统**（无 ROS2） | `bash scripts/install_deps.sh --with-ros2` |
+| **已有 ROS2 Humble** | `bash scripts/install_deps.sh` |
+| **仅检查不安装** | `bash scripts/install_deps.sh --dry-run` |
+
+> Ubuntu 20.04 用户: 脚本会自动添加 packages.ros.org apt 源（ROS2 Humble 不在 20.04 默认仓库中）。
 
 ### 构建选项
 
@@ -412,7 +434,9 @@ Orin-ROS/
 │   ├── ft_radar_params.yaml
 │   └── ft_radar.rviz
 ├── scripts/
-│   └── build.sh
+│   ├── install_deps.sh             # 依赖一键安装 (ROS2 Humble)
+│   ├── build.sh                    # 一键构建
+│   └── launch_all.sh               # 一键启动
 ├── data/                           # 模拟测试数据
 ├── docs/                           # 架构与使用文档
 └── 参考/                           # 原始需求文档
@@ -426,4 +450,4 @@ Apache-2.0
 
 **作者**: zhengyuan.liu  
 **创建**: 2026.6.8  
-**更新**: 2026.6.9
+**更新**: 2026.6.10

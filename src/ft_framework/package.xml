@@ -3,7 +3,7 @@
 <package format="3">
   <name>ft_framework</name>
   <version>0.1.0</version>
-  <description>FT Radar-Camera-Vehicle Data Fusion Framework for ROS2 Humble</description>
+  <description>FT Radar-Camera-Vehicle Data Fusion Framework (ROS2 Foxy/Humble)</description>
   <maintainer email="zhengyuan.liu@example.com">zhengyuan.liu</maintainer>
   <license>Apache-2.0</license>
 

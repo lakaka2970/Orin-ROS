@@ -21,7 +21,7 @@ setup(
     zip_safe=True,
     maintainer='zhengyuan.liu',
     maintainer_email='zhengyuan.liu@example.com',
-    description='FT Radar-Camera-Vehicle Data Fusion Framework for ROS2 Humble',
+    description='FT Radar-Camera-Vehicle Data Fusion Framework (ROS2 Foxy/Humble)',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [

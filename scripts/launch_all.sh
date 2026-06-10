@@ -2,15 +2,16 @@
 # ============================================================================
 # FT Radar Framework — 一键启动脚本
 # ============================================================================
+# 自动检测 ROS2 发行版 (Foxy / Humble) 并加载对应环境。
+#
 # 用法:
 #   bash scripts/launch_all.sh                      # 默认 CUDA 模式
 #   bash scripts/launch_all.sh python               # Python 模式
 #   bash scripts/launch_all.sh cuda --rviz          # CUDA 模式 + RViz
 #   bash scripts/launch_all.sh both_compare         # 双路对比模式
-#   bash scripts/launch_all.sh cuda log_image:=false # 自定义 Logging 开关
 #
 # 作者: zhengyuan.liu
-# 日期: 2026.6.8
+# 日期: 2026.6.10
 # ============================================================================
 
 set -e
@@ -18,17 +19,34 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-RSP_MODE="${1:-cuda}"        # 默认 CUDA 模式
-RVIZ_FLAG="$2"               # --rviz 标志
+RSP_MODE="${1:-cuda}"
+RVIZ_FLAG="$2"
+
+# ── 自动检测 ROS2 ──
+_detect_ros2() {
+    for d in humble foxy; do
+        [ -f "/opt/ros/$d/setup.bash" ] && echo "$d" && return
+    done
+    case "$(lsb_release -rs 2>/dev/null)" in
+        20.04) echo "foxy" ;;
+        22.04) echo "humble" ;;
+        *)     echo "humble" ;;
+    esac
+}
+
+ROS2_DISTRO=$(_detect_ros2)
 
 echo "=============================================="
 echo "  FT Radar Framework — 启动脚本"
-echo "  模式: $RSP_MODE"
+echo "  ROS2:     $ROS2_DISTRO"
+echo "  模式:     $RSP_MODE"
 echo "=============================================="
 
-# 加载 ROS2 环境
-if [ -f /opt/ros/humble/setup.bash ]; then
-    source /opt/ros/humble/setup.bash
+if [ -f "/opt/ros/$ROS2_DISTRO/setup.bash" ]; then
+    source "/opt/ros/$ROS2_DISTRO/setup.bash"
+    echo "[INFO] ROS2 $ROS2_DISTRO 环境已加载"
+else
+    echo "[WARN] 未找到 ROS2 环境，尝试继续..."
 fi
 
 # 加载工作空间

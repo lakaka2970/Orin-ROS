@@ -51,6 +51,9 @@ adc_rx:
   num_chirps_per_row: 16
   num_samples_per_chirp: 2048
   frame_size_bytes: 33554432              # 512×16×2048×2
+  data_dir: "data"                        # .bin 文件目录 (相对路径基于 CWD)
+  max_preload_files: 30                   # 最多预加载文件数 (~960 MB)
+  use_noise_pool: true                    # 无文件时自动回退到噪声池
 
 # ====================================================================
 # 节点: Camera Rx — 相机数据接收

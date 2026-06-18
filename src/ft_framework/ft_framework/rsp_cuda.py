@@ -102,10 +102,12 @@ class RspCudaNode(Node):
         self._latest_ego = None
 
         # ---------- 订阅 ----------
+        _qos = rclpy.qos.QoSProfile(depth=10,
+            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
-            AdcRawData, '/adc/raw_data', self._on_adc, 10)
+            AdcRawData, '/adc/raw_data', self._on_adc, _qos)
         self.create_subscription(
-            EgoMotion, '/vehicle/ego_motion', self._on_ego, 10)
+            EgoMotion, '/vehicle/ego_motion', self._on_ego, _qos)
 
         # ---------- 发布（按模式条件切换话题） ----------
         self._pub_enabled = self.rsp_mode in ('cuda', 'both', 'both_compare')

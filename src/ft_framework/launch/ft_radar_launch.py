@@ -133,12 +133,16 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument(
         'log_obj_list', default_value='true',
         description='Logging: 是否录制 Obj_List 数据'))
+    ld.add_action(DeclareLaunchArgument(
+        'rx_impl', default_value='cpp',
+        description='Rx 节点实现: cpp (C++ 零拷贝) | python (Python 原版)'))
 
     # ========================================================================
     # 模式引用
     # ========================================================================
 
-    rsp_mode = LaunchConfiguration('rsp_mode')
+    rsp_mode  = LaunchConfiguration('rsp_mode')
+    rx_impl   = LaunchConfiguration('rx_impl')
 
     # 条件表达式
     python_enabled = PythonExpression([
@@ -147,30 +151,44 @@ def generate_launch_description():
     cuda_enabled = PythonExpression([
         "'", rsp_mode, "' in ['cuda', 'both', 'both_compare']"
     ])
+    use_cpp = PythonExpression(["'", rx_impl, "' == 'cpp'"])
+    use_py  = PythonExpression(["'", rx_impl, "' == 'python'"])
+
+    # ========================================================================
+    # 包引用 (根据 rx_impl 选择)
+    # ========================================================================
+
+    adc_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    adc_exe     = PythonExpression(["'adc_rx_cpp' if '", rx_impl, "' == 'cpp' else 'adc_rx'"])
+    cam_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    cam_exe     = PythonExpression(["'camera_rx_cpp' if '", rx_impl, "' == 'cpp' else 'camera_rx'"])
+    veh_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    veh_exe     = PythonExpression(["'vehicle_data_rx_cpp' if '", rx_impl, "' == 'cpp' else 'vehicle_data_rx'"])
 
     # ========================================================================
     # 启动日志
     # ========================================================================
 
     ld.add_action(LogInfo(
-        msg=['=== FT Radar Framework: rsp_mode=[', rsp_mode, '] ===']))
+        msg=['=== FT Radar Framework: rsp_mode=[', rsp_mode,
+             ']  rx_impl=[', rx_impl, '] ===']))
 
     # ========================================================================
     # 第一层：数据采集层 (3 个节点)
     # ========================================================================
 
     ld.add_action(Node(
-        package='ft_framework', executable='adc_rx', name='adc_rx',
+        package=adc_pkg, executable=adc_exe, name='adc_rx',
         output='screen',
-        parameters=[{**adc_cfg, 'fps': 15}]))
+        parameters=[{**adc_cfg, 'fps': 15.0}]))
     ld.add_action(Node(
-        package='ft_framework', executable='camera_rx', name='camera_rx',
+        package=cam_pkg, executable=cam_exe, name='camera_rx',
         output='screen',
-        parameters=[{**camera_cfg, 'fps': 30}]))
+        parameters=[{**camera_cfg, 'fps': 30.0}]))
     ld.add_action(Node(
-        package='ft_framework', executable='vehicle_data_rx',
+        package=veh_pkg, executable=veh_exe,
         name='vehicle_data_rx', output='screen',
-        parameters=[{**vehicle_cfg, 'fps': 50}]))
+        parameters=[{**vehicle_cfg, 'fps': 50.0}]))
 
     # ========================================================================
     # 第二层：雷达信号处理层 (按 mode 条件启动)

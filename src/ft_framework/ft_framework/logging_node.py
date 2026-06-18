@@ -248,21 +248,23 @@ class LoggingNode(Node):
         # ego_motion 表头
         self._init_ego_csv()
 
-        # 订阅 (6 路)
+        # 订阅 (6 路) — Best Effort 匹配 C++ 发布者
+        _qos = rclpy.qos.QoSProfile(depth=10,
+            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
         self.sub_adc = self.create_subscription(
-            AdcRawData, '/adc/raw_data',  self._on_adc,  10)
+            AdcRawData, '/adc/raw_data',  self._on_adc,  _qos)
         self.sub_image = self.create_subscription(
-            Image, '/camera/image_raw',    self._on_image, 10)
+            Image, '/camera/image_raw',    self._on_image, _qos)
         self.sub_det = self.create_subscription(
             DetList, '/processing/radar/det_list',
-            self._on_det_list, 10)
+            self._on_det_list, _qos)
         self.sub_det_cu = self.create_subscription(
             DetList, '/processing/radar/det_list_cuda',
-            self._on_det_list_cuda, 10)
+            self._on_det_list_cuda, _qos)
         self.sub_ego = self.create_subscription(
-            EgoMotion, '/vehicle/ego_motion', self._on_ego, 10)
+            EgoMotion, '/vehicle/ego_motion', self._on_ego, _qos)
         self.sub_obj = self.create_subscription(
-            ObjList, '/perception/objects',   self._on_obj, 10)
+            ObjList, '/perception/objects',   self._on_obj, _qos)
 
         # 标定文件 (如果指定了路径且存在)
         if self._calibration_file and os.path.exists(self._calibration_file):

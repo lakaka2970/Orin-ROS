@@ -32,8 +32,8 @@ FT 相机数据接收节点 (Camera Rx)
 
 # ---------- 相机参数 ----------
 CAMERA_FPS      = 30        # 帧率 (Hz)
-IMAGE_WIDTH     = 1280      # 图像宽度 (px)
-IMAGE_HEIGHT    = 720       # 图像高度 (px)
+IMAGE_WIDTH     = 4         # 图像宽度 (px)  — 空数据模式, 不占用硬盘空间
+IMAGE_HEIGHT    = 4         # 图像高度 (px)  — 空数据模式, 不占用硬盘空间
 
 # ---------- 预留参数 ----------
 LINE            = 0         # 待确认，预留接口
@@ -47,7 +47,6 @@ FIXED_FRAME = 'camera'
 # ============================================================================
 
 import numpy as np
-import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -139,28 +138,14 @@ class CameraRxNode(Node):
 
     def _on_timer(self):
         """
-        生成模拟测试图案并发布。
-        实际部署时替换为相机驱动读取（格式待确认）。
+        发布极小空图像以维持节点拓扑, 不生成测试图案, 不占用硬盘空间.
+        4×4×3 = 48 bytes/frame, 30 Hz ≈ 1.4 KB/s.
         """
         self.frame_count += 1
         sec, nsec = monotonic_us_stamp()
 
-        w, h = self.image_width, self.image_height
-
-        # 测试图案：渐变色背景 + 移动圆 + 帧号文字
-        img = np.zeros((h, w, 3), dtype=np.uint8)
-
-        for y in range(h):
-            color_val = int(128 + 64 * np.sin(y * 0.01 + self.frame_count * 0.1))
-            img[y, :] = [color_val, 200 - color_val // 2, 128]
-
-        cx = int(w * 0.5 + 200 * np.sin(self.frame_count * 0.05))
-        cy = int(h * 0.5 + 100 * np.cos(self.frame_count * 0.07))
-        cv2.circle(img, (cx, cy), 40, (0, 255, 255), 2)
-
-        cv2.putText(img, f'Frame: {self.frame_count}',
-                    (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (255, 255, 255), 2)
+        # 极小空图像
+        img = np.zeros((self.image_height, self.image_width, 3), dtype=np.uint8)
 
         # 发布图像
         img_msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')

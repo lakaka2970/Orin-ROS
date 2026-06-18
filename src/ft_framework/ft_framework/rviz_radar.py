@@ -172,7 +172,13 @@ class RvizRadarNode(Node):
 
     def _on_publish(self):
         self.frame_count += 1
-        stamp = self.get_clock().now().to_msg()
+        # 使用最新数据的时间戳 (透传 ADC 时间)，避免与 static TF 时间冲突
+        if self._latest_det is not None:
+            stamp = self._latest_det.header.stamp
+        elif self._latest_det_cu is not None:
+            stamp = self._latest_det_cu.header.stamp
+        else:
+            stamp = self.get_clock().now().to_msg()
 
         # ---- 合并所有 DetList → 点云 ----
         all_xyz = []

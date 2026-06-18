@@ -28,13 +28,14 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 # ============================================================================
 
 # ---------- 采集参数 ----------
-ADC_FPS                    = 15        # 帧率 (Hz)
+ADC_FPS                    = 10        # 帧率 (Hz)
 NUM_ROWS                   = 512       # 行数
 NUM_CHIRPS_PER_ROW         = 16        # 每行的 chirp 数量
 NUM_SAMPLES_PER_CHIRP      = 2048      # 每个 chirp 的采样点数
 
 # ---------- 模拟参数 ----------
 SIM_NOISE_LEVEL            = 100       # 模拟噪声幅度（±）
+SIM_NOISE_POOL_FACTOR      = 4         # 噪声池倍数 (预生成池 = 帧大小 × 倍数)
 
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
@@ -43,6 +44,7 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
+import os
 import numpy as np
 
 import rclpy
@@ -52,6 +54,7 @@ from geometry_msgs.msg import TransformStamped
 
 from ft_radar_msgs.msg import AdcRawData
 from ft_framework.common import monotonic_us_stamp
+from ft_framework.perf_profiler import FrameProfiler
 
 
 # ============================================================================
@@ -80,12 +83,28 @@ class AdcRxNode(Node):
         self.declare_parameter('num_chirps_per_row', NUM_CHIRPS_PER_ROW)
         self.declare_parameter('num_samples_per_chirp', NUM_SAMPLES_PER_CHIRP)
         self.declare_parameter('fixed_frame', FIXED_FRAME)
+        self.declare_parameter('profiler_enabled', True)
+        self.declare_parameter('profiler_log_interval', 50)
+        self.declare_parameter('profiler_report_dir', '')
 
         self.fps                = int(self.get_parameter('fps').value)
         self.num_rows           = int(self.get_parameter('num_rows').value)
         self.num_chirps_per_row = int(self.get_parameter('num_chirps_per_row').value)
         self.num_samples        = int(self.get_parameter('num_samples_per_chirp').value)
         self.fixed_frame        = self.get_parameter('fixed_frame').value
+
+        # ---------- 性能分析器 (自动接入 _on_timer) ----------
+        prof_enabled  = bool(self.get_parameter('profiler_enabled').value)
+        prof_interval = int(self.get_parameter('profiler_log_interval').value)
+        prof_dir      = self.get_parameter('profiler_report_dir').value or os.getcwd()
+        self._prof = FrameProfiler(
+            self, log_every_n=prof_interval, enabled=prof_enabled,
+            report_to_file=True, report_dir=prof_dir)
+        self._prof.wrap_callback(self, '_on_timer')     # 自动接管 tick/tick_end
+        if prof_enabled:
+            self.get_logger().info(
+                f'性能分析器已启用 (每 {prof_interval} 帧报告, '
+                f'文件输出: {prof_dir}')
 
         # ---------- 静态 TF：radar → map ----------
         self._tf_static = tf2_ros.StaticTransformBroadcaster(self)
@@ -116,6 +135,24 @@ class AdcRxNode(Node):
             f'{self.num_samples} samples/chirp, '
             f'每帧 {self._total_samples * 2 / 1024 / 1024:.1f} MB')
 
+        # ---------- 预生成模拟噪声池 ----------
+        # 原理: np.random.randint(16.7M) 在 ARM 上需 ~82ms，
+        #   改为预生成 4x 噪声池 + 每帧随机切片，将 O(16.7M) 降到 O(1)。
+        pool_size = self._total_samples * SIM_NOISE_POOL_FACTOR
+        self._noise_pool = np.random.randint(
+            -SIM_NOISE_LEVEL, SIM_NOISE_LEVEL, pool_size, dtype=np.int16)
+        self._pool_max_offset = pool_size - self._total_samples
+        self.get_logger().info(
+            f'噪声池已预生成: {pool_size / 1e6:.1f}M 采样 '
+            f'({pool_size * 2 / 1024 / 1024:.1f} MB)')
+
+        # ---------- 预分配消息对象 (复用避免每帧 malloc) ----------
+        self._msg = AdcRawData()
+        self._msg.header.frame_id = self.fixed_frame
+        self._msg.num_rows = self.num_rows
+        self._msg.num_chirps_per_row = self.num_chirps_per_row
+        self._msg.num_samples_per_chirp = self.num_samples
+
     # ------------------------------------------------------------------
     # 定时器回调
     # ------------------------------------------------------------------
@@ -124,43 +161,48 @@ class AdcRxNode(Node):
         """
         模拟 ADC 数据采集:
           1. 注入全局时间戳（单调时钟，微秒精度）
-          2. 模拟 v4l2 读取原始 int16 数据
-          3. 构造 AdcRawData 消息并发布
+          2. 从预生成噪声池中随机切片 (替代实时 randint)
+          3. 复用预分配消息对象并发布
+
+        FrameProfiler 通过 wrap_callback 自动接管帧级计时，
+        checkpoint 置于每步代码之后，确保名称与测量内容一致。
         """
         self.frame_count += 1
 
         # ---- 1. 注入时间戳 ----
         sec, nsec = monotonic_us_stamp()
+        self._prof.checkpoint('1.timestamp')
 
-        # ---- 2. 模拟 ADC 数据采集 ----
+        # ---- 2. 模拟 ADC 数据采集 (预生成池随机切片) ----
         # 实际部署时，此处替换为 v4l2 驱动读取:
         #   data_buffer = v4l2_device.read(frame_size_bytes)
         #   int16_array = np.frombuffer(data_buffer, dtype=np.int16)
-        data_array = np.random.randint(
-            -SIM_NOISE_LEVEL, SIM_NOISE_LEVEL,
-            self._total_samples, dtype=np.int16)
+        offset = np.random.randint(0, self._pool_max_offset + 1)
+        data_array = self._noise_pool[offset : offset + self._total_samples]
+        self._prof.checkpoint('2.np_random')
 
-        # ---- 3. 构造消息 ----
-        msg = AdcRawData()
-        msg.header.stamp.sec = sec
-        msg.header.stamp.nanosec = nsec
-        msg.header.frame_id = self.fixed_frame
-        msg.num_rows = self.num_rows
-        msg.num_chirps_per_row = self.num_chirps_per_row
-        msg.num_samples_per_chirp = self.num_samples
-        msg.data = data_array.tolist()
+        # ---- 3. 更新消息 (复用预分配对象) ----
+        self._msg.header.stamp.sec = sec
+        self._msg.header.stamp.nanosec = nsec
+        # ★ 绕过 setter: 直接写 _data 避免 Foxy 内部 list(bytes) 转换
+        self._msg._data = data_array.tobytes()
+        self._prof.checkpoint('3.build_msg')
 
-        self.pub_adc.publish(msg)
+        # ---- 4. 发布 ----
+        self.pub_adc.publish(self._msg)
+        self._prof.checkpoint('4.publish')
+
         self.get_logger().debug(
             f'ADC Rx 帧 #{self.frame_count}: '
             f'timestamp={sec}.{nsec:09d}, '
-            f'data_size={len(msg.data)}')
+            f'data_size={self._total_samples}')
 
     # ------------------------------------------------------------------
     # 销毁
     # ------------------------------------------------------------------
 
     def destroy_node(self):
+        self._prof.finalize()       # 输出最终报告并落盘 JSON
         self.get_logger().info(f'ADC Rx 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()
 

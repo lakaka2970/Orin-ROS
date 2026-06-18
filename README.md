@@ -36,21 +36,25 @@
 ```bash
 cd ~/Orin-ROS
 
-# 0. (仅首次) 安装依赖 — 含 ROS2 Humble 本体 + 项目所需功能包
+# 0a. (仅首次) 安装依赖 — 含 ROS2 Humble 本体 + 项目所需功能包
 bash scripts/install_deps.sh --with-ros2
 
-#   (已有 ROS2 Humble 时，仅安装项目依赖)
-bash scripts/install_deps.sh
+# 0b. (推荐) 添加到 ~/.bashrc，以后每次开终端自动加载环境
+echo "source ~/Orin-ROS/scripts/env.sh" >> ~/.bashrc
+source ~/.bashrc
 
-# 1. 一键构建（自动加载 ROS2 Humble 环境，按序编译消息包和节点包）
+# 1. 一键构建（自动检测 ROS2，按序编译消息包和节点包）
 bash scripts/build.sh
 
-# 2. 加载工作空间
-source install/setup.bash
+# 2. 加载工作空间（如已完成步骤 0b 则跳过）
+source scripts/env.sh
 
 # 3. 启动全部节点（默认 CUDA 模式）
 ros2 launch ft_framework ft_radar_launch.py
 ```
+
+> 完成步骤 0b 后，每次开新终端都会自动完成 ROS2 + 工作空间的环境加载，
+> 不再需要手动 `source`。
 
 ### 安装说明
 
@@ -434,9 +438,10 @@ Orin-ROS/
 │   ├── ft_radar_params.yaml
 │   └── ft_radar.rviz
 ├── scripts/
-│   ├── install_deps.sh             # 依赖一键安装 (ROS2 Humble)
-│   ├── build.sh                    # 一键构建
-│   └── launch_all.sh               # 一键启动
+│   ├── env.sh                       # 一键加载 ROS2 + 工作空间环境
+│   ├── install_deps.sh              # 依赖一键安装 (ROS2 Humble)
+│   ├── build.sh                     # 一键构建
+│   └── launch_all.sh                # 一键启动
 ├── data/                           # 模拟测试数据
 ├── docs/                           # 架构与使用文档
 └── 参考/                           # 原始需求文档

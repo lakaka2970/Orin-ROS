@@ -18,7 +18,8 @@ uint32 num_rows                       # 行数，典型值 512
 uint32 num_chirps_per_row             # 每行的 chirp 数量，典型值 16
 uint32 num_samples_per_chirp          # 每个 chirp 的采样点数，典型值 2048
 
-int16[] data                          # ADC 采样数据，原始 int16 数组
-                                      # 一维展开顺序: [row][chirp_per_row][sample]
-                                      # 总长度: num_rows × num_chirps_per_row × num_samples_per_chirp
-                                      # 典型值: 512 × 16 × 2048 = 16,777,216 个采样点
+uint8[] data                          # ADC 采样数据，原始字节流 (little-endian int16)
+                                      # 语义: int16[row×chirp×sample]; 传输用 uint8 走 memcpy 快速路径
+                                      # 消费者: np.frombuffer(msg.data, dtype=np.int16).reshape(...)
+                                      # 总字节: num_rows × num_chirps_per_row × num_samples_per_chirp × 2
+                                      # 典型值: 512 × 16 × 2048 × 2 = 33,554,432 字节 (32 MiB)

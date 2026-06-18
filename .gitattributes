@@ -1,0 +1,43 @@
+# ─── 脚本文件 ─── 强制 LF，确保 Linux / Ubuntu 可执行
+*.sh          text eol=lf
+*.py          text eol=lf
+
+# ─── 配置与数据文件 ─── LF 避免跨平台解析问题
+*.yaml        text eol=lf
+*.yml         text eol=lf
+*.md          text eol=lf
+*.txt         text eol=lf
+*.csv         text eol=lf
+*.xml         text eol=lf
+*.cfg         text eol=lf
+*.ini         text eol=lf
+
+# ─── C/C++ 源码 ─── LF
+*.c           text eol=lf
+*.cc          text eol=lf
+*.cpp         text eol=lf
+*.cxx         text eol=lf
+*.h           text eol=lf
+*.hpp         text eol=lf
+*.hxx         text eol=lf
+*.cmake       text eol=lf
+CMakeLists.txt text eol=lf
+
+# ─── 二进制文件 ─── 不做换行转换
+*.pcd         binary
+*.jpg         binary
+*.jpeg        binary
+*.png         binary
+*.gif         binary
+*.avi         binary
+*.mp4         binary
+*.pdf         binary
+*.so          binary
+*.a           binary
+*.o           binary
+*.dll         binary
+*.exe         binary
+*.zip         binary
+*.gz          binary
+*.tar         binary
+*.whl         binary

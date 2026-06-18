@@ -84,7 +84,6 @@ import os
 import time
 import threading
 import queue
-import array
 
 import rclpy
 from rclpy.node import Node
@@ -303,7 +302,7 @@ class LoggingNode(Node):
         hdr += msg.num_chirps_per_row.to_bytes(4, 'little')
         hdr += msg.num_samples_per_chirp.to_bytes(4, 'little')
 
-        payload = array.array('h', msg.data).tobytes()
+        payload = bytes(msg.data)
         fpath = os.path.join(self._dirs['adc'], f'{ts}.bin')
         self._writer.enqueue(fpath, hdr + payload, 'wb')
         self._frame_counts['adc'] += 1

@@ -34,6 +34,7 @@ ros2_ws/log/
 *.bin
 *.bag
 *.db3
+*.json
 
 # Temporary files
 *.tmp
@@ -53,3 +54,4 @@ src/*/test_results/
 # Reference materials
 参考/
 docs/FT_visualizer
+docs/

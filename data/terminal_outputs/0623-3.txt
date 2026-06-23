@@ -1,0 +1,5 @@
+zhengyuanliu@zhengyuanliu-desktop:~/Desktop/Orin-ROS$ ros2 topic list
+/parameter_events
+/rosout
+zhengyuanliu@zhengyuanliu-desktop:~/Desktop/Orin-ROS$ ros2 node list
+zhengyuanliu@zhengyuanliu-desktop:~/Desktop/Orin-ROS$ 

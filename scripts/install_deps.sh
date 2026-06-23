@@ -240,10 +240,18 @@ _verify_py "cv2"    "OpenCV (cv2)"
 _verify_py "yaml"   "PyYAML"
 
 if [ -f "$ROS2_SETUP" ]; then
-    if bash -c "source $ROS2_SETUP 2>/dev/null && python3 -c 'import rclpy; import cv_bridge' 2>/dev/null"; then
-        echo "  [OK] rclpy + cv_bridge (ROS2 $ROS2_DISTRO)"
+    # rclpy 独立验证
+    if bash -c "source $ROS2_SETUP 2>/dev/null && python3 -c 'import rclpy' 2>/dev/null"; then
+        echo "  [OK] rclpy (ROS2 $ROS2_DISTRO)"
     else
-        echo "  [WARN] rclpy / cv_bridge 验证失败 — 请手动检查 ROS2 安装"
+        echo "  [WARN] rclpy 验证失败 — 请手动检查 ROS2 安装"
+    fi
+
+    # cv_bridge 需要 cv2 先加载（pybind11 模块初始化依赖）
+    if bash -c "source $ROS2_SETUP 2>/dev/null && python3 -c 'import cv2; import cv_bridge' 2>/dev/null"; then
+        echo "  [OK] cv_bridge (ROS2 $ROS2_DISTRO)"
+    else
+        echo "  [WARN] cv_bridge 验证失败 — 请手动检查 ROS2 安装"
     fi
 fi
 

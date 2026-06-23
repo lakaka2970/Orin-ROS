@@ -61,6 +61,30 @@ else
     RX_IMPL="cpp"
 fi
 
+# ── 4.5 清理上次运行残留的进程 ──
+# 多次 Ctrl+C 或异常退出可能导致 Python 节点残留, 占用节点名
+_ft_kill_stale() {
+    local patterns=(
+        "install/ft_framework/lib/ft_framework/"
+        "install/ft_rx_cpp/lib/ft_rx_cpp/"
+    )
+    local killed=false
+    for pat in "${patterns[@]}"; do
+        local pids=$(pgrep -f "$pat" 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            echo "[ft] 清理残留进程: $(echo $pids | wc -w) 个"
+            kill $pids 2>/dev/null || true
+            sleep 0.5
+            # 强制终止还在的
+            pids=$(pgrep -f "$pat" 2>/dev/null || true)
+            [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+            killed=true
+        fi
+    done
+    $killed && sleep 0.5 || true
+}
+_ft_kill_stale
+
 # ── 5. 启动 ──
 echo "=============================================="
 echo "  FT Radar Framework 启动"
@@ -80,8 +104,6 @@ if $USE_RVIZ; then
     sleep 2
     if [ -f "$PROJECT_ROOT/config/ft_radar.rviz" ]; then
         rviz2 -d "$PROJECT_ROOT/config/ft_radar.rviz" &
-    else
-        rviz2 &
     fi
 fi
 
@@ -91,8 +113,12 @@ echo ""
 
 cleanup() {
     echo ""
-    echo "[ft] 正在停止..."
-    kill $LAUNCH_PID 2>/dev/null || true
+    echo "[ft] 正在停止所有节点..."
+    # 先向 launch 进程组发 SIGTERM，让节点有机会优雅退出
+    kill -TERM -$LAUNCH_PID 2>/dev/null || kill $LAUNCH_PID 2>/dev/null || true
+    sleep 1
+    # 再次确保所有 FT 进程已终止
+    _ft_kill_stale
     exit 0
 }
 trap cleanup SIGINT SIGTERM

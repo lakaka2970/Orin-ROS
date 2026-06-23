@@ -91,9 +91,6 @@ from sensor_msgs.msg import Image
 
 from ft_radar_msgs.msg import AdcRawData, DetList, EgoMotion, ObjList
 
-# cv_bridge 的 pybind11 模块初始化依赖 cv2 先加载
-import cv2  # noqa: E402 — 必须在 cv_bridge 之前导入
-
 try:
     from cv_bridge import CvBridge
 except ImportError:
@@ -326,6 +323,7 @@ class LoggingNode(Node):
         try:
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             ts = get_timestamp_us(msg)
+            import cv2
             success, jpg = cv2.imencode('.jpg', cv_img)
             if success:
                 fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')

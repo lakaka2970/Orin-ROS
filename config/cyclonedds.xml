@@ -19,7 +19,7 @@
   <Domain id="any">
     <General>
       <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
-      <AllowMulticast>false</AllowMulticast>
+      <AllowMulticast>true</AllowMulticast>
     </General>
     <Tracing>
       <Verbosity>warning</Verbosity>

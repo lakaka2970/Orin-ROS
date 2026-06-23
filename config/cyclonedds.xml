@@ -1,18 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  FT Radar Framework — CycloneDDS 共享内存传输配置
+  FT Radar Framework — CycloneDDS 配置 (兼容 ROS2 Foxy / CycloneDDS 0.7.x)
   ============================================================================
-  目标: 32 MB/帧 × 15 Hz = 480 MB/s 吞吐, 走 SHM 避免 UDP 分片瓶颈.
+  Foxy 自带的 CycloneDDS 0.7.x 不支持 <SharedMemory> 和带单位的 WhcHigh,
+  因此使用精简配置: 仅限定本地回环 + 关闭多播, 其余使用 CycloneDDS 默认值.
 
-  关键配置:
-    SharedMemory/Enable = true    显式启用 SHM (本地 IPC 不走网络栈)
-    NetworkInterfaceAddress = lo  限制为本地回环 (WSL 无需物理网卡)
-    AllowMulticast = false        WSL 环境无多播, 关闭可加速发现
-    WhcHigh = 500KB               增大写缓存水位, 避免大消息背压
+  本地 SHM 传输由 CycloneDDS 根据 lo 接口自动启用, 无需显式配置.
 
   用法:
     export CYCLONEDDS_URI="file://<path>/config/cyclonedds.xml"
-    (由 scripts/env.sh 自动加载)
   ============================================================================
 -->
 <CycloneDDS xmlns="https://cdds.io/config">
@@ -20,17 +16,7 @@
     <General>
       <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
       <AllowMulticast>false</AllowMulticast>
-      <FragmentSize>65536</FragmentSize>
     </General>
-    <SharedMemory>
-      <Enable>true</Enable>
-      <LogLevel>info</LogLevel>
-    </SharedMemory>
-    <Internal>
-      <Watermarks>
-        <WhcHigh>500KB</WhcHigh>
-      </Watermarks>
-    </Internal>
     <Tracing>
       <Verbosity>warning</Verbosity>
     </Tracing>

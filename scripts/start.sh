@@ -5,12 +5,13 @@
 # 封装环境加载 + 构建检查 + ros2 launch, 一行命令启动整个框架.
 #
 # 用法:
-#   bash scripts/start.sh                 # 默认 cuda 模式 + C++ rx 节点
+#   bash scripts/start.sh                 # 默认 cuda 模式 + C++ rx 节点 (real ADC)
 #   bash scripts/start.sh python          # Python RSP 模式
 #   bash scripts/start.sh cuda            # CUDA RSP 模式
 #   bash scripts/start.sh both_compare    # 双路对比模式
 #
 # 可选参数 (任意顺序):
+#   --analog   使用模拟 ADC 数据源 (噪声池/.bin), 默认 real (硬件设备)
 #   --py-rx    使用 Python 版 rx 节点 (默认 C++)
 #   --rviz     同时启动 RViz2
 #
@@ -26,13 +27,15 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 RSP_MODE="cuda"
 USE_PY_RX=false
 USE_RVIZ=false
+ADC_SOURCE="real"
 
 for arg in "$@"; do
     case "$arg" in
         python|cuda|both|both_compare) RSP_MODE="$arg" ;;
-        --py-rx) USE_PY_RX=true ;;
-        --rviz)  USE_RVIZ=true ;;
-        *)       echo "未知参数: $arg"; exit 1 ;;
+        --analog) ADC_SOURCE="analog" ;;
+        --py-rx)  USE_PY_RX=true ;;
+        --rviz)   USE_RVIZ=true ;;
+        *)        echo "未知参数: $arg"; exit 1 ;;
     esac
 done
 
@@ -88,14 +91,16 @@ _ft_kill_stale
 # ── 5. 启动 ──
 echo "=============================================="
 echo "  FT Radar Framework 启动"
-echo "  RSP 模式: $RSP_MODE"
-echo "  Rx 实现:  $RX_IMPL"
-echo "  RMW:      ${RMW_IMPLEMENTATION:-FastDDS (default)}"
+echo "  RSP 模式:   $RSP_MODE"
+echo "  Rx 实现:    $RX_IMPL"
+echo "  ADC 数据源: $ADC_SOURCE"
+echo "  RMW:        ${RMW_IMPLEMENTATION:-FastDDS (default)}"
 echo "=============================================="
 
 ros2 launch ft_framework ft_radar_launch.py \
     rsp_mode:=$RSP_MODE \
-    rx_impl:=$RX_IMPL &
+    rx_impl:=$RX_IMPL \
+    adc_source:=$ADC_SOURCE &
 
 LAUNCH_PID=$!
 

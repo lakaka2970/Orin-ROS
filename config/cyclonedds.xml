@@ -18,8 +18,8 @@
 <CycloneDDS xmlns="https://cdds.io/config">
   <Domain id="any">
     <General>
-      <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
-      <AllowMulticast>true</AllowMulticast>
+      <!-- 不指定 NetworkInterfaceAddress，让 CycloneDDS 自动选择物理网卡 -->
+      <!-- lo 回环接口不支持多播，会导致 ros2 CLI 报错 -->
     </General>
     <Tracing>
       <Verbosity>warning</Verbosity>

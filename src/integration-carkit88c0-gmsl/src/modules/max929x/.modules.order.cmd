@@ -1,0 +1,1 @@
+cmd_/home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/max929x/modules.order := {   echo /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/max929x/max929x.ko; :; } | awk '!x[$$0]++' - > /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/max929x/modules.order

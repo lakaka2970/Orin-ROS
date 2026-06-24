@@ -1,19 +1,31 @@
 // ============================================================================
-// adc_rx.cpp — ADC 数据采集节点 (预生成噪声池 → 15 Hz 零磁盘 I/O)
+// adc_rx.cpp — ADC 真实数据采集节点 (V4L2 mmap streaming)
 // ============================================================================
-// 启动时预生成 int16 噪声池 (类似 Python 版噪声池优化), 每帧从池中随机切片.
-// 可选: 若 data_dir 中存在 .bin 文件, 预加载至多 max_preload 帧用于真实数据循环.
+// 使用 V4L2 mmap streaming 从 Infineon CTRX 雷达 sensor 逐帧采集原始 ADC 数据.
+// 替换旧的 open()/read() 字符设备模式.
 //
-// 设计目标: 15 Hz × 32 MB/帧 = 480 MB/s 吞吐, CycloneDDS SHM 传输.
+// 数据格式: RG12 (12-bit padded to 16-bit), 分辨率可配置
+// 设备: /dev/video0 (可通过 device_path 参数配置)
+//
+// 用法: adc_rx_cpp (默认), 由 launch 文件通过 adc_source:=real 选择.
+//
+// V4L2 流程:
+//   open → QUERYCAP → S_FMT → S_CTRL(bypass_mode) → REQBUFS → QUERYBUF×N →
+//   mmap×N → QBUF×N → STREAMON → (DQBUF→copy→QBUF)×… → STREAMOFF → munmap → close
+//
+// 设计目标: 30 Hz, CycloneDDS SHM 传输.
 // ============================================================================
 
-#include <algorithm>
+#include <chrono>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <random>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <linux/videodev2.h>
 
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -23,13 +35,12 @@
 #include "ft_radar_msgs/msg/adc_raw_data.hpp"
 
 using AdcRawData = ft_radar_msgs::msg::AdcRawData;
-namespace fs = std::filesystem;
 
 namespace {
-  constexpr double FPS      = 15.0;
-  constexpr int    NOISE_LEVEL = 100;      // ± 噪声幅度
-  constexpr int    POOL_FACTOR = 4;        // 噪声池倍数 (预生成池 = 帧大小 × 倍数)
-  constexpr size_t MAX_PRELOAD_FILES = 30; // 最多预加载文件数 (~960 MB)
+  constexpr double   FPS           = 30.0;
+  constexpr uint32_t DEFAULT_WIDTH  = 2048;
+  constexpr uint32_t DEFAULT_HEIGHT = 512;
+  constexpr uint32_t NUM_V4L2_BUFS  = 4;
 }
 
 class AdcRxNode : public ft_rx::RxNodeBase<AdcRawData, AdcRxNode>
@@ -39,25 +50,19 @@ public:
     : RxNodeBase("adc_rx", "/adc/raw_data", 10, true)
   {
     declare_parameter("fps", FPS);
-    declare_parameter("num_rows", 512);
-    declare_parameter("num_chirps_per_row", 16);
-    declare_parameter("num_samples_per_chirp", 2048);
-    declare_parameter("data_dir", "data");
+    declare_parameter("capture_width", static_cast<int>(DEFAULT_WIDTH));
+    declare_parameter("capture_height", static_cast<int>(DEFAULT_HEIGHT));
+    declare_parameter("device_path", "/dev/video0");
     declare_parameter("fixed_frame", "radar");
-    declare_parameter("max_preload_files", static_cast<int>(MAX_PRELOAD_FILES));
-    declare_parameter("use_noise_pool", true);
 
-    fps_            = get_parameter("fps").as_double();
-    num_rows_       = static_cast<uint32_t>(get_parameter("num_rows").as_int());
-    num_chirps_     = static_cast<uint32_t>(get_parameter("num_chirps_per_row").as_int());
-    num_samples_    = static_cast<uint32_t>(get_parameter("num_samples_per_chirp").as_int());
-    data_dir_       = get_parameter("data_dir").as_string();
-    frame_id_       = get_parameter("fixed_frame").as_string();
-    max_preload_    = static_cast<size_t>(get_parameter("max_preload_files").as_int());
-    use_noise_pool_ = get_parameter("use_noise_pool").as_bool();
+    fps_         = get_parameter("fps").as_double();
+    width_       = static_cast<uint32_t>(get_parameter("capture_width").as_int());
+    height_      = static_cast<uint32_t>(get_parameter("capture_height").as_int());
+    device_path_ = get_parameter("device_path").as_string();
+    frame_id_    = get_parameter("fixed_frame").as_string();
 
-    total_elems_ = num_rows_ * num_chirps_ * num_samples_;  // int16 元素数
-    frame_bytes_ = total_elems_ * sizeof(int16_t);           // 32 MB
+    // RG12: 每个像素 2 字节 (12-bit 数据 + 4-bit 零填充)
+    frame_bytes_ = static_cast<size_t>(width_) * height_ * 2;
 
     // ── 静态 TF (成员变量 — 生命周期必须覆盖整个节点) ──
     tf_bc_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
@@ -71,70 +76,62 @@ public:
       tf_bc_->sendTransform(tf);
     }
 
-    // ── 数据源初始化 ──
-    scan_files();
-    init_data_source();
+    // ── 打开 V4L2 数据源 ──
+    open_device();
 
-    // ── 日志 ──
-    if (!file_buffers_.empty()) {
-      RCLCPP_INFO(get_logger(),
-        "ADC Rx: %.0f Hz, %ux%ux%u, %.0f MB/帧, %zu 文件预加载 (%.0f MB RAM)",
-        fps_, num_rows_, num_chirps_, num_samples_,
-        frame_bytes_ / 1048576.0, file_buffers_.size(),
-        (file_buffers_.size() * frame_bytes_) / 1048576.0);
-    }
-    if (use_noise_pool_ && noise_pool_.empty()) {
-      RCLCPP_WARN(get_logger(), "噪声池为空, 将发布空帧");
-    }
     RCLCPP_INFO(get_logger(),
-      "ADC Rx: 数据源=%s, %.0f MB/帧",
-      file_buffers_.empty() ? "噪声池" : "预加载文件",
-      frame_bytes_ / 1048576.0);
+      "ADC Rx [V4L2]: %.0f Hz, %ux%u RG12, %.1f KB/帧, 设备=%s (%s)",
+      fps_, width_, height_, frame_bytes_ / 1024.0,
+      device_path_.c_str(),
+      v4l2_fd_ >= 0 ? "已连接" : "未连接 — 将发布空帧");
 
     init_timer(fps_);
+  }
+
+  ~AdcRxNode() override
+  {
+    stop_streaming();
+    close_device();
   }
 
   std::string frame_id() const { return frame_id_; }
 
   bool fill_message(AdcRawData &msg)
   {
-    // ── 数据源 1: 预加载文件 (优先级最高) ──
-    if (!file_buffers_.empty()) {
-      msg.data = file_buffers_[file_index_];
-      file_index_ = (file_index_ + 1) % file_buffers_.size();
-      prof_.checkpoint("copy");       // ★ 测量 32 MB 拷贝耗时
-    }
-    // ── 数据源 2: 噪声池 ──
-    else if (!noise_pool_.empty()) {
-      size_t max_offset = noise_pool_.size() - frame_bytes_;
-      size_t offset = uniform_dist_(rng_,
-        std::uniform_int_distribution<size_t>::param_type(0, max_offset));
-      msg.data.assign(
-        noise_pool_.begin() + static_cast<std::ptrdiff_t>(offset),
-        noise_pool_.begin() + static_cast<std::ptrdiff_t>(offset + frame_bytes_));
-      prof_.checkpoint("copy");       // ★ 测量噪声切片拷贝耗时
-    }
-    // ── 无数据源: 发布空消息 ──
-    else {
+    if (v4l2_fd_ < 0) {
+      // 设备未连接: 尝试重新打开
+      open_device();
       msg.data.clear();
+    } else {
+      uint8_t *buf = nullptr;
+      size_t   bytes_used = 0;
+
+      if (dequeue_buffer(buf, bytes_used)) {
+        msg.data.assign(buf, buf + bytes_used);
+        enqueue_buffer(v4l2_buf_index_);
+        prof_.checkpoint("v4l2_dequeue");
+      } else {
+        // 无可用帧 (非阻塞, 驱动尚未填充) — 发布空帧
+        msg.data.clear();
+      }
     }
 
-    msg.num_rows              = num_rows_;
-    msg.num_chirps_per_row    = num_chirps_;
-    msg.num_samples_per_chirp = num_samples_;
+    msg.num_rows              = height_;
+    msg.num_chirps_per_row    = 1;
+    msg.num_samples_per_chirp = width_;
 
-    // ── 紧急 FPS 计数器 (不依赖 50 帧累积, 每 2s 输出一次) ──
+    // ── FPS 计数器 (每 2s 输出一次) ──
     {
-      static int cnt = 0;
+      static int   cnt  = 0;
       static auto last = std::chrono::steady_clock::now();
       cnt++;
       auto now = std::chrono::steady_clock::now();
       double dt = std::chrono::duration<double>(now - last).count();
       if (dt >= 2.0) {
         RCLCPP_INFO(get_logger(),
-          "[ADC-RATE] internal: %.1f Hz  (%d frames in %.1fs)",
+          "[ADC-RATE] V4L2: %.1f Hz  (%d frames in %.1fs)",
           cnt / dt, cnt, dt);
-        cnt = 0;
+        cnt  = 0;
         last = now;
       }
     }
@@ -144,91 +141,259 @@ public:
 
 private:
   // ──────────────────────────────────────────────────────────────────────────
-  // 文件扫描
+  // V4L2 buffer 元数据
   // ──────────────────────────────────────────────────────────────────────────
-  void scan_files()
+  struct V4l2Buffer {
+    void   *start  = nullptr;
+    size_t  length = 0;
+  };
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // V4L2 设备管理
+  // ──────────────────────────────────────────────────────────────────────────
+
+  void open_device()
   {
-    std::error_code ec;
-    if (!fs::is_directory(data_dir_, ec)) {
-      RCLCPP_WARN(get_logger(),
-        "数据目录 '%s' 不存在, 将使用噪声池", data_dir_.c_str());
+    if (v4l2_fd_ >= 0) close_device();
+
+    v4l2_fd_ = open(device_path_.c_str(), O_RDWR | O_NONBLOCK);
+    if (v4l2_fd_ < 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "无法打开 V4L2 设备 '%s': %s", device_path_.c_str(), strerror(errno));
       return;
     }
-    for (auto &e : fs::directory_iterator(data_dir_, ec))
-      if (e.path().extension() == ".bin") paths_.push_back(e.path());
-    std::sort(paths_.begin(), paths_.end());
-  }
 
-  // ──────────────────────────────────────────────────────────────────────────
-  // 数据源初始化 (文件预加载 + 噪声池)
-  // ──────────────────────────────────────────────────────────────────────────
-  void init_data_source()
-  {
-    // ── 预加载 .bin 文件 (限制数量, 避免内存溢出) ──
-    if (!paths_.empty()) {
-      size_t nload = std::min(paths_.size(), max_preload_);
-      file_buffers_.reserve(nload);
-      for (size_t i = 0; i < nload; ++i) {
-        std::ifstream f(paths_[i], std::ios::binary | std::ios::ate);
-        if (!f) {
-          RCLCPP_WARN(get_logger(), "跳过: %s", paths_[i].string().c_str());
-          continue;
-        }
-        size_t sz = std::min(static_cast<size_t>(f.tellg()), frame_bytes_);
-        std::vector<uint8_t> buf(sz);
-        f.seekg(0);
-        f.read(reinterpret_cast<char *>(buf.data()), sz);
-        if (sz < frame_bytes_) buf.resize(frame_bytes_, 0);  // 补齐
-        file_buffers_.push_back(std::move(buf));
-      }
-      if (!file_buffers_.empty()) return;  // 文件数据优先, 不初始化噪声池
+    // ── QUERYCAP: 验证设备能力 ──
+    struct v4l2_capability cap;
+    std::memset(&cap, 0, sizeof(cap));
+    if (ioctl(v4l2_fd_, VIDIOC_QUERYCAP, &cap) < 0) {
+      RCLCPP_WARN(get_logger(), "VIDIOC_QUERYCAP 失败: %s", strerror(errno));
+      close_device();
+      return;
+    }
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+      RCLCPP_WARN(get_logger(), "设备 '%s' 不支持 video capture", device_path_.c_str());
+      close_device();
+      return;
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+      RCLCPP_WARN(get_logger(), "设备 '%s' 不支持 streaming I/O", device_path_.c_str());
+      close_device();
+      return;
     }
 
-    // ── 噪声池 (备选数据源) ──
-    if (!use_noise_pool_) return;
+    RCLCPP_DEBUG(get_logger(),
+      "V4L2 设备: driver='%s' card='%s' bus='%s'",
+      cap.driver, cap.card, cap.bus_info);
 
-    size_t pool_elems = total_elems_ * POOL_FACTOR;
-    size_t pool_bytes = pool_elems * sizeof(int16_t);
-    noise_pool_.resize(pool_bytes);
+    // ── S_FMT: 设置像素格式 ──
+    if (!init_format()) { close_device(); return; }
 
-    // 分块填充: 避免 134 MB 的临时 vector
-    auto *ptr = reinterpret_cast<int16_t *>(noise_pool_.data());
-    std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<int16_t> dist(
-      static_cast<int16_t>(-NOISE_LEVEL),
-      static_cast<int16_t>(NOISE_LEVEL));
-    for (size_t i = 0; i < pool_elems; ++i)
-      ptr[i] = dist(gen);
+    // ── S_CTRL: bypass_mode=0 (绕过 NVIDIA ISP, 直出原始数据) ──
+    {
+      struct v4l2_control ctrl;
+      std::memset(&ctrl, 0, sizeof(ctrl));
+      ctrl.id    = 0x009a2064;   // bypass_mode (NVIDIA 自定义 V4L2 control)
+      ctrl.value = 0;
+      if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+        RCLCPP_DEBUG(get_logger(), "设置 bypass_mode 失败 (非致命): %s", strerror(errno));
+    }
+
+    // ── REQBUFS + QUERYBUF + mmap ──
+    if (!init_mmap()) { close_device(); return; }
+
+    // ── QBUF × N + STREAMON ──
+    if (!start_streaming()) { close_device(); return; }
 
     RCLCPP_INFO(get_logger(),
-      "噪声池已生成: %.0f MB (%zu 采样, ±%d)",
-      pool_bytes / 1048576.0, pool_elems, NOISE_LEVEL);
+      "V4L2 设备已连接: %s fd=%d (%ux%u RG12, %.1f KB/帧)",
+      device_path_.c_str(), v4l2_fd_,
+      width_, height_, frame_bytes_ / 1024.0);
+  }
+
+  bool init_format()
+  {
+    struct v4l2_format fmt;
+    std::memset(&fmt, 0, sizeof(fmt));
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = width_;
+    fmt.fmt.pix.height      = height_;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SRGGB12;  // RG12
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+
+    if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt) < 0) {
+      RCLCPP_WARN(get_logger(), "VIDIOC_S_FMT 失败: %s", strerror(errno));
+      return false;
+    }
+
+    // 驱动可能调整分辨率: 以实际值为准
+    if (fmt.fmt.pix.width != width_ || fmt.fmt.pix.height != height_) {
+      RCLCPP_INFO(get_logger(),
+        "驱动调整了分辨率: 请求 %ux%u → 实际 %ux%u",
+        width_, height_, fmt.fmt.pix.width, fmt.fmt.pix.height);
+      width_  = fmt.fmt.pix.width;
+      height_ = fmt.fmt.pix.height;
+    }
+
+    // 以驱动返回的 sizeimage 为准 (可能大于 width×height×2)
+    if (fmt.fmt.pix.sizeimage > 0)
+      frame_bytes_ = fmt.fmt.pix.sizeimage;
+    else
+      frame_bytes_ = static_cast<size_t>(width_) * height_ * 2;
+
+    RCLCPP_INFO(get_logger(),
+      "V4L2 格式: %ux%u %c%c%c%c stride=%u sizeimage=%u (%.1f KB/帧)",
+      fmt.fmt.pix.width, fmt.fmt.pix.height,
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 0)  & 0xFF),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 8)  & 0xFF),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 16) & 0xFF),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 24) & 0xFF),
+      fmt.fmt.pix.bytesperline,
+      fmt.fmt.pix.sizeimage,
+      frame_bytes_ / 1024.0);
+
+    return true;
+  }
+
+  bool init_mmap()
+  {
+    struct v4l2_requestbuffers req;
+    std::memset(&req, 0, sizeof(req));
+    req.count  = NUM_V4L2_BUFS;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req) < 0) {
+      RCLCPP_WARN(get_logger(), "VIDIOC_REQBUFS 失败: %s", strerror(errno));
+      return false;
+    }
+    if (req.count < 2) {
+      RCLCPP_WARN(get_logger(), "驱动缓冲区不足: %u", req.count);
+      return false;
+    }
+
+    v4l2_bufs_.resize(req.count);
+    for (uint32_t i = 0; i < req.count; ++i) {
+      struct v4l2_buffer buf;
+      std::memset(&buf, 0, sizeof(buf));
+      buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index  = i;
+
+      if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+        RCLCPP_WARN(get_logger(), "VIDIOC_QUERYBUF[%u] 失败: %s", i, strerror(errno));
+        return false;
+      }
+
+      v4l2_bufs_[i].length = buf.length;
+      v4l2_bufs_[i].start = mmap(
+          nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+          v4l2_fd_, buf.m.offset);
+
+      if (v4l2_bufs_[i].start == MAP_FAILED) {
+        RCLCPP_WARN(get_logger(), "mmap[%u] 失败: %s", i, strerror(errno));
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool start_streaming()
+  {
+    // 将所有 buffer 入队
+    for (uint32_t i = 0; i < v4l2_bufs_.size(); ++i) {
+      struct v4l2_buffer buf;
+      std::memset(&buf, 0, sizeof(buf));
+      buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index  = i;
+      if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0) {
+        RCLCPP_WARN(get_logger(), "VIDIOC_QBUF[%u] 失败: %s", i, strerror(errno));
+        return false;
+      }
+    }
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &type) < 0) {
+      RCLCPP_WARN(get_logger(), "VIDIOC_STREAMON 失败: %s", strerror(errno));
+      return false;
+    }
+    streaming_ = true;
+    return true;
+  }
+
+  void stop_streaming()
+  {
+    if (v4l2_fd_ >= 0 && streaming_) {
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &type);
+      streaming_ = false;
+    }
+    for (auto &b : v4l2_bufs_) {
+      if (b.start && b.start != MAP_FAILED)
+        munmap(b.start, b.length);
+    }
+    v4l2_bufs_.clear();
+  }
+
+  // 非阻塞出队: 成功返回 true, 无可用帧返回 false (data=nullptr)
+  bool dequeue_buffer(uint8_t *&data, size_t &bytes_used)
+  {
+    struct v4l2_buffer buf;
+    std::memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &buf) < 0) {
+      if (errno == EAGAIN) return false;        // 无可用帧 (非阻塞)
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "VIDIOC_DQBUF 失败: %s", strerror(errno));
+      return false;
+    }
+
+    v4l2_buf_index_ = buf.index;
+    data       = static_cast<uint8_t *>(v4l2_bufs_[buf.index].start);
+    bytes_used = buf.bytesused;
+    return true;
+  }
+
+  // 归还 buffer 到驱动队列
+  void enqueue_buffer(uint32_t index)
+  {
+    struct v4l2_buffer buf;
+    std::memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index  = index;
+    if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0)
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "VIDIOC_QBUF 失败: %s", strerror(errno));
+  }
+
+  void close_device()
+  {
+    if (v4l2_fd_ >= 0) {
+      close(v4l2_fd_);
+      v4l2_fd_ = -1;
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
   // 成员变量
   // ──────────────────────────────────────────────────────────────────────────
-  uint32_t num_rows_    = 512;
-  uint32_t num_chirps_  = 16;
-  uint32_t num_samples_ = 2048;
-  size_t   total_elems_ = 0;
-  size_t   frame_bytes_ = 0;
-  size_t   max_preload_ = MAX_PRELOAD_FILES;
-  bool     use_noise_pool_ = true;
-  std::string data_dir_;
+  std::string device_path_;
   std::string frame_id_ = "radar";
 
-  // ── 文件数据源 ──
-  std::vector<fs::path> paths_;
-  std::vector<std::vector<uint8_t>> file_buffers_;  // 预加载文件内容
-  size_t file_index_ = 0;
+  uint32_t  width_       = DEFAULT_WIDTH;
+  uint32_t  height_      = DEFAULT_HEIGHT;
+  size_t    frame_bytes_ = 0;
 
-  // ── 噪声池数据源 ──
-  std::vector<uint8_t> noise_pool_;  // int16 噪声池 (字节形式)
-  std::mt19937 rng_{std::random_device{}()};
-  std::uniform_int_distribution<size_t> uniform_dist_;
+  int       v4l2_fd_          = -1;
+  bool      streaming_        = false;
+  uint32_t  v4l2_buf_index_   = 0;
+  std::vector<V4l2Buffer> v4l2_bufs_;
 
-  // ── TF 广播器 (成员变量 — 保持存活以支持 /tf_static latch) ──
+  // ── TF 广播器 ──
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_bc_;
 };
 
@@ -237,4 +402,5 @@ int main(int argc, char *argv[])
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<AdcRxNode>());
   rclcpp::shutdown();
+  return 0;
 }

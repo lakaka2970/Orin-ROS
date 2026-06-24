@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FT Radar 框架启动文件 — 支持 4 种 RSP 启动模式
+FT Radar 框架启动文件 — 支持 4 种 RSP 启动模式 + 2 种 ADC 数据源
 ================================================================================
 启动全部 10 个 ROS2 节点，构成完整的雷达-相机-车辆数据融合感知框架。
 
@@ -11,12 +11,15 @@ FT Radar 框架启动文件 — 支持 4 种 RSP 启动模式
   both           双路并行，独立输出话题
   both_compare   双路并行 + 自动对比输出差异
 
+ADC 数据源:
+  real           从硬件设备读取真实 ADC 数据 (默认, /dev/adc_data)
+  analog         噪声池 / .bin 文件预加载模拟
+
 用法:
-  ros2 launch ft_radar_launch.py                         # 默认 cuda 模式
-  ros2 launch ft_radar_launch.py rsp_mode:=python        # 仅 Python
-  ros2 launch ft_radar_launch.py rsp_mode:=cuda          # 仅 CUDA
-  ros2 launch ft_radar_launch.py rsp_mode:=both          # 双路并行
-  ros2 launch ft_radar_launch.py rsp_mode:=both_compare  # 双路对比
+  ros2 launch ft_radar_launch.py                               # 默认 cuda + real
+  ros2 launch ft_radar_launch.py rsp_mode:=python               # Python RSP
+  ros2 launch ft_radar_launch.py adc_source:=analog             # 模拟 ADC
+  ros2 launch ft_radar_launch.py rsp_mode:=cuda adc_source:=real
 
   # 自定义 Logging 开关
   ros2 launch ft_radar_launch.py rsp_mode:=cuda \
@@ -136,13 +139,17 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument(
         'rx_impl', default_value='cpp',
         description='Rx 节点实现: cpp (C++ 零拷贝) | python (Python 原版)'))
+    ld.add_action(DeclareLaunchArgument(
+        'adc_source', default_value='real',
+        description='ADC 数据源: real (硬件设备) | analog (噪声池/文件模拟)'))
 
     # ========================================================================
     # 模式引用
     # ========================================================================
 
-    rsp_mode  = LaunchConfiguration('rsp_mode')
-    rx_impl   = LaunchConfiguration('rx_impl')
+    rsp_mode   = LaunchConfiguration('rsp_mode')
+    rx_impl    = LaunchConfiguration('rx_impl')
+    adc_source = LaunchConfiguration('adc_source')
 
     # 条件表达式
     python_enabled = PythonExpression([
@@ -158,12 +165,16 @@ def generate_launch_description():
     # 包引用 (根据 rx_impl 选择)
     # ========================================================================
 
-    adc_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
-    adc_exe     = PythonExpression(["'adc_rx_cpp' if '", rx_impl, "' == 'cpp' else 'adc_rx'"])
-    cam_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
-    cam_exe     = PythonExpression(["'camera_rx_cpp' if '", rx_impl, "' == 'cpp' else 'camera_rx'"])
-    veh_pkg     = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
-    veh_exe     = PythonExpression(["'vehicle_data_rx_cpp' if '", rx_impl, "' == 'cpp' else 'vehicle_data_rx'"])
+    adc_pkg = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    # ADC 可执行文件: cpp 实现下根据 adc_source 选择 real / analog
+    adc_exe = PythonExpression([
+        "'adc_rx_analog_cpp' if '", rx_impl, "' == 'cpp' and '", adc_source, "' == 'analog' ",
+        "else 'adc_rx_cpp' if '", rx_impl, "' == 'cpp' ",
+        "else 'adc_rx'"])
+    cam_pkg = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    cam_exe = PythonExpression(["'camera_rx_cpp' if '", rx_impl, "' == 'cpp' else 'camera_rx'"])
+    veh_pkg = PythonExpression(["'ft_rx_cpp' if '", rx_impl, "' == 'cpp' else 'ft_framework'"])
+    veh_exe = PythonExpression(["'vehicle_data_rx_cpp' if '", rx_impl, "' == 'cpp' else 'vehicle_data_rx'"])
 
     # ========================================================================
     # 启动日志
@@ -171,7 +182,8 @@ def generate_launch_description():
 
     ld.add_action(LogInfo(
         msg=['=== FT Radar Framework: rsp_mode=[', rsp_mode,
-             ']  rx_impl=[', rx_impl, '] ===']))
+             ']  rx_impl=[', rx_impl,
+             ']  adc_source=[', adc_source, '] ===']))
 
     # ========================================================================
     # 第一层：数据采集层 (3 个节点)

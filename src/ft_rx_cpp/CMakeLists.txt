@@ -20,15 +20,19 @@ find_package(OpenCV REQUIRED)
 find_package(ft_radar_msgs REQUIRED)
 
 # ---- include ----
+# NOTE: global include_directories kept for compatibility;
+#       per-target target_include_directories is preferred
 include_directories(include)
 
 # ---- common compile options ----
 add_compile_options(-Wall -Wextra -Wpedantic)
-# Release optimisation: -O2 is default for ament_cmake, explicit for safety
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-add_compile_options(-O2)
+# -O2 only for Release builds; don't override Debug optimisation level
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_compile_options(-O2)
+endif()
 
 # ============================================================================
 # 1. vehicle_data_rx — lightweight, ~50 Hz scalar data (delivered first for CI)
@@ -47,20 +51,29 @@ ament_target_dependencies(camera_rx_cpp
 target_include_directories(camera_rx_cpp PRIVATE include)
 
 # ============================================================================
-# 3. adc_rx — 32 MB/frame zero-copy-optimised heavy-lift node
+# 3. adc_rx — 真实 ADC 硬件采集 (默认, 从设备文件读取)
 # ============================================================================
 add_executable(adc_rx_cpp src/adc_rx.cpp)
 ament_target_dependencies(adc_rx_cpp
   rclcpp std_msgs geometry_msgs tf2_ros ft_radar_msgs)
 target_include_directories(adc_rx_cpp PRIVATE include)
+
+# ============================================================================
+# 4. adc_rx_analog — 模拟 ADC 数据源 (噪声池 / .bin 预加载)
+# ============================================================================
+add_executable(adc_rx_analog_cpp src/adc_rx_analog.cpp)
+ament_target_dependencies(adc_rx_analog_cpp
+  rclcpp std_msgs geometry_msgs tf2_ros ft_radar_msgs)
+target_include_directories(adc_rx_analog_cpp PRIVATE include)
 # std::filesystem needs explicit linking on GCC 9 (Foxy)
-target_link_libraries(adc_rx_cpp stdc++fs)
+target_link_libraries(adc_rx_analog_cpp stdc++fs)
 
 # ---- install ----
 install(TARGETS
   vehicle_data_rx_cpp
   camera_rx_cpp
   adc_rx_cpp
+  adc_rx_analog_cpp
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/

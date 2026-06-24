@@ -91,6 +91,9 @@ from sensor_msgs.msg import Image
 
 from ft_radar_msgs.msg import AdcRawData, DetList, EgoMotion, ObjList
 
+# cv_bridge 的 pybind11 模块初始化依赖 cv2 先加载
+import cv2
+
 try:
     from cv_bridge import CvBridge
 except ImportError:
@@ -148,8 +151,25 @@ class AsyncWriter:
     # ── 生命周期 ──
 
     def stop(self):
-        """终止写线程, 等待最多 5 秒。"""
+        """终止写线程: 先排空队列再发送终止信号，避免数据丢失。"""
         self._stop_event.set()
+        # 先排空队列中剩余的任务
+        while True:
+            try:
+                item = self._queue.get(timeout=0.1)
+                if item is None:
+                    break
+                tag, payload = item
+                if tag == 'write':
+                    fpath, data, mode = payload
+                    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+                    with open(fpath, mode) as f:
+                        f.write(data)
+                elif tag == 'task':
+                    payload()
+            except queue.Empty:
+                break
+        # 发送终止信号
         self._queue.put(None)
         self._thread.join(timeout=5)
 
@@ -323,7 +343,6 @@ class LoggingNode(Node):
         try:
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             ts = get_timestamp_us(msg)
-            import cv2
             success, jpg = cv2.imencode('.jpg', cv_img)
             if success:
                 fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')
@@ -521,8 +540,13 @@ class LoggingNode(Node):
         try:
             fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
             os.makedirs(os.path.dirname(fpath), exist_ok=True)
-            with open(fpath, 'w') as f:
-                f.write('timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n')
+            if os.path.exists(fpath):
+                self.get_logger().warning(
+                    f'ego_motion.csv 已存在, 将追加写入: {fpath}')
+            with open(fpath, 'a') as f:
+                # 仅新建文件时写入表头
+                if f.tell() == 0:
+                    f.write('timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n')
             self.get_logger().info(f'ego_motion.csv → {fpath}')
         except OSError as e:
             self.get_logger().error(f'ego_motion.csv 初始化失败: {e}')

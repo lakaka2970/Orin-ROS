@@ -58,8 +58,6 @@ public:
 
   bool fill_message(Image & /*msg*/)
   {
-    local_count_++;
-
     auto m = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", img_).toImageMsg();
     m->header.stamp    = this->now();
     m->header.frame_id = frame_id_;
@@ -71,7 +69,6 @@ private:
   cv::Mat      img_;
   int          width_   = 4;
   int          height_  = 4;
-  int          local_count_ = 0;
   std::string  frame_id_ = "camera";
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_bc_;
 };
@@ -81,4 +78,5 @@ int main(int argc, char *argv[])
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<CameraRxNode>());
   rclcpp::shutdown();
+  return 0;
 }

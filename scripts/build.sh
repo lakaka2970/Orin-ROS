@@ -17,6 +17,7 @@
 # ============================================================================
 
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -98,7 +99,9 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 
 # 加载消息包环境，使下游包能找到 .msg 定义
-source "$PROJECT_ROOT/install/setup.bash" 2>/dev/null || true
+if ! source "$PROJECT_ROOT/install/setup.bash" 2>/dev/null; then
+    echo "[WARN] 无法加载 install/setup.bash, 后续包可能找不到 ft_radar_msgs"
+fi
 
 echo "[4/5] [BUILD] 构建 ft_framework (10 个节点)..."
 colcon build --packages-select ft_framework --symlink-install \

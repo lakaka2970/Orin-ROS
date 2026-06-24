@@ -35,12 +35,6 @@ MIN_CLUSTER_SIZE = 3          # 最小簇大小（点数）
 DEFAULT_BOX_H   = 2.0         # 默认目标框高度 (m)
 MARKER_LIFETIME = 1.0         # RViz Marker 生命周期 (s)
 
-# ---------- 模拟 AI 检测参数 ----------
-MOVING_STATE_MAP = {          # moving_state 枚举
-    0: 'moving', 1: 'stationary', 2: 'oncoming',
-    3: 'cross', 4: 'stopped', 255: 'unknown'
-}
-
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
 

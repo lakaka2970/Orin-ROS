@@ -1,0 +1,20 @@
+# 1. Determine the current directory
+CURRENT_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+
+# 2. Add local C files, includes and flags
+
+FIRMWARE_PATH = 8188_Ram_Release_1.0.0
+
+#C_FILES +=
+C_FILES += $(wildcard $(CURRENT_DIR)/ctrx_firmware/${FIRMWARE_PATH}/*.c)
+C_FILES += $(wildcard $(CURRENT_DIR)/src/8188/*.c)
+
+#INCLUDE_DIRS +=
+INCLUDE_DIRS += $(CURRENT_DIR)/ctrx_firmware/${FIRMWARE_PATH}
+INCLUDE_DIRS += $(CURRENT_DIR)/include/8188
+INCLUDE_DIRS += $(CURRENT_DIR)/src/8188
+
+# 3. Include makelist.mk from other dependencies
+DEPENDENCIES :=
+
+include $(DEPENDENCIES)

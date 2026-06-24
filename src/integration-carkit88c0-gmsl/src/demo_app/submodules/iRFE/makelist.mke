@@ -1,0 +1,30 @@
+# 1. Determine the current directory
+CURRENT_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+
+# 2. Add local C files, includes and flags
+
+#C_FILES +=
+C_FILES += $(wildcard $(CURRENT_DIR)/src/*.c)
+C_FILES += $(wildcard $(CURRENT_DIR)/wrappers/*.c)
+C_FILES += $(wildcard $(CURRENT_DIR)/ramp_design/*.c)
+
+#INCLUDE_DIRS +=
+INCLUDE_DIRS += $(CURRENT_DIR)/src
+INCLUDE_DIRS += $(CURRENT_DIR)/wrappers
+INCLUDE_DIRS += $(CURRENT_DIR)/include
+INCLUDE_DIRS += $(CURRENT_DIR)/ramp_design
+INCLUDE_DIRS += $(CURRENT_DIR)/ctrx_firmware
+
+$(info **** CHIP_TYPE: $(CHIP_TYPE))
+# 3. Include makelist.mk from other dependencies
+ifeq ($(CHIP_TYPE),8181_ES)
+DEPENDENCIES := $(CURRENT_DIR)/makelist_8181_es.mke
+else ifeq ($(CHIP_TYPE),8191_A11)
+DEPENDENCIES := $(CURRENT_DIR)/makelist_8191_a11.mke
+else ifeq ($(CHIP_TYPE),8191_B11)
+DEPENDENCIES := $(CURRENT_DIR)/makelist_8191_b11.mke
+else ifeq ($(CHIP_TYPE),8188)
+DEPENDENCIES := $(CURRENT_DIR)/makelist_8188.mke
+endif
+
+include $(DEPENDENCIES)

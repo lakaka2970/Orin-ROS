@@ -56,3 +56,4 @@ src/*/test_results/
 docs/FT_visualizer
 docs/
 ft_dataset/
+*.o

@@ -14,8 +14,8 @@
 # Adapt parameters as needed
 OUTPUT_FOLDER="output"
 OUTPUT_FILE="${OUTPUT_FOLDER}/ctrx0_raw.bin"
-WIDTH="2048"
-HEIGHT="512"
+WIDTH="8192"
+HEIGHT="1024"
 PIXEL_FORMAT="RG12"
 DEVICE="/dev/video0"
 

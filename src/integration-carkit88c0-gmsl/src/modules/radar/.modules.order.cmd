@@ -1,1 +1,1 @@
-cmd_/home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/modules.order := {   echo /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/radar.ko; :; } | awk '!x[$$0]++' - > /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/modules.order
+cmd_/home/orin/projects/gmsl/src/modules/radar/modules.order := {   echo /home/orin/projects/gmsl/src/modules/radar/radar.ko; :; } | awk '!x[$$0]++' - > /home/orin/projects/gmsl/src/modules/radar/modules.order

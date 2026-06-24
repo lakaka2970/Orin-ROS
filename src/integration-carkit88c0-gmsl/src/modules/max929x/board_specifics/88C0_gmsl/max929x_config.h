@@ -102,7 +102,7 @@ static struct max929x_reg max9296_SINGLE_LINK_Dser_Ser_init[] = {
     {0x90, 0x1D00, 0xF4},  //  (config_soft_rst_n - PHY1): 0x0
     // This is to set predefined (coarse) CSI output frequency
     // CSI Phy 1 is 1200 Mbps/lane.
-    {0x90, 0x0320, 0x2C},
+    {0x90, 0x0320, 0x34},
     {0x90, 0x1D00, 0xF5},  //  (config_soft_rst_n - PHY1): 0x1
     {0x90, 0x0332, 0x30},  //  (phy_Stdby_2): Put PHY2 in standby mode |  (phy_Stdby_3): Put PHY3 in standby mode
     {0x90, 0x0313, 0x02},  //  (CSI_OUT_EN): CSI output enabled
@@ -319,7 +319,7 @@ static struct max929x_reg max9296_SPLITTER_MODE_Dser_Ser_init[] = {
     {0x90, 0x1D00, 0xF4},  // (config_soft_rst_n - PHY1): 0x0
     // This is to set predefined (coarse) CSI output frequency
     // CSI Phy 1 is 1200 Mbps/lane.
-    {0x90, 0x0320, 0x2C},
+    {0x90, 0x0320, 0x34},
     {0x90, 0x1D00, 0xF5},  // (config_soft_rst_n - PHY1): 0x1
     {0x90, 0x048A, 0xD0},  // (Default)  (Port B - Lane Count): 4
     {0x90, 0x0334, 0xE4},  // (Default)  (Lane Map - PHY2 D0): Lane 0 | (Default)  (Lane Map - PHY2 D1): Lane 1 | (Default)  (Lane Map - PHY3 D0): Lane 2 | (Default)  (Lane Map - PHY3 D1): Lane 3
@@ -327,7 +327,7 @@ static struct max929x_reg max9296_SPLITTER_MODE_Dser_Ser_init[] = {
     {0x90, 0x1E00, 0xF4},  // (config_soft_rst_n - PHY2): 0x0
     // This is to set predefined (coarse) CSI output frequency
     // CSI Phy 2 is 1200 Mbps/lane.
-    {0x90, 0x0323, 0x2C},
+    {0x90, 0x0323, 0x34},
     {0x90, 0x1E00, 0xF5},  // (config_soft_rst_n - PHY2): 0x1
     {0x90, 0x0313, 0x02},  // (CSI_OUT_EN): CSI output enabled
     // Video Transmit Configuration for Serializer(s)

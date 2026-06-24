@@ -109,11 +109,12 @@ int main(void)
 
     // =============== Initialize I2C Interface ===================
     // Initialize I2C bus 2 for communication
+    // 初始化I2C总线2（用于与PMIC通信），失败则执行cleanup_platform并退出
     EXIT_ON_PLATFORM_ERROR(PlatformI2c_init(2), cleanup_platform());
 
     // =============== Configure GPIO Pins ===================
     // Setup control and status pins for the CTRX devices
-
+    // RFT（Ready for Transfer）引脚：输入+下拉，指示CTRX是否就绪SPI通信
     // RFT (Ready for Transfer) pins - indicate when CTRXs are ready for SPI communication
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_RFT_A, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_RFT_B, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
@@ -135,6 +136,7 @@ int main(void)
     // =============== Setup SPI Communication ===================
     // Configure SPI interface mapping for communication with CTRXs
     // Configure reverse splitter mode GMSL setup
+    //配置GMSL SPI映射
     gmsl_device_config_t device_configs[] = {
         {
             .device_id = DEVICE_LINK_A,
@@ -146,7 +148,7 @@ int main(void)
             .link_cmd  = GMSL_SPI_ID_01,  // Second board uses SPI ID '01'
             .ss_cmd    = GMSL_ASS_SS1     // Both on SS1
         }};
-
+    // 设置GMSL SPI配置：设备列表、SPI_RO/SPI_BNE引脚映射
     GmslSpiWrapper_setConfig(device_configs,
                              sizeof(device_configs) / sizeof(device_configs[0]),
                              GPIO_ID_SPI_RO,
@@ -156,12 +158,14 @@ int main(void)
     // Setup function callbacks for SPI, GPIO, timing, and logging operations
 
     // SPI function callbacks
+    // SPI回调函数：绑定GMSL SPI的配置/传输/写操作
     IfxRfe_spiFunctions_t spiFncs = {
         .spiConfigure = GmslSpiWrapper_configure,
         .spiTransfer  = GmslSpiWrapper_transfer,
         .spiWrite     = GmslSpiWrapper_write};
 
     // Enable automatic SPI retransmission
+    // 启用SPI自动重传
     IfxRfe_setSpiRetransmissionCount(SPI_RETRANSMISSIONS);
 
     // GPIO function callbacks - handle pin control and status reading
@@ -186,12 +190,12 @@ int main(void)
     // Define GPIO pin mapping for each CTRX device
     uint16_t const GPIO_UNUSED                     = 0;
     IfxRfe_gpioDefinitions_t gpios[CTRX_DEV_COUNT] = {
-        {.spiRftId = GPIO_ID_RFT_A,
-         .dmux1Id  = GPIO_ID_DMUX1_A,
+        {.spiRftId = GPIO_ID_RFT_A,// 链路A RFT引脚
+         .dmux1Id  = GPIO_ID_DMUX1_A,// 链路A DMUX1引脚
          .okId     = GPIO_UNUSED,
          .dmux2Id  = GPIO_UNUSED,
          .dmux3Id  = GPIO_UNUSED},
-        {.spiRftId = GPIO_ID_RFT_B,
+        {.spiRftId = GPIO_ID_RFT_B,// 链路B RFT引脚
          .dmux1Id  = GPIO_ID_DMUX1_B,
          .okId     = GPIO_UNUSED,
          .dmux2Id  = GPIO_UNUSED,
@@ -210,15 +214,15 @@ int main(void)
         cleanup_platform());
 
     // =============== PMIC and Configuration Setup ===================
-
+    // 启用PMIC的扩频功能（±3%伪随机，降低EMI电磁干扰）
     // enable spread spectrum +-3% pseudo-random
     EXIT_ON_IFXRFE_ERROR(Max20434_enableSpreadSpectrum(&pmic, SSE_3Percent_PseudoRandom), cleanup_platform());
-
+    // 初始化雷达演示配置参数（默认参数：TX功率、RX配置、RF频率等）
     // Initialize device configuration parameters
     IfxRfe_demoConfigParams_t configParams;
     // Device config
     IrfeDemoConfigInit(&configParams);
-
+    // 配置SPI时钟：模式0（CPOL=0, CPHA=0），10MHz
     // Configure SPI clock speed to SPI_CLOCK_SPEED using mode 0
     uint8_t flags = IFXRFE_SPI_MODE_0;
     Wrapper_SpiConfigure(flags, SPI_CLOCK_SPEED);
@@ -251,6 +255,7 @@ int main(void)
     printf("Performing initialization of the CTRX...\n");
 
     // Initialize CTRX
+    // 定义CTRX初始化配置（独立模式、IRAM描述符、SPI参数）
     static uint32_t intitializeIramDesc[] = {0x10000028, 0x1180000A, 0x1000000E};
     static uint32_t intitializeValue[]    = {1, 2, 1};  // Use continuous CSI-2 clk mode
 
@@ -294,7 +299,7 @@ int main(void)
 
     // =============== RF Configuration ===================
     // Configure RF parameters and sequencer data
-
+    // 配置雷达射频参数（序列器、Ramp、TX功率、RX、RF频率）
     // Configure RF parameters for CTRX on LINK A
     printf("Configuring CTRX (LINK A) RF parameters...\n");
     EXIT_ON_IFXRFE_ERROR(IfxRfe_selectDevice(DEVICE_LINK_A), cleanup_platform());
@@ -321,6 +326,9 @@ int main(void)
 
     // =============== Transition to Operation State ===================
     // Transition both devices to operational state for radar operations
+    // 将CTRX从初始化状态切换到运行状态（可执行雷达扫描）
+    
+    // 链路A切换到运行状态
     EXIT_ON_IFXRFE_ERROR(IfxRfe_selectDevice(DEVICE_LINK_A), cleanup_platform());
     EXIT_ON_IFXRFE_ERROR(IfxRfe_gotoOperation(), cleanup_platform());
     EXIT_ON_IFXRFE_ERROR(IfxRfe_getStatus(&statusLinkA), cleanup_platform());

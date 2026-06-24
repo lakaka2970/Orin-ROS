@@ -22,9 +22,10 @@ def readRawBin(datadir, fid, Ns1, Nrx, Ns2):
     return Raw
 
 ###############################################################################
+#数据读取 拼接 去除硬件填充位
 def readRawBinCasc(datadir, frameNr, nSamples, nRamps, nChannels):
     
-    Nbins = nSamples*nRamps*4
+    Nbins = nSamples*nRamps*4#一片 CTRX 固定 4 个通道
     frameSize = Nbins*2
     
     fname = "ctrx0.bin"
@@ -38,7 +39,7 @@ def readRawBinCasc(datadir, frameNr, nSamples, nRamps, nChannels):
     f.seek(frameSize*frameNr)
     data = f.read(frameSize)
     f.close()
-    Raw = np.frombuffer(data, np.uint16)
+    Raw = np.frombuffer(data, np.uint16)#二进制字节流 → 转成 uint16 数组
     Raw = Raw.reshape((nRamps, nSamples, 4))
 
     numCtrx = int(round(nChannels / 4))
@@ -49,13 +50,13 @@ def readRawBinCasc(datadir, frameNr, nSamples, nRamps, nChannels):
         data = f.read(frameSize)
         f.close()
         tmp = np.frombuffer(data, np.uint16)
-        tmp = Raw.reshape((nRamps, nSamples, 4))
+        tmp = Raw.reshape((nRamps, nSamples, 4)) ## 应该为 tmp = tmp.reshape((nRamps, nSamples, 4))？？
         Raw = np.concat((Raw,tmp), 2)
 
-    Raw = np.transpose(Raw, (1, 2, 0))
+    Raw = np.transpose(Raw, (1, 2, 0))#(nRamps, nSamples, nChannels) -> (nSamples, nChannels, nRamps)
 
     # remove padded bits:
-    Raw = np.bitwise_and(Raw, np.uint16(0xFFF0))
+    Raw = np.bitwise_and(Raw, np.uint16(0xFFF0))#清4bit 填充位
     Raw = Raw.astype(np.int16, copy=False)
 
     Raw = np.float64(Raw)
@@ -66,7 +67,7 @@ def readRawBinCasc(datadir, frameNr, nSamples, nRamps, nChannels):
 def rdFft(Raw):
     Ns1, Nrx, Ns2 = Raw.shape
 
-    Wd1 = signal.windows.chebwin(Ns1, 80)
+    Wd1 = signal.windows.chebwin(Ns1, 80)#生成切比雪夫窗 窗衰减80dB
     Wd2 = signal.windows.chebwin(Ns2, 80)
 
     Nf1 = Ns1
@@ -76,7 +77,7 @@ def rdFft(Raw):
     Ndopp = Nf2
 
     # Range FFT
-    Ff1 = np.complex64(np.zeros((Nrang,Nrx,Ndopp)))
+    Ff1 = np.complex64(np.zeros((Nrang,Nrx,Ndopp)))#创建空数组存距离 FFT 结果
     for chirp in range(0, Ns2):
         for rx in range(0, Nrx):
             Rw = Raw[:,rx,chirp] * Wd1
@@ -91,13 +92,13 @@ def rdFft(Raw):
             tmp = fft.fft(Rw, Nf2)
             RD[:,rg,rx] = tmp
 
-    return RD
+    return RD#RD(doppler,range,rx)
 
 ###############################################################################
 def nci(RD):
     Ndopp,Nrang,Nrx = RD.shape
     # NCI
-    Plin = np.abs(RD)**2
+    Plin = np.abs(RD)**2#abs^2
     NCI = Plin[:,:,0]
     for rx in range(1, Nrx):
         NCI = NCI + Plin[:,:,rx]
@@ -105,11 +106,11 @@ def nci(RD):
     return NCI
 
 ###############################################################################
-def localMax(NCI):
+def localMax(NCI):#十字
     Ndopp, Nrang = NCI.shape
     LMAP = np.zeros((Ndopp, Nrang), bool)
 
-    NCIt = np.concatenate((NCI[(Ndopp-1):Ndopp,:],NCI,NCI[0:1,:]))
+    NCIt = np.concatenate((NCI[(Ndopp-1):Ndopp,:],NCI,NCI[0:1,:]))# 对 多普勒维度做循环填充/边缘扩展
     NCIt = np.concatenate((NCIt[:,1:2],NCIt,NCIt[:,(Nrang-2):(Nrang-1)]),axis=1)
 
     for r in range(0,Nrang):
@@ -122,7 +123,7 @@ def localMax(NCI):
     return LMAP
 
 ###############################################################################
-def thresholding(NCI, beta_dB):
+def thresholding(NCI, beta_dB):#50%
     Ndopp, Nrang = NCI.shape
 
     S = np.zeros((Ndopp,Nrang))
@@ -136,7 +137,7 @@ def thresholding(NCI, beta_dB):
     return TMAP
 
 ###############################################################################
-def matching(TMAP, txCode):
+def matching(TMAP, txCode):#tx都检测到的才能通过
     Ndopp, Nrange = TMAP.shape
     shift = np.int32(txCode*Ndopp)
 

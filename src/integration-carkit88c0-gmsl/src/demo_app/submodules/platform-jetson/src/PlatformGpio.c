@@ -20,7 +20,11 @@
 
 #include "PlatformGpio.h"
 #include "PlatformTime.h"
-
+// #ifndef GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP
+// #define GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP    1
+// #define GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN  0
+// #define GPIOD_LINE_REQUEST_FLAG_BIAS_DISABLE    0
+// #endif
 typedef struct gpiod_chip gpiod_chip;
 typedef struct gpiod_line gpiod_line;
 

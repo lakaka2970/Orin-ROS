@@ -1,1 +1,1 @@
-cmd_/home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/radar.mod := { echo  /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/radar.o;  echo; } > /home/zhengyuanliu/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/modules/radar/radar.mod
+cmd_/home/orin/projects/gmsl/src/modules/radar/radar.mod := { echo  /home/orin/projects/gmsl/src/modules/radar/radar.o;  echo; } > /home/orin/projects/gmsl/src/modules/radar/radar.mod

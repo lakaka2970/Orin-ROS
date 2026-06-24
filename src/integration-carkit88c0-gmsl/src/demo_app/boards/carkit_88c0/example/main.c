@@ -108,38 +108,42 @@ int main(void)
 
     // =============== Initialize I2C Interface ===================
     // Initialize I2C bus 2 for communication
+    // 初始化I2C总线2（用于与PMIC/其他I2C设备通信）
     EXIT_ON_PLATFORM_ERROR(PlatformI2c_init(2), cleanup_platform());
 
     // =============== Configure GPIO Pins ===================
     // Setup control and status pins for the CTRX devices
-
+    // 配置CTRX设备的控制和状态引脚，分功能逐一配置
     // RFT (Ready for Transfer) pins - indicate when CTRXs are ready for SPI communication
+     // 配置RFT（Ready for Transfer）引脚：输入模式+下拉，用于指示CTRX是否就绪SPI通信
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_RFT, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
 
-    // Reset pins
+    // 配置复位引脚：输出高电平+下拉，用于控制CTRX设备复位
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_RES_N, GPIO_FLAG_OUTPUT_DRIVE_HIGH | GPIO_FLAG_PULL_DOWN), cleanup_platform());
 
-    // Status monitoring pins
+    // 配置OK状态监测引脚：输入模式+下拉，用于读取CTRX设备状态
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_OK, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
+    // 配置SPI_BNE状态监测引脚：输入模式+下拉，用于SPI总线忙状态检测
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_SPI_BNE, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
 
-    // Read-only SPI pin
+    // 配置SPI只读引脚：输出低电平+上拉，用于SPI只读模式控制
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_SPI_RO, GPIO_FLAG_OUTPUT_DRIVE_LOW | GPIO_FLAG_PULL_UP), cleanup_platform());
 
-    // DMUX1 pin for device
+    // 配置设备DMUX1引脚：输出高电平+下拉，用于设备通道选择
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_DMUX1, GPIO_FLAG_OUTPUT_DRIVE_HIGH | GPIO_FLAG_PULL_DOWN), cleanup_platform());
-    // DMUX2 pin for device
+    // 配置设备DMUX2引脚：输入模式+下拉，用于设备通道选择/状态读取
     EXIT_ON_PLATFORM_ERROR(PlatformGpio_configure(GPIO_ID_DMUX2, GPIO_FLAG_INPUT_ENABLE | GPIO_FLAG_PULL_DOWN), cleanup_platform());
 
     // =============== Setup SPI Communication ===================
     // Configure SPI interface mapping for communication with CTRXs
+    // 配置SPI接口映射（与CTRX通信的SPI参数）
     gmsl_device_config_t device_configs[] = {
         {
             .device_id = DEVICE_STANDALONE,
             .link_cmd  = GMSL_SPI_ID_IGNORE,  // Serializer accepts all IDs in single-link mode
             .ss_cmd    = GMSL_ASS_SS1         // Device on SS1
         }};
-
+    // 参数：设备配置数组、数组长度、SPI_RO引脚ID、SPI_BNE引脚ID
     GmslSpiWrapper_setConfig(device_configs,
                              sizeof(device_configs) / sizeof(device_configs[0]),
                              GPIO_ID_SPI_RO,
@@ -187,6 +191,8 @@ int main(void)
     };
 
     // Initialize IfxRfe with all configuration parameters
+    // 初始化IfxRfe库
+    // 参数：设备数量、GPIO映射、SPI回调、GPIO回调、时间回调、日志回调
     EXIT_ON_IFXRFE_ERROR(
         IfxRfe_init(
             CTRX_DEV_COUNT,
@@ -200,6 +206,7 @@ int main(void)
     // =============== PMIC and Configuration Setup ===================
 
     // enable spread spectrum +-3% pseudo-random
+    // 启用PMIC的扩频时钟：±3%伪随机（降低EMI电磁干扰）
     // EXIT_ON_IFXRFE_ERROR(Max20434_enableSpreadSpectrum(&pmic, SSE_3Percent_PseudoRandom), cleanup_platform());
 
     // Initialize device configuration parameters
@@ -214,7 +221,6 @@ int main(void)
     {
 
     }
-
     // // =============== Check CTRX Status ===================
     // // Check the CTRX status
     // IfxRfe_getStatusResult_t status = {0};
@@ -227,6 +233,7 @@ int main(void)
     // usleep(RESET_DELAY_US);
 
     // // Get status
+    // // 选择独立模式的CTRX设备，用于后续状态查询
     // EXIT_ON_IFXRFE_ERROR(IfxRfe_selectDevice(DEVICE_STANDALONE), cleanup_platform());
     // EXIT_ON_IFXRFE_ERROR(IfxRfe_getStatus(&status), cleanup_platform());
 
@@ -279,6 +286,8 @@ int main(void)
 
     // // =============== Transition to Operation State ===================
     // // Transition to operational state for radar operations
+    // // =============== 切换到工作状态 ===================
+    // // 将CTRX切换到操作状态，用于雷达数据采集
     // EXIT_ON_IFXRFE_ERROR(IfxRfe_gotoOperation(), cleanup_platform());
     // EXIT_ON_IFXRFE_ERROR(IfxRfe_getStatus(&status), cleanup_platform());
 
@@ -309,6 +318,7 @@ int main(void)
     // for (int i = 0; i < NUM_ITERATIONS; i++)
     // {
     //     printf("Radar iteration: %d\n", i);
+    //     // 启动斜坡场景（触发雷达发射/接收）
     //     EXIT_ON_IFXRFE_ERROR(IfxRfe_startRampScenario(), cleanup_platform());
 
     //     usleep(FINISH_RAMP_DELAY_US);  // Wait for ramp scenario to complete

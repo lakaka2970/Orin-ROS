@@ -1,1 +1,0 @@
-cmd_/home/orin/projects/gmsl/src/modules/radar/radar.ko := ld -r  -EL  -maarch64elf  --build-id=sha1  -T scripts/module.lds -o /home/orin/projects/gmsl/src/modules/radar/radar.ko /home/orin/projects/gmsl/src/modules/radar/radar.o /home/orin/projects/gmsl/src/modules/radar/radar.mod.o;  true

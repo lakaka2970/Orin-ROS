@@ -1,1 +1,0 @@
-cmd_/home/orin/projects/gmsl/src/modules/radar/Module.symvers := sed 's/ko$$/o/' /home/orin/projects/gmsl/src/modules/radar/modules.order | scripts/mod/modpost -m  -E  -o /home/orin/projects/gmsl/src/modules/radar/Module.symvers -e -i Module.symvers   -T -

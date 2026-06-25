@@ -1,1 +1,0 @@
-cmd_/home/orin/projects/gmsl/src/modules/max929x/max929x.ko := ld -r  -EL  -maarch64elf  --build-id=sha1  -T scripts/module.lds -o /home/orin/projects/gmsl/src/modules/max929x/max929x.ko /home/orin/projects/gmsl/src/modules/max929x/max929x.o /home/orin/projects/gmsl/src/modules/max929x/max929x.mod.o;  true

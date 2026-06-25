@@ -1,1 +1,0 @@
-cmd_/home/orin/projects/gmsl/src/modules/max929x/modules.order := {   echo /home/orin/projects/gmsl/src/modules/max929x/max929x.ko; :; } | awk '!x[$$0]++' - > /home/orin/projects/gmsl/src/modules/max929x/modules.order

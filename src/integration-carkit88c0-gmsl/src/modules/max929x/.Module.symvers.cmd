@@ -1,1 +1,0 @@
-cmd_/home/orin/projects/gmsl/src/modules/max929x/Module.symvers := sed 's/ko$$/o/' /home/orin/projects/gmsl/src/modules/max929x/modules.order | scripts/mod/modpost -m  -E  -o /home/orin/projects/gmsl/src/modules/max929x/Module.symvers -e -i Module.symvers   -T -

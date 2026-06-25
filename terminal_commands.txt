@@ -1,0 +1,27 @@
+~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl$ sudo python init_jetson.py
+
+
+
+~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/demo_app/boards/carkit_88c0/example/bin$ sudo ./carkit88c0_gmsl_example 
+
+
+
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=8192,height=512,pixelformat=RG12 --stream-mmap --stream-count=1 --stream-to=test.raw --verbose
+
+
+cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl
+sudo python init_jetson.py 
+
+cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/demo_app/boards/carkit_88c0/example/bin
+sudo ./carkit88c0_gmsl_example 
+
+cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts
+bash capture_video0_2048x512.sh
+
+cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts
+sudo bash tracing.sh
+
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=8192,height=512,pixelformat=RG12 --stream-mmap --stream-count=1 --stream-to=test.raw --verbose
+
+cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts 
+sudo dmesg -w

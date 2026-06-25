@@ -57,3 +57,7 @@ docs/FT_visualizer
 docs/
 ft_dataset/
 *.o
+*.cmd
+
+src/integration-carkit88c0-gmsl/src/modules/radar/
+src/integration-carkit88c0-gmsl/src/modules/max929x/

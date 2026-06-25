@@ -102,7 +102,7 @@ def plot_nci_3d_surface(NCI, title="NCI 3D Surface", save_path=None):
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
     ax.plot_surface(x, y, Z, cmap='jet')
-    ax.view_init(-90, 0, 0)
+    ax.view_init(-90, 0)
     ax.set_proj_type('ortho')
     ax.set_xlabel('Range Bin')
     ax.set_ylabel('Doppler Bin')
@@ -484,7 +484,9 @@ def main():
     if args.save:
         print(f"图像保存目录: {save_dir}")
 
-    plt.show()
+    # 仅在交互式后端时显示 (非交互式后端如 Agg 会自动跳过)
+    if plt.get_backend() != 'agg':
+        plt.show()
 
 
 if __name__ == "__main__":

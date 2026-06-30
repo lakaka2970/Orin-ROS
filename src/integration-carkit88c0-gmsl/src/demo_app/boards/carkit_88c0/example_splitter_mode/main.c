@@ -67,6 +67,7 @@ static void cleanup_platform(void)
  * @param deviceName Human-readable device name for output (e.g., "CTRX")
  * @param result Pointer to error result structure
  */
+#if 0 
 static void print_error_status(const char *deviceName, const IfxRfe_handleErrorResult_t *result)
 {
     printf("HandleError %s\n", deviceName);
@@ -78,7 +79,7 @@ static void print_error_status(const char *deviceName, const IfxRfe_handleErrorR
     }
     printf("-------------------------------------\n");
 }
-
+#endif
 /**
  * @brief Main application entry point
  * 
@@ -105,7 +106,7 @@ int main(void)
 {
     printf("=== IfxRfe App - CARKIT88C0 Reverse Splitter Mode Example ===\n");
 
-    const Max20434Pec_t pmic = {.devAddrI2c = 0x3f};
+    // const Max20434Pec_t pmic = {.devAddrI2c = 0x3f};
 
     // =============== Initialize I2C Interface ===================
     // Initialize I2C bus 2 for communication
@@ -216,7 +217,7 @@ int main(void)
     // =============== PMIC and Configuration Setup ===================
     // 启用PMIC的扩频功能（±3%伪随机，降低EMI电磁干扰）
     // enable spread spectrum +-3% pseudo-random
-    EXIT_ON_IFXRFE_ERROR(Max20434_enableSpreadSpectrum(&pmic, SSE_3Percent_PseudoRandom), cleanup_platform());
+    // EXIT_ON_IFXRFE_ERROR(Max20434_enableSpreadSpectrum(&pmic, SSE_3Percent_PseudoRandom), cleanup_platform());
     // 初始化雷达演示配置参数（默认参数：TX功率、RX配置、RF频率等）
     // Initialize device configuration parameters
     IfxRfe_demoConfigParams_t configParams;
@@ -227,6 +228,7 @@ int main(void)
     uint8_t flags = IFXRFE_SPI_MODE_0;
     Wrapper_SpiConfigure(flags, SPI_CLOCK_SPEED);
 
+#if 0
     // =============== Check CTRX Status ===================
     // Check the CTRX status
     IfxRfe_getStatusResult_t statusLinkA = {0};
@@ -425,6 +427,7 @@ int main(void)
 
     // Cleanup platform resources
     cleanup_platform();
+#endif    
 
     printf("=== SUCCESS ===\n");
     return EXIT_SUCCESS;

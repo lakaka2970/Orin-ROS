@@ -88,6 +88,7 @@ fi
 # 先构建消息包，加载后构建节点包
 echo "[3/5] [BUILD] 构建 ft_radar_msgs (自定义消息)..."
 colcon build --packages-select ft_radar_msgs --symlink-install \
+    --cmake-force-configure \
     --allow-overriding ft_radar_msgs \
     2>&1 | grep -v "WARNING.*doesn't exist\|WARNING.*colcon\|If you understand\|--allow-overriding\|Some selected\|This may be\|If a package\|Failure to"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then

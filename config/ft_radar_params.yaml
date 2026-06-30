@@ -9,7 +9,7 @@
 # ════════════════════════════════════════════════════════════════════════════
 # 话题频率概览 (Hz)
 # ════════════════════════════════════════════════════════════════════════════
-#   /adc/raw_data                    15 Hz  ← adc_rx
+#   /adc/raw_data                    15 Hz  ← adc_rx (16 MiB/帧, 8T8R ctrx0)
 #   /camera/image_raw                30 Hz  ← camera_rx
 #   /vehicle/ego_motion              50 Hz  ← vehicle_data_rx
 #   /processing/radar/det_list       10 Hz  ← rsp_* (⚠ 低于ADC 15Hz)
@@ -44,16 +44,17 @@ system:
 # ====================================================================
 # 节点: ADC Rx — 雷达 ADC 数据接收
 # ====================================================================
-# 规格: 15 Hz, 32 MB/帧, 512×16×2048×int16
+# 规格: 8T8R ctrx0 半集, 16 MiB/帧, 1024 chirps × 4 RX × 2048 samples × int16
+#   Frame = 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB
 adc_rx:
   fps: 15
-  num_rows: 512
-  num_chirps_per_row: 16
+  num_rows: 1024                           # 总 chirp: 512 chirps/group × 2 groups
+  num_chirps_per_row: 4                    # RX 天线数
   num_samples_per_chirp: 2048
-  frame_size_bytes: 33554432              # 512×16×2048×2
-  data_dir: "data"                        # .bin 文件目录 (相对路径基于 CWD)
-  max_preload_files: 30                   # 最多预加载文件数 (~960 MB)
-  use_noise_pool: true                    # 无文件时自动回退到噪声池
+  frame_size_bytes: 16777216               # 1024×4×2048×2 = 16 MiB
+  data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
+  max_preload_files: 30                    # 最多预加载文件数 (~960 MB)
+  use_noise_pool: true                     # 无文件时自动回退到噪声池
 
 # ====================================================================
 # 节点: Camera Rx — 相机数据接收
@@ -163,7 +164,7 @@ rviz_image:
 #       └── <timestamp_us>.bin
 #
 # 帧数上限策略:
-#   ADC:     100 帧 → 约 3.2 GB (100 × 32 MB)
+#   ADC:     100 帧 → 约 1.6 GB (100 × 16 MiB)
 #   Image:   1000 帧
 #   Det_List: 1000 帧
 #   Ego_Motion: 1000 帧

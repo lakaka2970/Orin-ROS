@@ -6,7 +6,7 @@
 //
 // 用法: 由 launch 文件通过 adc_source:=analog 参数自动选择本节点.
 //
-// 设计目标: 15 Hz × 32 MB/帧 = 480 MB/s 吞吐, CycloneDDS SHM 传输.
+// 设计目标: 15 Hz × 16 MiB/帧 = 240 MiB/s 吞吐 (8T8R ctrx0), CycloneDDS SHM 传输.
 // ============================================================================
 
 #include <algorithm>
@@ -41,8 +41,8 @@ public:
     : RxNodeBase("adc_rx", "/adc/raw_data", 10, true)
   {
     declare_parameter("fps", FPS);
-    declare_parameter("num_rows", 512);
-    declare_parameter("num_chirps_per_row", 16);
+    declare_parameter("num_rows", 1024);                  // 总 chirp: 512 × 2 groups
+    declare_parameter("num_chirps_per_row", 4);            // RX 天线数
     declare_parameter("num_samples_per_chirp", 2048);
     declare_parameter("data_dir", "data");
     declare_parameter("fixed_frame", "radar");
@@ -59,7 +59,7 @@ public:
     use_noise_pool_ = get_parameter("use_noise_pool").as_bool();
 
     total_elems_ = num_rows_ * num_chirps_ * num_samples_;  // int16 元素数
-    frame_bytes_ = total_elems_ * sizeof(int16_t);           // 32 MB
+    frame_bytes_ = total_elems_ * sizeof(int16_t);           // 16 MiB
 
     // ── 静态 TF (成员变量 — 生命周期必须覆盖整个节点) ──
     tf_bc_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);

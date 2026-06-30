@@ -8,7 +8,7 @@ CycloneDDS 共享内存 (SHM) 传输配置文件
     WSL 开发时请使用默认的 Fast-RTPS UDP 传输。
 
 用途: 在同机 (localhost) 节点间启用 SHM 传输，消除 socket send/receive 路径上的
-      32MB/帧 memcpy 开销，大幅降低 ADC 数据发布时延与 CPU 占用。
+      16 MiB/帧 memcpy 开销（8T8R ctrx0），大幅降低 ADC 数据发布时延与 CPU 占用。
 
 启用方式 (Jetson 裸机):
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -38,17 +38,17 @@ CycloneDDS 共享内存 (SHM) 传输配置文件
             <Policy>default</Policy>
 
             <!-- 最大 SHM 区域大小 (单条消息上限)。
-                 32 MB ADC 帧 + 安全余量 → 64 MB。
+                 16 MiB ADC 帧 + 安全余量 → 32 MiB。
                  /dev/shm 总大小: Jetson AGX Orin 默认 3.5 GB (/dev/shm 为 tmpfs)。
-                 10 个节点 × 64 MB × 2 (pub/sub) ≈ 1.28 GB，足够容纳。
+                 10 个节点 × 32 MiB × 2 (pub/sub) ≈ 640 MB，足够容纳。
             -->
-            <DefaultAllocationSize>67108864</DefaultAllocationSize>
+            <DefaultAllocationSize>33554432</DefaultAllocationSize>
         </Shm>
 
         <!-- ──── 网络传输配置 (SHM 回退路径) ──── -->
         <General>
-            <!-- 最大消息大小: 适配 32MB ADC 帧 -->
-            <MaxMessageSize>33554432</MaxMessageSize>
+            <!-- 最大消息大小: 适配 16 MiB ADC 帧 (8T8R ctrx0) -->
+            <MaxMessageSize>16777216</MaxMessageSize>
 
             <!-- 允许绑定到多播接口 (DDS 发现必需) -->
             <AllowMulticast>default</AllowMulticast>

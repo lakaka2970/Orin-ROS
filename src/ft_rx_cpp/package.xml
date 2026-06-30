@@ -4,7 +4,7 @@
   <name>ft_rx_cpp</name>
   <version>0.1.0</version>
   <description>C++ rewrite of the three rx data-acquisition nodes (ADC / Camera / Vehicle) —
-    zero-copy-optimised for high-throughput 32 MB/frame ADC streaming on Jetson Orin.</description>
+    zero-copy-optimised for high-throughput 16 MiB/frame ADC streaming on Jetson Orin.</description>
   <maintainer email="zhengyuan.liu@example.com">zhengyuan.liu</maintainer>
   <license>Apache-2.0</license>
 

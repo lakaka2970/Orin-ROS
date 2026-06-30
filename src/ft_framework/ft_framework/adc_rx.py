@@ -6,8 +6,9 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 模拟通过 v4l2 接口从雷达硬件采集原始 ADC 数据，发布为自定义 AdcRawData 消息。
 
 规格:
-  - 帧率: 15 Hz
-  - 数据量: 32 MB/帧 (512 rows × 16 chirps/row × 2048 samples/chirp × int16)
+  - 帧率: 10 Hz
+  - 数据量: 16 MiB/帧 (1024 chirps × 4 RX × 2048 samples/chirp × int16)
+    = 512 chirps × 2 groups × 4 RX × 2048 samples
   - 时间戳: 全局统一，微秒 (μs) 精度，使用 time.monotonic_ns()
 
 话题:
@@ -28,14 +29,21 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 # ============================================================================
 
 # ---------- 采集参数 ----------
+# 数据格式 (8T8R, ctrx0 半集):
+#   每帧 = 512 chirps × 2 groups × 4 RX × 2048 samples = 8,388,608 int16 = 16 MiB
+#   AdcRawData: num_rows(总chirp) × num_chirps_per_row(RX数) × num_samples_per_chirp
 ADC_FPS                    = 10        # 帧率 (Hz)
-NUM_ROWS                   = 512       # 行数
-NUM_CHIRPS_PER_ROW         = 16        # 每行的 chirp 数量
+NUM_ROWS                   = 1024      # 总 chirp 数 (512 chirps/group × 2 groups)
+NUM_CHIRPS_PER_ROW         = 4         # RX 天线数
 NUM_SAMPLES_PER_CHIRP      = 2048      # 每个 chirp 的采样点数
 
 # ---------- 模拟参数 ----------
 SIM_NOISE_LEVEL            = 100       # 模拟噪声幅度（±）
 SIM_NOISE_POOL_FACTOR      = 4         # 噪声池倍数 (预生成池 = 帧大小 × 倍数)
+
+# ---------- 文件回放参数 ----------
+BIN_FILE_PATH              = 'data/ctrx0_raw.bin'  # 预采集的 .bin 文件路径
+USE_BIN_FILE               = True      # 是否优先使用 .bin 文件回放（否则使用噪声池）
 
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
@@ -71,7 +79,7 @@ class AdcRxNode(Node):
     功能说明:
       - 模拟 v4l2 驱动的 ADC 数据采集
       - 在采集第一时间注入全局统一时间戳（微秒精度）
-      - 发布 512×16×2048 int16 原始数据（32 MB/帧）
+      - 发布 1024×4×2048 int16 原始数据（16 MiB/帧，8T8R ctrx0 半集）
     """
 
     def __init__(self):
@@ -82,6 +90,8 @@ class AdcRxNode(Node):
         self.declare_parameter('num_rows', NUM_ROWS)
         self.declare_parameter('num_chirps_per_row', NUM_CHIRPS_PER_ROW)
         self.declare_parameter('num_samples_per_chirp', NUM_SAMPLES_PER_CHIRP)
+        self.declare_parameter('bin_file_path', BIN_FILE_PATH)
+        self.declare_parameter('use_bin_file', USE_BIN_FILE)
         self.declare_parameter('fixed_frame', FIXED_FRAME)
         self.declare_parameter('profiler_enabled', True)
         self.declare_parameter('profiler_log_interval', 50)
@@ -91,6 +101,8 @@ class AdcRxNode(Node):
         self.num_rows           = int(self.get_parameter('num_rows').value)
         self.num_chirps_per_row = int(self.get_parameter('num_chirps_per_row').value)
         self.num_samples        = int(self.get_parameter('num_samples_per_chirp').value)
+        self.bin_file_path      = self.get_parameter('bin_file_path').value
+        self.use_bin_file       = bool(self.get_parameter('use_bin_file').value)
         self.fixed_frame        = self.get_parameter('fixed_frame').value
 
         # ---------- 性能分析器 (自动接入 _on_timer) ----------
@@ -131,11 +143,75 @@ class AdcRxNode(Node):
 
         self.get_logger().info(
             f'ADC Rx 启动: {self.fps} Hz, '
-            f'{self.num_rows} rows × {self.num_chirps_per_row} chirps/row × '
+            f'{self.num_rows} chirps × {self.num_chirps_per_row} RX × '
             f'{self.num_samples} samples/chirp, '
-            f'每帧 {self._total_samples * 2 / 1024 / 1024:.1f} MB')
+            f'每帧 {self._total_samples * 2 / 1024 / 1024:.1f} MiB')
 
-        # ---------- 预生成模拟噪声池 ----------
+        # ---------- 数据源初始化（文件预加载优先，噪声池备选） ----------
+        self._file_frames = []      # 预加载的文件帧列表
+        self._file_frame_idx = 0    # 当前回放帧索引
+
+        if self.use_bin_file and self.bin_file_path and os.path.exists(self.bin_file_path):
+            self._load_bin_frames()
+        else:
+            if self.use_bin_file:
+                self.get_logger().warning(
+                    f'bin 文件不存在: {self.bin_file_path}, 回退到噪声池')
+            self._init_noise_pool()
+
+        # ---------- 预分配消息对象 (复用避免每帧 malloc) ----------
+        self._msg = AdcRawData()
+        self._msg.header.frame_id = self.fixed_frame
+        self._msg.num_rows = self.num_rows
+        self._msg.num_chirps_per_row = self.num_chirps_per_row
+        self._msg.num_samples_per_chirp = self.num_samples
+
+    # ------------------------------------------------------------------
+    # 数据源：从 .bin 文件预加载帧
+    # ------------------------------------------------------------------
+
+    def _load_bin_frames(self):
+        """从 .bin 文件中预加载所有帧到内存（循环回放）。"""
+        frame_bytes = self._total_samples * 2  # int16 × 2 bytes
+        file_size = os.path.getsize(self.bin_file_path)
+        total_frames = file_size // frame_bytes
+
+        if total_frames < 1:
+            self.get_logger().warning(
+                f'bin 文件太小 ({file_size} bytes < 1 frame {frame_bytes} bytes), '
+                f'回退到噪声池')
+            self._init_noise_pool()
+            return
+
+        # 逐帧读取，避免一次性分配过大内存
+        try:
+            mmap_array = np.memmap(
+                self.bin_file_path, dtype=np.int16, mode='r',
+                shape=(total_frames * self._total_samples,))
+            for i in range(total_frames):
+                start = i * self._total_samples
+                end = start + self._total_samples
+                # 复制到独立 buffer，释放 mmap 资源后可继续使用
+                frame = mmap_array[start:end].copy()
+                self._file_frames.append(frame)
+            del mmap_array  # 释放 mmap
+        except Exception as e:
+            self.get_logger().warning(
+                f'bin 文件读取失败: {e}, 回退到噪声池')
+            self._file_frames.clear()
+            self._init_noise_pool()
+            return
+
+        self.get_logger().info(
+            f'bin 文件已预加载: {total_frames} 帧 ({file_size / 1048576:.1f} MB), '
+            f'来自 {self.bin_file_path}')
+
+    # ------------------------------------------------------------------
+    # 数据源：生成模拟噪声池（备选）
+    # ------------------------------------------------------------------
+
+    def _init_noise_pool(self):
+        """预生成噪声池（原模拟模式）。"""
         # 原理: np.random.randint(16.7M) 在 ARM 上需 ~82ms，
         #   改为预生成 4x 噪声池 + 每帧随机切片，将 O(16.7M) 降到 O(1)。
         pool_size = self._total_samples * SIM_NOISE_POOL_FACTOR
@@ -146,22 +222,15 @@ class AdcRxNode(Node):
             f'噪声池已预生成: {pool_size / 1e6:.1f}M 采样 '
             f'({pool_size * 2 / 1024 / 1024:.1f} MB)')
 
-        # ---------- 预分配消息对象 (复用避免每帧 malloc) ----------
-        self._msg = AdcRawData()
-        self._msg.header.frame_id = self.fixed_frame
-        self._msg.num_rows = self.num_rows
-        self._msg.num_chirps_per_row = self.num_chirps_per_row
-        self._msg.num_samples_per_chirp = self.num_samples
-
     # ------------------------------------------------------------------
     # 定时器回调
     # ------------------------------------------------------------------
 
     def _on_timer(self):
         """
-        模拟 ADC 数据采集:
+        ADC 数据采集:
           1. 注入全局时间戳（单调时钟，微秒精度）
-          2. 从预生成噪声池中随机切片 (替代实时 randint)
+          2. 从预加载文件帧或噪声池获取数据
           3. 复用预分配消息对象并发布
 
         FrameProfiler 通过 wrap_callback 自动接管帧级计时，
@@ -173,13 +242,22 @@ class AdcRxNode(Node):
         sec, nsec = monotonic_us_stamp()
         self._prof.checkpoint('1.timestamp')
 
-        # ---- 2. 模拟 ADC 数据采集 (预生成池随机切片) ----
+        # ---- 2. 获取 ADC 数据 (文件回放优先，噪声池备选) ----
         # 实际部署时，此处替换为 v4l2 驱动读取:
         #   data_buffer = v4l2_device.read(frame_size_bytes)
         #   int16_array = np.frombuffer(data_buffer, dtype=np.int16)
-        offset = np.random.randint(0, self._pool_max_offset + 1)
-        data_array = self._noise_pool[offset : offset + self._total_samples]
-        self._prof.checkpoint('2.np_random')
+        if self._file_frames:
+            # 从预加载文件帧中循环回放
+            data_array = self._file_frames[self._file_frame_idx]
+            self._file_frame_idx = (self._file_frame_idx + 1) % len(self._file_frames)
+        elif hasattr(self, '_noise_pool'):
+            # 从预生成噪声池中随机切片
+            offset = np.random.randint(0, self._pool_max_offset + 1)
+            data_array = self._noise_pool[offset : offset + self._total_samples]
+        else:
+            # 无数据源：发布零帧
+            data_array = np.zeros(self._total_samples, dtype=np.int16)
+        self._prof.checkpoint('2.data_source')
 
         # ---- 3. 更新消息 (复用预分配对象) ----
         self._msg.header.stamp.sec = sec

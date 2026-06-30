@@ -2,9 +2,9 @@
 # 雷达 ADC 原始数据消息
 # ============================================================================
 # 数据维度: [num_rows × num_chirps_per_row × num_samples_per_chirp] × int16
-# 典型配置: 512 rows × 16 chirps/row × 2048 samples/chirp × 2 bytes = 32 MB/帧
+# 典型配置 (8T8R ctrx0 半集): 1024 chirps × 4 RX × 2048 samples × 2 bytes = 16 MiB/帧
 # 帧率: 15 Hz
-# 总吞吐: ~480 MB/s
+# 总吞吐: ~240 MiB/s
 #
 # 时间戳要求:
 #   header.stamp 必须在 v4l2 读取数据的第一时间注入，
@@ -14,12 +14,12 @@
 
 std_msgs/Header header                # 全局统一时间戳（微秒精度，header.stamp 透传）
 
-uint32 num_rows                       # 行数，典型值 512
-uint32 num_chirps_per_row             # 每行的 chirp 数量，典型值 16
+uint32 num_rows                       # 总 chirp 数，典型值 1024 (512 chirps × 2 groups)
+uint32 num_chirps_per_row             # RX 天线数，典型值 4
 uint32 num_samples_per_chirp          # 每个 chirp 的采样点数，典型值 2048
 
 uint8[] data                          # ADC 采样数据，原始字节流 (little-endian int16)
-                                      # 语义: int16[row×chirp×sample]; 传输用 uint8 走 memcpy 快速路径
+                                      # 语义: int16[chirps×rx×sample]; 传输用 uint8 走 memcpy 快速路径
                                       # 消费者: np.frombuffer(msg.data, dtype=np.int16).reshape(...)
                                       # 总字节: num_rows × num_chirps_per_row × num_samples_per_chirp × 2
-                                      # 典型值: 512 × 16 × 2048 × 2 = 33,554,432 字节 (32 MiB)
+                                      # 典型值: 1024 × 4 × 2048 × 2 = 16,777,216 字节 (16 MiB)

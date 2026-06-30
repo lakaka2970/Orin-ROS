@@ -60,7 +60,7 @@ bash scripts/start.sh python
 | **已有 ROS2** | `bash scripts/install_deps.sh --with-cyclonedds` |
 | **仅检查不安装** | `bash scripts/install_deps.sh --dry-run` |
 
-> **CycloneDDS 必须安装**: 32MB/帧 ADC 消息在默认 FastDDS 下会被 UDP 分片为 500+ 包导致大量丢包。CycloneDDS 内置共享内存传输，本地 IPC 不走网络栈。
+> **CycloneDDS 必须安装**: 16 MiB/帧 ADC 消息在默认 FastDDS 下会被 UDP 分片导致大量丢包。CycloneDDS 内置共享内存传输，本地 IPC 不走网络栈。
 
 ### 启动选项
 
@@ -134,7 +134,7 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 ### 数据流
 
 ```
-[ADC Rx C++] ──→ /adc/raw_data (32MB/帧, 15Hz, SHM传输)
+[ADC Rx C++] ──→ /adc/raw_data (16MB/帧, 15Hz, SHM传输)
                     ├──→ [RSP Python / CUDA] ──→ /processing/radar/det_list
                     └──→ [Logging] ──→ output/ft_dataset/
 
@@ -162,7 +162,7 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 
 | 节点 | 频率 | 输出话题 | 数据量 | 说明 |
 |------|:----:|------|------|------|
-| **ADC Rx** | 15 Hz | `/adc/raw_data` | 32 MB/帧 | ADC 原始数据 (uint8 字节流) |
+| **ADC Rx** | 15 Hz | `/adc/raw_data` | 16 MiB/帧 | ADC 原始数据 (uint8 字节流) |
 | **Camera Rx** | 30 Hz | `/camera/image_raw` | ~2.7 MB/帧 | 测试图案 (1280×720 BGR) |
 | **Vehicle Data Rx** | 50 Hz | `/vehicle/ego_motion` | < 1 KB/帧 | 车速/偏航角/转向/加速度/挡位 |
 
@@ -170,10 +170,10 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 
 | 优化 | 效果 |
 |------|------|
-| 噪声池预生成 (4x 帧大小) | 消除每帧 82ms MT19937 开销 |
-| 单次 memcpy 入消息 | 替代 Python tolist() 的 16.7M 对象分配 |
+| 噪声池预生成 (4x 帧大小) | 消除每帧 MT19937 开销 |
+| 单次 memcpy 入消息 | 替代 Python tolist() 的 8.4M 对象分配 |
 | `uint8[]` 消息类型 | ROS2 C 序列化走 memcpy 快速路径 |
-| CycloneDDS SHM 传输 | 32MB 不走 UDP 分片, 本地 IPC 直通 |
+| CycloneDDS SHM 传输 | 16MiB 不走 UDP 分片, 本地 IPC 直通 |
 | Best Effort QoS | 模拟场景无需可靠传输, 消除 ACK 等待 |
 
 ### 第二层：信号处理 (Python)
@@ -375,4 +375,4 @@ Apache-2.0
 
 **作者**: zhengyuan.liu
 **创建**: 2026.6.8
-**更新**: 2026.6.18
+**更新**: 2026.6.30

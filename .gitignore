@@ -61,3 +61,4 @@ ft_dataset/
 
 src/integration-carkit88c0-gmsl/src/modules/radar/
 src/integration-carkit88c0-gmsl/src/modules/max929x/
+data/simulated_data

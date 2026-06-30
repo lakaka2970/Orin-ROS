@@ -61,7 +61,7 @@ OUTPUT_DIR      = "output/ft_dataset"    # 数据集根目录 (相对路径 = �
 STATUS_INTERVAL = 5.0                    # 状态日志输出间隔 (秒)
 
 # ── 帧数上限 (达到即停止, 不循环覆盖) ──
-FRAME_LIMIT_ADC   = 100                  # ADC: 32 MB/帧 × 100 = ~3.2 GB
+FRAME_LIMIT_ADC   = 100                  # ADC: 16 MiB/帧 × 100 = ~1.6 GB
 FRAME_LIMIT_OTHER = 1000                 # 其他 5 个通道统一上限
 
 # ── 通道开关 (True = 录制, False = 静默) ──

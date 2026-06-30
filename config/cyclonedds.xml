@@ -2,7 +2,7 @@
 <!--
   FT Radar Framework — CycloneDDS 共享内存传输配置
   ============================================================================
-  目标: 32 MB/帧 × 15 Hz = 480 MB/s 吞吐, 走 SHM 避免 UDP 分片瓶颈.
+  目标: 16 MiB/帧 × 15 Hz = 240 MiB/s 吞吐 (8T8R ctrx0), 走 SHM 避免 UDP 分片瓶颈.
 
   关键配置:
     SharedMemory/Enable = true    显式启用 SHM (本地 IPC 不走网络栈)

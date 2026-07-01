@@ -52,7 +52,7 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
     tx_ddma = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)  # (n_tx,)
     doppler_indices = torch.arange(n_chirps, dtype=torch.int64, device=DEVICE)[None, :]  # (1, chirp)
     # 每个发射天线对应的多普勒频移索引（循环移位）
-    db_idx = (doppler_indices + tx_ddma[:, None]) % n_chirps          # (n_tx, n_chirps)
+    db_idx = (doppler_indices + tx_ddma[:, None] * (n_chirps // n_subbands)) % n_chirps   # (n_tx, n_chirps)
 
     # 按发射天线求和，然后转置为 (range, chirp) 便于后续子带处理
     vch_nci = torch.sum(rx_nci[db_idx, :], dim=0).t().contiguous()    # (range, chirp)

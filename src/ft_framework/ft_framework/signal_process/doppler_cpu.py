@@ -51,21 +51,21 @@ def doppler_processing_numpy(
     tx_ddma = np.asarray(tx_ddma_idx, dtype=np.int64)
     doppler_indices = np.arange(n_chirps, dtype=np.int64)[np.newaxis, :]          # (1, chirp)
     # 每个发射天线的多普勒偏移索引
-    db_idx = (doppler_indices + tx_ddma[:, np.newaxis]) % n_chirps                # (n_tx, chirp)
+    db_idx = (doppler_indices + tx_ddma[:, np.newaxis] * (n_chirps // n_subbands)) % n_chirps   # (n_tx, chirp)
     vch_nci = np.sum(rx_nci[db_idx, :], axis=0).T                                 # (range, chirp)
 
-    # 5. 子带最大值提取
-    subband_step = n_chirps // n_subbands
-    max_subband_idx = np.zeros((n_range_bins, n_subbands), dtype=np.int32)
-    max_vch_nci = np.zeros((n_range_bins, n_subbands), dtype=np.float32)
+    # 5. 子带最大值提取（512 Doppler分16组，每组32个，取最大值）
+    n_groups = (n_chirps // n_subbands)
+    max_subband_idx = np.zeros((n_range_bins, n_groups), dtype=np.int32)
+    max_vch_nci = np.zeros((n_range_bins, n_groups), dtype=np.float32)
 
-    for sub_idx in range(n_subbands):
-        # 子带内的多普勒索引范围
-        dop_positions = np.arange(sub_idx, n_chirps, subband_step, dtype=np.int64)
-        vals = vch_nci[:, dop_positions]                              # (range, subband_width)
+    for grp in range(n_groups):
+        # 交错分组: Group k = [k, k+16, k+32, ..., k+496]  共32个bin
+        dop_positions = np.arange(grp, n_chirps, n_groups, dtype=np.int64)
+        vals = vch_nci[:, dop_positions]                              # (range, 32)
         max_vals = np.max(vals, axis=1)
         max_idx = dop_positions[np.argmax(vals, axis=1)]
-        max_subband_idx[:, sub_idx] = max_idx
-        max_vch_nci[:, sub_idx] = max_vals
+        max_subband_idx[:, grp] = max_idx
+        max_vch_nci[:, grp] = max_vals
 
     return rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci

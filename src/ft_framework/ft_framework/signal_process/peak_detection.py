@@ -11,21 +11,25 @@ DEVICE = torch.device('cuda')
 @torch.inference_mode()
 def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
                     tx_ddma_idx, n_range_bins, n_doppler, n_subbands,
-                    ps_scale=25.0, max_peaks_per_rb=12, max_total_peaks=1024):
+                    ps_scale=25.0, max_peaks_per_rb=12, max_total_peaks=1024,
+                    frame_timestamp_us=0, frame_id=0, idle_time_idx=0):
     """
     全向量化 GPU 峰值检测与筛选。
 
     参数:
-        rd_cube: 距离-多普勒谱 (rx, chirp, range) —— 此处实际传入的是距离 FFT 后的 cube，形状 (rx, chirp, range)
+        rd_cube: 距离-多普勒谱 (rx, chirp, range)
         max_vch_nci: 各子带最大值 (range, subband)
         max_subband_idx: 各子带最大值对应的多普勒索引 (range, subband)
         rx_nci: 接收非相干积累结果 (chirp, range)
         noise: 每距离门噪声基底 (range,)
         tx_ddma_idx: DDMA 发射天线索引 (n_tx,)
+        frame_timestamp_us: 帧时间戳(us)
+        frame_id: 帧ID
+        idle_time_idx: 空闲时间索引
         其他: 尺寸参数、阈值比例等
 
     返回:
-        rdcell_list: 每个检测到的峰值字典，包含距离门、多普勒门、功率、噪声、通道数据等。
+        rdcell_list: 每个检测到的峰值字典，字段与 RDCell 结构体对齐
     """
     # 将 rx_nci 转置为 (range, chirp) 以便与子带矩阵对齐
     rx_nci_rd = rx_nci.t().contiguous()   # (range, chirp)
@@ -107,16 +111,40 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     p_right_c = p_right.cpu().numpy()
     rx_nci_c = rx_nci_rd.cpu().numpy()
 
+    # ----- 7. 组装返回字典（字段与 RDCell 结构体对齐）-----
     rdcell_list = []
     for i in range(len(rb_cpu)):
         r, d = rb_cpu[i], db_cpu[i]
+
         rdcell_list.append({
-            'rb': int(r),
-            'db': int(d),
-            'pow_rb': [float(p_up_c[r, d]), float(rx_nci_c[r, d]), float(p_down_c[r, d])],
-            'pow_db': [float(p_left_c[r, d]), float(rx_nci_c[r, d]), float(p_right_c[r, d])],
-            'noise': float(noise_cpu[r]),
+            'u32FrameTimeStamp':   int(frame_timestamp_us),
+            'u16FrameId':          int(frame_id),
+            'u16NofRdCell':        0,
+            'u8Index_Idletime':    int(idle_time_idx),
+            'u16Rb':               int(r),
+            'u16Db':               int(d),
+            'f32PowRbNci_Q7dB':    [float(p_up_c[r, d]),
+                                     float(rx_nci_c[r, d]),
+                                     float(p_down_c[r, d])],
+            'f32PowDbNci_Q7dB':    [float(p_left_c[r, d]),
+                                     float(rx_nci_c[r, d]),
+                                     float(p_right_c[r, d])],
+            'f32PeakPowVchNci_Q7dB': float(vch_cpu[i]),
+            'f32NoiseNci_Q7dB':     float(noise_cpu[r]),
+            'u8RdValidFlag':       1,
+            'u8RdPeakFlag':        1,
+            'sVch':                channel_list[i],    # complex64(256,)
+            # 兼容旧字段
+            'rb':      int(r),
+            'db':      int(d),
+            'pow_rb':  [float(p_up_c[r, d]), float(rx_nci_c[r, d]), float(p_down_c[r, d])],
+            'pow_db':  [float(p_left_c[r, d]), float(rx_nci_c[r, d]), float(p_right_c[r, d])],
+            'noise':   float(noise_cpu[r]),
             'pow_vch': float(vch_cpu[i]),
-            'channel': channel_list[i]
+            'channel': channel_list[i],
         })
+    n_cells = len(rdcell_list)
+    for cell in rdcell_list:
+        cell['u16NofRdCell'] = n_cells
+
     return rdcell_list

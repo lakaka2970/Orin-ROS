@@ -56,6 +56,8 @@ FIXED_FRAME = 'radar'
 
 import os
 import numpy as np
+import threading
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -98,6 +100,7 @@ class AdcRxNode(Node):
         self.declare_parameter('fixed_frame', FIXED_FRAME)
         self.declare_parameter('profiler_enabled', True)
         self.declare_parameter('profiler_log_interval', 50)
+        self.declare_parameter('profiler_report_to_file', False)
         self.declare_parameter('profiler_report_dir', '')
 
         self.fps                = int(self.get_parameter('fps').value)
@@ -110,17 +113,17 @@ class AdcRxNode(Node):
         self.fixed_frame        = self.get_parameter('fixed_frame').value
 
         # ---------- 性能分析器 (自动接入 _on_timer) ----------
-        prof_enabled  = bool(self.get_parameter('profiler_enabled').value)
-        prof_interval = int(self.get_parameter('profiler_log_interval').value)
-        prof_dir      = self.get_parameter('profiler_report_dir').value or os.getcwd()
+        prof_enabled       = bool(self.get_parameter('profiler_enabled').value)
+        prof_interval      = int(self.get_parameter('profiler_log_interval').value)
+        prof_report_to_file = bool(self.get_parameter('profiler_report_to_file').value)
+        prof_dir           = self.get_parameter('profiler_report_dir').value or None
         self._prof = FrameProfiler(
             self, log_every_n=prof_interval, enabled=prof_enabled,
-            report_to_file=True, report_dir=prof_dir)
-        self._prof.wrap_callback(self, '_on_timer')     # 自动接管 tick/tick_end
+            report_to_file=prof_report_to_file, report_dir=prof_dir)
         if prof_enabled:
             self.get_logger().info(
                 f'性能分析器已启用 (每 {prof_interval} 帧报告, '
-                f'文件输出: {prof_dir}')
+                f'文件输出: {prof_report_to_file})')
 
         # ---------- 静态 TF：radar → map ----------
         self._tf_static = tf2_ros.StaticTransformBroadcaster(self)
@@ -139,9 +142,10 @@ class AdcRxNode(Node):
         # ---------- 发布者 ----------
         self.pub_adc = self.create_publisher(AdcRawData, '/adc/raw_data', 10)
 
-        # ---------- 定时器 ----------
-        period = 1.0 / self.fps
-        self.timer = self.create_timer(period, self._on_timer)
+        # ---------- 轮询线程 (硬件驱动, 替代定时器) ----------
+        self._stop_event = threading.Event()
+        self._poll_thread = threading.Thread(target=self._polling_loop, daemon=True)
+        self._poll_thread.start()
         self.frame_count = 0
         self._total_samples = self.num_rows * self.num_chirps_per_row * self.num_samples
 
@@ -297,60 +301,62 @@ class AdcRxNode(Node):
     # 定时器回调
     # ------------------------------------------------------------------
 
-    def _on_timer(self):
+    def _polling_loop(self):
         """
-        ADC 数据采集:
-          1. 注入全局时间戳（单调时钟，微秒精度）
-          2. 从预加载文件帧或噪声池获取数据
-          3. 复用预分配消息对象并发布
+        ADC 数据采集轮询线程 (硬件驱动, 替代定时器).
 
-        FrameProfiler 通过 wrap_callback 自动接管帧级计时，
-        checkpoint 置于每步代码之后，确保名称与测量内容一致。
+        实际部署时, 此处的文件回放/噪声池应替换为 v4l2 阻塞读取:
+          data_buffer = v4l2_device.read(frame_size_bytes)
+          int16_array = np.frombuffer(data_buffer, dtype=np.int16)
+        阻塞读取会自然限制循环频率为硬件实际发送频率.
         """
-        self.frame_count += 1
+        while rclpy.ok() and not self._stop_event.is_set():
+            self._prof.tick()
+            self.frame_count += 1
 
-        # ---- 1. 注入时间戳 ----
-        sec, nsec = monotonic_us_stamp()
-        self._prof.checkpoint('1.timestamp')
+            # ---- 1. 注入时间戳 (ROS 系统时间) ----
+            stamp = self.get_clock().now().to_msg()
+            self._prof.checkpoint('1.timestamp')
 
-        # ---- 2. 获取 ADC 数据 (文件回放优先，噪声池备选) ----
-        # 实际部署时，此处替换为 v4l2 驱动读取:
-        #   data_buffer = v4l2_device.read(frame_size_bytes)
-        #   int16_array = np.frombuffer(data_buffer, dtype=np.int16)
-        if self._file_frames:
-            # 从预加载文件帧中循环回放
-            data_array = self._file_frames[self._file_frame_idx]
-            self._file_frame_idx = (self._file_frame_idx + 1) % len(self._file_frames)
-        elif hasattr(self, '_noise_pool'):
-            # 从预生成噪声池中随机切片
-            offset = np.random.randint(0, self._pool_max_offset + 1)
-            data_array = self._noise_pool[offset : offset + self._total_samples]
-        else:
-            # 无数据源：发布零帧
-            data_array = np.zeros(self._total_samples, dtype=np.int16)
-        self._prof.checkpoint('2.data_source')
+            # ---- 2. 获取 ADC 数据 (文件回放优先，噪声池备选) ----
+            if self._file_frames:
+                data_array = self._file_frames[self._file_frame_idx]
+                self._file_frame_idx = (self._file_frame_idx + 1) % len(self._file_frames)
+            elif hasattr(self, '_noise_pool'):
+                offset = np.random.randint(0, self._pool_max_offset + 1)
+                data_array = self._noise_pool[offset : offset + self._total_samples]
+            else:
+                data_array = np.zeros(self._total_samples, dtype=np.int16)
+            self._prof.checkpoint('2.data_source')
 
-        # ---- 3. 更新消息 (复用预分配对象) ----
-        self._msg.header.stamp.sec = sec
-        self._msg.header.stamp.nanosec = nsec
-        # ★ 绕过 setter: 直接写 _data 避免 Foxy 内部 list(bytes) 转换
-        self._msg._data = data_array.tobytes()
-        self._prof.checkpoint('3.build_msg')
+            # ---- 3. 更新消息 (复用预分配对象) ----
+            self._msg.header.stamp = stamp
+            self._msg._data = data_array.tobytes()
+            self._prof.checkpoint('3.build_msg')
 
-        # ---- 4. 发布 ----
-        self.pub_adc.publish(self._msg)
-        self._prof.checkpoint('4.publish')
+            # ---- 4. 发布 ----
+            self.pub_adc.publish(self._msg)
+            self._prof.checkpoint('4.publish')
 
-        self.get_logger().debug(
-            f'ADC Rx 帧 #{self.frame_count}: '
-            f'timestamp={sec}.{nsec:09d}, '
-            f'data_size={self._total_samples}')
+            self.get_logger().debug(
+                f'ADC Rx 帧 #{self.frame_count}: '
+                f'timestamp={stamp.sec}.{stamp.nanosec:09d}, '
+                f'data_size={self._total_samples}')
+
+            self._prof.tick_end()
+
+            # 文件/噪声模式下无真实硬件阻塞: 短暂休眠避免 100% CPU
+            if not self._stop_event.is_set():
+                time.sleep(0.001)
 
     # ------------------------------------------------------------------
     # 销毁
     # ------------------------------------------------------------------
 
     def destroy_node(self):
+        self._stop_event.set()
+        if hasattr(self, '_poll_thread') and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=2.0)
         self._prof.finalize()       # 输出最终报告并落盘 JSON
         self.get_logger().info(f'ADC Rx 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()

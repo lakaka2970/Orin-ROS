@@ -38,8 +38,8 @@ using AdcRawData = ft_radar_msgs::msg::AdcRawData;
 
 namespace {
   constexpr double   FPS           = 30.0;
-  constexpr uint32_t DEFAULT_WIDTH  = 2048;
-  constexpr uint32_t DEFAULT_HEIGHT = 512;
+  constexpr uint32_t DEFAULT_WIDTH  = 8192;   // 4 RX × 2048 samples (pixel-interleaved)
+  constexpr uint32_t DEFAULT_HEIGHT = 1024;   // 512 chirps × 2 groups
   constexpr uint32_t NUM_V4L2_BUFS  = 4;
 }
 
@@ -55,7 +55,6 @@ public:
     declare_parameter("device_path", "/dev/video0");
     declare_parameter("fixed_frame", "radar");
 
-    fps_         = get_parameter("fps").as_double();
     width_       = static_cast<uint32_t>(get_parameter("capture_width").as_int());
     height_      = static_cast<uint32_t>(get_parameter("capture_height").as_int());
     device_path_ = get_parameter("device_path").as_string();
@@ -85,12 +84,13 @@ public:
       device_path_.c_str(),
       v4l2_fd_ >= 0 ? "已连接" : "未连接 — 将发布空帧");
 
-    init_timer(fps_);
+    start_polling_loop(fps_);
   }
 
   ~AdcRxNode() override
   {
-    stop_streaming();
+    stop_polling_ = true;     // signal polling thread to exit
+    stop_streaming();         // STREAMOFF unblocks any pending DQBUF
     close_device();
   }
 
@@ -106,35 +106,22 @@ public:
       uint8_t *buf = nullptr;
       size_t   bytes_used = 0;
 
+      // Blocking DQBUF: waits until hardware has a frame ready
       if (dequeue_buffer(buf, bytes_used)) {
         msg.data.assign(buf, buf + bytes_used);
         enqueue_buffer(v4l2_buf_index_);
         prof_.checkpoint("v4l2_dequeue");
       } else {
-        // 无可用帧 (非阻塞, 驱动尚未填充) — 发布空帧
+        // Device error (e.g. disconnected) — publish empty frame
         msg.data.clear();
       }
     }
 
-    msg.num_rows              = height_;
-    msg.num_chirps_per_row    = 1;
-    msg.num_samples_per_chirp = width_;
-
-    // ── FPS 计数器 (每 2s 输出一次) ──
-    {
-      static int   cnt  = 0;
-      static auto last = std::chrono::steady_clock::now();
-      cnt++;
-      auto now = std::chrono::steady_clock::now();
-      double dt = std::chrono::duration<double>(now - last).count();
-      if (dt >= 2.0) {
-        RCLCPP_INFO(get_logger(),
-          "[ADC-RATE] V4L2: %.1f Hz  (%d frames in %.1fs)",
-          cnt / dt, cnt, dt);
-        cnt  = 0;
-        last = now;
-      }
-    }
+    // V4L2 帧: width=8192(4RX×2048samples 逐像素交错), height=1024 chirps
+    // AdcRawData 约定: num_rows=总chirp数, num_chirps_per_row=RX数, num_samples_per_chirp=每RX采样数
+    msg.num_rows              = height_;                   // 1024 chirps
+    msg.num_chirps_per_row    = 4;                         // 4 RX per CTRX (RX0-3)
+    msg.num_samples_per_chirp = width_ / 4;                // 2048 samples/RX/chirp
 
     return true;
   }
@@ -156,7 +143,7 @@ private:
   {
     if (v4l2_fd_ >= 0) close_device();
 
-    v4l2_fd_ = open(device_path_.c_str(), O_RDWR | O_NONBLOCK);
+    v4l2_fd_ = open(device_path_.c_str(), O_RDWR);  // blocking I/O — DQBUF waits for hardware
     if (v4l2_fd_ < 0) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "无法打开 V4L2 设备 '%s': %s", device_path_.c_str(), strerror(errno));
@@ -336,7 +323,7 @@ private:
     v4l2_bufs_.clear();
   }
 
-  // 非阻塞出队: 成功返回 true, 无可用帧返回 false (data=nullptr)
+  // 阻塞出队: 等待硬件帧就绪后返回. 成功返回 true, 失败返回 false.
   bool dequeue_buffer(uint8_t *&data, size_t &bytes_used)
   {
     struct v4l2_buffer buf;
@@ -345,7 +332,7 @@ private:
     buf.memory = V4L2_MEMORY_MMAP;
 
     if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &buf) < 0) {
-      if (errno == EAGAIN) return false;        // 无可用帧 (非阻塞)
+      // 阻塞模式下 EAGAIN 不会发生; 错误来自设备断开或 STREAMOFF
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "VIDIOC_DQBUF 失败: %s", strerror(errno));
       return false;

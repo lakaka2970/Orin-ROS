@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 #include <rclcpp/qos.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -86,6 +88,46 @@ public:
       prof_.is_enabled() ? "ON" : "OFF");
   }
 
+  /// Start a dedicated polling thread (hardware-driven, no timer).
+  /// The thread runs execute_frame() in a tight loop, paced by blocking HW reads.
+  /// @param expected_fps  informational — used for rate-check warnings only
+  void start_polling_loop(double expected_fps)
+  {
+    fps_ = expected_fps;
+
+    // ── 性能分析器参数 (子类可 declare 覆盖) ──
+    declare_parameter("profiler_enabled", true);
+    declare_parameter("profiler_log_every_n", 50);
+
+    bool prof_enabled = get_parameter("profiler_enabled").as_bool();
+    int  prof_period  = get_parameter("profiler_log_every_n").as_int();
+    prof_ = ft_perf::FrameProfiler(this, prof_period, prof_enabled);
+
+    heartbeat_pub_ = this->create_publisher<std_msgs::msg::Empty>(
+        this->get_name() + std::string("/heartbeat"), rx_qos(10, true));
+
+    wall_start_ = std::chrono::steady_clock::now();
+    stop_polling_ = false;
+
+    polling_thread_ = std::thread([this]() {
+      while (rclcpp::ok() && !stop_polling_) {
+        execute_frame();
+      }
+    });
+
+    RCLCPP_INFO(get_logger(),
+      "轮询循环: expected %.1f Hz | 心跳: %s | Profiler: %s",
+      fps_,
+      (std::string(this->get_name()) + "/heartbeat").c_str(),
+      prof_.is_enabled() ? "ON" : "OFF");
+  }
+
+  ~RxNodeBase()
+  {
+    if (polling_thread_.joinable())
+      polling_thread_.join();
+  }
+
 protected:
   typename rclcpp::Publisher<MessageT>::SharedPtr pub_;
   double fps_ = 0;
@@ -94,7 +136,8 @@ protected:
   /// disabled 时所有 checkpoint 调用自动内联为空操作, 零开销.
   ft_perf::FrameProfiler prof_{nullptr, 0, false};
 
-private:
+  /// 轮询线程退出标志: 子类析构时设为 true 以通知线程退出
+  std::atomic<bool> stop_polling_{false};
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr heartbeat_pub_;
   std::chrono::steady_clock::time_point wall_start_;
@@ -102,6 +145,13 @@ private:
   int wall_check_  = 0;
 
   void on_timer_impl()
+  {
+    execute_frame();
+  }
+
+  /// Single frame iteration: profiler wrap → heartbeat → stamp → fill → publish → rate check.
+  /// Called by both timer callback (on_timer_impl) and polling thread (polling_loop).
+  void execute_frame()
   {
     prof_.tick();
 
@@ -130,13 +180,16 @@ private:
         double hz = 30.0 / s;
         if (fps_ > 0 && hz < fps_ * 0.85)
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-            "[频率] 设定 %.0f Hz 实际 %.1f Hz (%.0f%%)", fps_, hz, hz/fps_*100);
+            "[频率] expected %.0f Hz  actual %.1f Hz (%.0f%%)", fps_, hz, hz/fps_*100);
         wall_start_ = now;
       }
     }
 
     prof_.tick_end();
   }
+
+  // ── polling thread ──
+  std::thread polling_thread_;
 };
 
 }  // namespace ft_rx

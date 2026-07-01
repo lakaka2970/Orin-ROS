@@ -9,23 +9,23 @@
 # ════════════════════════════════════════════════════════════════════════════
 # 话题频率概览 (Hz)
 # ════════════════════════════════════════════════════════════════════════════
-#   /adc/raw_data                    15 Hz  ← adc_rx (32 MiB/帧, ctrx0+ctrx1 16T16R 合并)
-#   /camera/image_raw                30 Hz  ← camera_rx
-#   /vehicle/ego_motion              50 Hz  ← vehicle_data_rx
-#   /processing/radar/det_list       10 Hz  ← rsp_* (⚠ 低于ADC 15Hz)
+#   /adc/raw_data                    硬件实际频率  ← adc_rx (轮询模式, 阻塞 V4L2 DQBUF)
+#   /camera/image_raw                硬件实际频率  ← camera_rx (轮询模式, 阻塞 camera.read())
+#   /vehicle/ego_motion              50 Hz (可配置) ← vehicle_data_rx (混合模式: CAN线程+buffer+定时发布)
+#   /processing/radar/det_list       10 Hz  ← rsp_*
 #   /processing/radar/det_list_cuda  10 Hz  ← rsp_cuda (双路模式)
 #   /perception/objects             ~10 Hz  ← object_detection_3d (事件驱动)
 #   /visualization/radar/display     10 Hz  ← rviz_radar (定时合成)
 #   /visualization/radar/boxes       10 Hz  ← rviz_radar + object_detection_3d
 #   /visualization/radar/frame_info  10 Hz  ← rviz_radar
-#   /visualization/camera/display   ~30 Hz  ← rviz_image (事件驱动)
+#   /visualization/camera/display    硬件实际频率  ← rviz_image (事件驱动)
 #   /visualization/ruler              2 Hz  ← rviz_ruler
 #
 # ════════════════════════════════════════════════════════════════════════════
 # 时间戳机制
 # ════════════════════════════════════════════════════════════════════════════
-#   SOURCE:  Layer-1 Rx 节点 → time.monotonic_ns() → (sec, nanosec) → header.stamp
-#            三节点统一调用 common.monotonic_us_stamp()
+#   SOURCE:  Layer-1 Rx 节点 → get_clock().now() (ROS 系统时间) → header.stamp
+#            C++: this->now()  Python: self.get_clock().now().to_msg()
 #   PASSTHR: Layer-2/3/4 下游节点 → 透传上游 header.stamp，禁止重新生成
 #            仅 Rviz_radar / Rviz_Ruler 使用 get_clock().now() 生成可视化时间戳
 #   LOGGING: Logging 节点 → 从 header.stamp 提取微秒整数 → 文件名 + CSV timestamp_us
@@ -59,17 +59,26 @@ adc_rx:
   data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
   max_preload_files: 30                    # 最多预加载文件数 (~960 MB)
   use_noise_pool: true                     # 无文件时自动回退到噪声池
+  device_path: "/dev/radar_ctrx0"           # V4L2 设备 (udev 持久化, ctrx0 半集)
+  capture_width: 8192                       # V4L2 帧宽度: 4 RX × 2048 samples (逐像素交错)
+  capture_height: 1024                      # V4L2 帧高度: 512 chirps × 2 groups
 
 # ====================================================================
 # 节点: Camera Rx — 相机数据接收
 # ====================================================================
-# 规格: 30 Hz, 约 16 KB/帧
+# 规格: 30 Hz, 1920×1080 MJPEG (~100-300 KB/帧, 取决于画面复杂度)
+# 摄像头: Rmoncam A2 1080P USB UVC, /dev/video0
+# 格式: MJPEG (高帧率) | YUYV (低帧率, 5fps@1080p)
 # 注意: `line` 和 `nof_line` 参数当前为占位值，具体格式待确认
 camera_rx:
   fps: 30
-  frame_size_bytes: 16384                 # 约 16 KB/帧，待确认
-  line: 0                                 # 待确认，预留接口
-  nof_line: 0                             # 待确认，预留接口
+  image_width: 1920                        # 图像宽度 (px)
+  image_height: 1080                       # 图像高度 (px)
+  device_path: "/dev/camera_capture"       # V4L2 设备路径 (udev 持久化符号链接)
+  pixel_format: "MJPG"                     # 像素格式: MJPG (30fps@1080p) | YUYV
+  reconnect_interval_frames: 90            # 断线重试间隔 (帧数, 90帧≈3s)
+  line: 0                                  # 待确认，预留接口
+  nof_line: 0                              # 待确认，预留接口
 
 # ====================================================================
 # 节点: Vehicle Data Rx — 车辆数据接收
@@ -78,7 +87,7 @@ camera_rx:
 # 超时: 超过 timeout_cycles 个周期未收到有效数据，自动切换为默认值
 vehicle_data_rx:
   fps: 50
-  timeout_cycles: 3                        # 超时周期数（3周期 = 60ms）
+  timeout_cycles: 1                        # 超时周期数 (1周期 = 20ms @ 50Hz)
   can_interface: "can0"                     # CAN 接口名 (接入总线后启用)
   defaults:
     vx: 0.0                               # 车速 (m/s)
@@ -199,7 +208,7 @@ rviz_image:
 #   Det_List: 1000 帧
 #   Ego_Motion: 1000 帧
 #   Obj_List:  1000 帧
-# 达到上限后停止记录并输出警告日志
+# 达到上限后循环覆盖（删除最旧文件，保留最新 N 帧）
 logging:
   output_dir: "output/ft_dataset"            # 输出根目录（相对路径基于工作区根）
   max_frames:

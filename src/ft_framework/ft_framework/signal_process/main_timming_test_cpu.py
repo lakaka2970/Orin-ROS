@@ -1,6 +1,7 @@
 """
 主程序：完整雷达信号处理流程 + 点云生成与计时
 """
+import os
 import time
 import numpy as np
 from config import RadarConfig
@@ -67,7 +68,7 @@ def main():
 
     # ----- 读取数据 -----
     raw_data = readRawBinCasc(
-        ".",
+        os.path.dirname(os.path.abspath(__file__)),
         frameNr=0,
         nSamples=cfg.n_samples,
         nRamps=cfg.n_chirps,
@@ -174,37 +175,46 @@ def main():
         snr_db = 10 * np.log10(pow_linear / peak['noise']) if peak['noise'] > 0 else 0.0
         rcs_db = 10 * np.log10(pow_linear)
 
-        for a_target in azi_results:
-            if a_target[0] != 1:
-                continue
+        # 筛选有效目标 (flag==1)，按能量降序排列
+        valid_azi = [t for t in azi_results if t[0] == 1]
+        valid_ele = [t for t in ele_results if t[0] == 1]
+        valid_azi.sort(key=lambda t: t[2], reverse=True)   # t[2]=mag_db
+        valid_ele.sort(key=lambda t: t[2], reverse=True)
+
+        if len(valid_azi) == 2 and len(valid_ele) == 2:
+            # 两组：能量强配强、弱配弱
+            pairs = [(valid_azi[0], valid_ele[0]),
+                     (valid_azi[1], valid_ele[1])]
+        else:
+            # 其他情况：笛卡尔积
+            pairs = [(a, e) for a in valid_azi for e in valid_ele]
+
+        for a_target, e_target in pairs:
             azi_deg = a_target[4]
             azi_rad = np.deg2rad(azi_deg)
-            for e_target in ele_results:
-                if e_target[0] != 1:
-                    continue
-                ele_deg = e_target[4]
-                ele_rad = np.deg2rad(ele_deg)
+            ele_deg = e_target[4]
+            ele_rad = np.deg2rad(ele_deg)
 
-                # 直角坐标
-                x = rng * np.cos(ele_rad) * np.cos(azi_rad)
-                y = rng * np.cos(ele_rad) * np.sin(azi_rad)
-                z = rng * np.sin(ele_rad)
+            # 直角坐标
+            x = rng * np.cos(ele_rad) * np.cos(azi_rad)
+            y = rng * np.cos(ele_rad) * np.sin(azi_rad)
+            z = rng * np.sin(ele_rad)
 
-                point = {
-                    'x': x, 'y': y, 'z': z,
-                    'range': rng,
-                    'azimuth': azi_rad,
-                    'elevation': ele_rad,
-                    'RCS': rcs_db,
-                    'SNR': snr_db,
-                    'ambgt': ambgt,
-                    'exist_prob': 100,
-                    'multi_tgt_prob': 100,
-                    'ambgt_prob': 100,
-                    'raw_doppler': vel,
-                    'idx': 128 if vel != 0 else 0
-                }
-                points.append(point)
+            point = {
+                'x': x, 'y': y, 'z': z,
+                'range': rng,
+                'azimuth': azi_rad,
+                'elevation': ele_rad,
+                'RCS': rcs_db,
+                'SNR': snr_db,
+                'ambgt': ambgt,
+                'exist_prob': 100,
+                'multi_tgt_prob': 100,
+                'ambgt_prob': 100,
+                'raw_doppler': vel,
+                'idx': 128 if vel != 0 else 0
+            }
+            points.append(point)
 
     timestamp_us = int(time.time() * 1e6)
     t_end = time.perf_counter()

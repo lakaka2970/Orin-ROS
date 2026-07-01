@@ -17,21 +17,24 @@ class RadarConfig:
     n_subbands = 32           # DDMA 子带数（多普勒域分割数）
 
     # ----- 处理参数 -----
-    threshold_scale = 6       # 干扰检测门限系数（相对于差分均值）
+    threshold_scale = 8       # 干扰检测门限系数（相对于差分均值）
     noise_est_ratio = 50      # 噪声估计百分位数（例如 50% 中位数）
     ps_scale = 20.0           # 峰值搜索门限缩放因子（倍乘噪声基底）
     max_peaks_per_rb = 12     # 每个距离门最多保留的峰值数
     max_total_peaks = 1024    # 全局最多保留的峰值总数
-    doa_threshold_db = 28.0
 
-    # DDMA 发射天线索引（共16个）
-    tx_ddma_idx = np.arange(16, dtype=np.int64)
+    # DDMA 发射天线索引（前8个master CTRX0，后8个slave CTRX1）
+    tx_ddma_idx = np.array([
+        0,  1,  2,  3,  4,  9, 10, 12,       # master  (phase_deg / 11.25)
+        14, 16, 19, 23, 24, 27, 29, 30        # slave
+    ], dtype=np.int64)
 
     # ----- 波形具体参数（需与硬件/固件一致）-----
-    freq_start_hz = 77e9                       # 起始频率 [Hz]
-    freq_slope_hz_per_s = 14.0e12              # 调频斜率 [Hz/s]
-    time_ramp_end_s = 35.0e-6                  # 有效调频时间 [s]
-    time_idle_s = 5.0e-6                       # Chirp 空闲时间 [s]
+    freq_start_hz = 77.5e9                       # 起始频率 [Hz]
+    freq_slope_hz_per_s = 10.18524e12            # 调频斜率 [Hz/s]
+    time_ramp_end_s = 40.96e-6                  # 有效调频时间 [s]
+    time_idle_s = 4.94e-6                       # Chirp 空闲时间 [s]
+    step_time = 4                               #跳频倍数
 
     # 派生参数（自动计算）
     bandwidth_hz = freq_slope_hz_per_s * time_ramp_end_s          # 带宽 [Hz]

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from config import RadarConfig
-from data_io import read_synthetic_bin
+from data_io import readRawBinCasc
 from preprocessing import radar_signal_process_final
 from doppler import doppler_processing_gpu
 from peak_detection import peak_search_gpu
@@ -72,12 +72,12 @@ def main():
     total_start = time.perf_counter()
 
     # ----- 1. 读取二进制数据 -----
-    raw_data = read_synthetic_bin(
-        "synthetic_data_fixed1.bin",
-        cfg.n_rx,
-        cfg.n_samples,
-        cfg.n_chirps,
-        is_complex=False
+    raw_data = readRawBinCasc(
+        ".",
+        frameNr=0,
+        nSamples=cfg.n_samples,
+        nRamps=cfg.n_chirps,
+        nChannels=cfg.n_rx
     )
     print(f"原始数据形状: {raw_data.shape}")
 

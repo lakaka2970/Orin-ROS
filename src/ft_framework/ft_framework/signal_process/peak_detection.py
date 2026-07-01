@@ -5,7 +5,7 @@ TopK 截断，同时提取对应通道的复数据用于 DOA 估计。
 
 import torch
 import numpy as np
-from calibration import apply_calibration
+from ft_framework.signal_process.calibration import apply_calibration
 
 DEVICE = torch.device('cuda')
 
@@ -85,49 +85,57 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
 
     n_tx = 16
     n_rx = 16
-    n_tx_half = n_tx // 2
-    n_rx_half = n_rx // 2
-    tx_idx = torch.arange(n_tx, device=DEVICE).view(-1, 1).expand(n_tx, n_rx)   # (16,16)
-    rx_idx = torch.arange(n_rx, device=DEVICE).view(1, -1).expand(n_tx, n_rx)   # (16,16)
-    tx_ddma = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)
-
-    # 预分离 4 象限索引矩阵，避免循环内重复切片
-    #   Q1: tx 0-7, rx 0-7   | Q3: tx 0-7, rx 8-15
-    #   Q2: tx 8-15, rx 0-7  | Q4: tx 8-15, rx 8-15
-    rx_q = [rx_idx[:n_tx_half, :n_rx_half], rx_idx[n_tx_half:, :n_rx_half],
-            rx_idx[:n_tx_half, n_rx_half:], rx_idx[n_tx_half:, n_rx_half:]]
-    tx_q = [tx_idx[:n_tx_half, :n_rx_half], tx_idx[n_tx_half:, :n_rx_half],
-            tx_idx[:n_tx_half, n_rx_half:], tx_idx[n_tx_half:, n_rx_half:]]
-    db_offs = [0, 4, 4, 8]
-    rb_offs = [0, 1, 1, 2]
-
-    # ----- 6. 提取每个峰值的通道数据（256 个虚拟通道）-----
     n_peaks = final_rb.shape[0]
-    channel_list = []
-    for i in range(n_peaks):
-        rb = final_rb[i]
-        db = final_db[i]
 
-        quads = []
-        for q in range(4):
-            db_q = (db + db_offs[q]) % n_doppler                       # doppler 取模防溢出
-            rb_q = rb + rb_offs[q]
-            if rb_q >= n_range_bins:                                    # range 防溢出 → 填零
-                quads.append(torch.zeros(n_tx_half, n_rx_half, dtype=torch.complex64, device=DEVICE))
-            else:
-                idx_dop_q = (db_q + tx_ddma[tx_q[q]] * 16) % n_doppler
-                quads.append(rd_cube[rx_q[q], idx_dop_q, rb_q])        # (8,8)
+    if n_peaks == 0:
+        return []
 
-        # 拼接: [Q1|Q3] 上, [Q2|Q4] 下 → (16,16)
-        top    = torch.cat([quads[0], quads[2]], dim=1)
-        bottom = torch.cat([quads[1], quads[3]], dim=1)
-        channel_mat = torch.cat([top, bottom], dim=0)
-        channel_flat = channel_mat.flatten().cpu().numpy()             # (256,)
-        channel_list.append(channel_flat)
+    # ----- 6. 向量化通道提取: 一次 gather 所有 peaks 的 (16,16) 虚拟通道矩阵 -----
+    # 计算每个 (tx, rx) 位置的 db/rb 偏移量:
+    #   rb_off = (tx >= 8) + (rx >= 8)    → 0, 1, 2
+    #   db_off = rb_off * 4               → 0, 4, 8
+    tx_grid = torch.arange(n_tx, device=DEVICE).view(1, 16, 1)   # (1, 16, 1)
+    rx_grid = torch.arange(n_rx, device=DEVICE).view(1, 1, 16)   # (1, 1, 16)
+    tx_hi  = (tx_grid >= 8).to(torch.int64)                      # (1, 16, 1)
+    rx_hi  = (rx_grid >= 8).to(torch.int64)                      # (1, 1, 16)
+    rb_off = (tx_hi + rx_hi)                                     # (1, 16, 16) 每元素为 0/1/2
+    db_off = rb_off * 4                                           # (1, 16, 16) 每元素为 0/4/8
 
-    # 通道校准
+    # 展开 peak 维度: (N, 1, 1) + (1, 16, 16) → (N, 16, 16)
+    rb_all = final_rb.view(-1, 1, 1)                             # (N, 1, 1)
+    db_all = final_db.view(-1, 1, 1)                             # (N, 1, 1)
+
+    rb_idx = rb_all + rb_off                                     # (N, 16, 16)
+    # DDMA 解调: doppler = (db + db_off + tx_ddma[tx] * step) % n_doppler
+    tx_ddma_t = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)
+    ddma_step = n_doppler // n_subbands                           # 16
+    ddma_shift = tx_ddma_t[tx_grid] * ddma_step                  # (1, 16, 1)
+    db_idx = (db_all + db_off + ddma_shift) % n_doppler          # (N, 16, 16)
+
+    # range 溢出遮罩
+    overflow = rb_idx >= n_range_bins
+    rb_idx = torch.clamp(rb_idx, 0, n_range_bins - 1)
+
+    # ★ 单次向量化 gather: (N, 16, 16) 一次完成所有 peaks 的通道提取
+    # rd_cube: (n_rx=16, chirp=512, range) — rx_grid 广播到 (N,16,16)
+    rx_batch = rx_grid.expand(n_peaks, -1, -1)                   # (N, 16, 16)
+    channel_all = rd_cube[rx_batch, db_idx, rb_idx]              # (N, 16, 16)
+    channel_all[overflow] = 0j                                    # 溢出位置填零
+
+    # 展平为 (N, 256) GPU tensor
+    channel_flat_all = channel_all.reshape(n_peaks, -1)           # (N, 256)
+
+    # ----- 7. 通道校准 (批量 CPU 传输, 避免 per-peak 往返) -----
     if do_calibrate:
-        channel_list = [apply_calibration(ch) for ch in channel_list]
+        # 单次 GPU→CPU 批量传输
+        channels_np = channel_flat_all.cpu().numpy()              # (N, 256)
+        calibrated_np = [apply_calibration(ch) for ch in channels_np]
+        # 单次 CPU→GPU 批量回传
+        channel_list = calibrated_np
+        channel_gpu_list = [torch.from_numpy(ch).to(DEVICE) for ch in calibrated_np]
+    else:
+        channel_list = [ch.cpu().numpy() for ch in channel_flat_all]
+        channel_gpu_list = [ch for ch in channel_flat_all]        # 保持 GPU tensor 引用
 
     # ----- 7. 组装返回字典（移至 CPU）-----
     rb_cpu = final_rb.cpu().numpy()
@@ -140,7 +148,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     p_right_c = p_right.cpu().numpy()
     rx_nci_c = rx_nci_rd.cpu().numpy()
 
-    # ----- 7. 组装返回字典（字段与 RDCell 结构体对齐）-----
+    # ----- 8. 组装返回字典（字段与 RDCell 结构体对齐）-----
     rdcell_list = []
     for i in range(len(rb_cpu)):
         r, d = rb_cpu[i], db_cpu[i]
@@ -162,7 +170,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
             'f32NoiseNci_Q7dB':     float(noise_cpu[r]),
             'u8RdValidFlag':       1,
             'u8RdPeakFlag':        1,
-            'sVch':                channel_list[i],    # complex64(256,)
+            'sVch':                channel_list[i],        # complex64(256,) numpy
             # 兼容旧字段
             'rb':      int(r),
             'db':      int(d),
@@ -170,7 +178,8 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
             'pow_db':  [float(p_left_c[r, d]), float(rx_nci_c[r, d]), float(p_right_c[r, d])],
             'noise':   float(noise_cpu[r]),
             'pow_vch': float(vch_cpu[i]),
-            'channel': channel_list[i],
+            'channel':       channel_list[i],              # (256,) numpy — 兼容旧代码
+            'channel_gpu':   channel_gpu_list[i],          # (256,) GPU tensor — DOA 直通, 零拷贝
         })
     n_cells = len(rdcell_list)
     for cell in rdcell_list:

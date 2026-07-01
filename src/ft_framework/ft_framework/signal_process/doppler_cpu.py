@@ -16,7 +16,7 @@ def doppler_processing_numpy(
     n_range_bins: int,
     tx_ddma_idx: np.ndarray,
     n_subbands: int,
-    noise_est_ratio: float = 30.0
+    noise_est_ratio: float
 ) -> tuple:
     """
     多普勒处理主函数
@@ -71,7 +71,7 @@ def doppler_processing_numpy(
 
     # 3. 噪声估计（按距离维的分位数）
     q = noise_est_ratio / 100.0
-    noise_est = np.quantile(rx_nci, q, axis=0, method='linear').astype(np.float32)   # (range,)
+    noise_est = np.quantile(rx_nci, q, axis=0).astype(np.float32)   # (range,)  method='linear' removed for numpy<1.22 compat
 
     # 4. VCH非相干积累（DDMA解调）
     tx_ddma = np.asarray(tx_ddma_idx, dtype=np.int64)

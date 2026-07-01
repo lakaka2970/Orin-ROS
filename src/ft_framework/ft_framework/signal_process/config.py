@@ -19,7 +19,7 @@ class RadarConfig:
     # ----- 处理参数 -----
     threshold_scale = 8       # 干扰检测门限系数（相对于差分均值）
     noise_est_ratio = 50      # 噪声估计百分位数（例如 50% 中位数）
-    ps_scale = 20.0           # 峰值搜索门限缩放因子（倍乘噪声基底）
+    ps_scale = 28.0           # 峰值搜索门限缩放因子（倍乘噪声基底）
     max_peaks_per_rb = 12     # 每个距离门最多保留的峰值数
     max_total_peaks = 1024    # 全局最多保留的峰值总数
 

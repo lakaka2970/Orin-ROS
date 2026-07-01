@@ -2,7 +2,7 @@
 峰值检测模块：在距离-多普勒谱中检测局部极值，并提取对应通道数据
 """
 import numpy as np
-from calibration import apply_calibration
+from ft_framework.signal_process.calibration import apply_calibration
 
 
 def peak_search_numpy(

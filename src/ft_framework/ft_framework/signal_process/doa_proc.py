@@ -52,9 +52,19 @@ class DOA_Ultra_Initializer:
                 return torch.full_like(positions, self.fft_len // 2, dtype=torch.int64)
             return ((positions - min_pos) / (max_pos - min_pos) * (self.fft_len - 1)).to(torch.int64)
 
-        self.azi_indices = get_map_indices_gpu(Array_Azi[0, :])   # 方位子阵 x 坐标
-        self.ele_indices = get_map_indices_gpu(Array_Ele[1, :])   # 俯仰子阵 y 坐标
+        self.azi_map_idx = get_map_indices_gpu(Array_Azi[0, :])   # 方位子阵 x 坐标 → FFT bin
+        self.ele_map_idx = get_map_indices_gpu(Array_Ele[1, :])   # 俯仰子阵 y 坐标 → FFT bin
+        # 保留旧名兼容
+        self.azi_indices = self.azi_map_idx
+        self.ele_indices = self.ele_map_idx
         self.is_initialized = True
+
+    def cache_selection_indices(self, AziIdx_Select, EleIdx_Select):
+        """缓存子阵选择索引 (GPU tensors), 供批量 DOA 使用。"""
+        self.azi_sel_idx = (AziIdx_Select.to(DEVICE) if isinstance(AziIdx_Select, torch.Tensor)
+                            else torch.from_numpy(AziIdx_Select).to(DEVICE))
+        self.ele_sel_idx = (EleIdx_Select.to(DEVICE) if isinstance(EleIdx_Select, torch.Tensor)
+                            else torch.from_numpy(EleIdx_Select).to(DEVICE))
 
 
 # 全局 DOA 环境（单例）
@@ -220,3 +230,115 @@ def doa_main_ultra_separated(snap_data, Array_Azi, AziIdx_Select, Array_Ele, Ele
         )
 
     return res_azi_np, res_ele_np
+
+
+# ============================================================================
+# 批量 DOA: N 个快拍并行处理 (单次 FFT kernel launch)
+# ============================================================================
+
+@torch.inference_mode()
+def doa_main_batch(snap_data_batch, threshold_db=6.0):
+    """
+    批量 DOA 估计: 将 N 个快拍堆叠为 (N, 256) 一次并行处理。
+
+    参数:
+        snap_data_batch: GPU tensor, 形状 (N, 256), dtype complex64
+        threshold_db: 峰值检测门限 (dB)
+
+    返回:
+        all_azi: List[np.ndarray], 每个形状 (n_det, 5)  [valid, bin, power, interp_bin, deg]
+        all_ele: List[np.ndarray], 每个形状 (n_det, 5)
+    """
+    global doa_env
+    if not doa_env.is_initialized:
+        return [(np.zeros((0, 5), dtype=np.float32), np.zeros((0, 5), dtype=np.float32))
+                for _ in range(snap_data_batch.shape[0])]
+
+    N = snap_data_batch.shape[0]
+    fft_len = doa_env.fft_len
+    max_targets = doa_env.max_targets
+    window = doa_env.window_gpu.view(1, -1)                     # (1, 256)
+
+    # ---- 方位: (N, 256) 批量 FFT ----
+    src_azi = snap_data_batch[:, doa_env.azi_sel_idx]           # (N, n_azi) complex
+    spec_azi = torch.zeros(N, fft_len, dtype=torch.complex64, device=DEVICE)
+    spec_azi[:, doa_env.azi_map_idx] = src_azi.to(torch.complex64)
+    fft_azi = torch.fft.fft(spec_azi * window, dim=1)          # (N, 256) — 一次 kernel launch!
+    mag_azi = 20.0 * torch.log10(torch.abs(fft_azi) + 1e-12)   # (N, 256)
+
+    # ---- 俯仰: (N, 256) 批量 FFT ----
+    src_ele = snap_data_batch[:, doa_env.ele_sel_idx]
+    spec_ele = torch.zeros(N, fft_len, dtype=torch.complex64, device=DEVICE)
+    spec_ele[:, doa_env.ele_map_idx] = src_ele.to(torch.complex64)
+    fft_ele = torch.fft.fft(spec_ele * window, dim=1)
+    mag_ele = 20.0 * torch.log10(torch.abs(fft_ele) + 1e-12)
+
+    # ---- 批量峰值检测 (一次 kernel 完成所有行) ----
+    all_azi = _batch_peaks_interp(mag_azi, threshold_db, fft_len, max_targets)
+    all_ele = _batch_peaks_interp(mag_ele, threshold_db, fft_len, max_targets)
+
+    return all_azi, all_ele
+
+
+def _batch_peaks_interp(mag_db, threshold_db, fft_len, max_targets):
+    """批量峰值检测 + 插值 + 角度解算 (全向量化, 无 per-row kernel launch)。
+
+    mag_db: (N, 256)
+    返回: List[np.ndarray] 每个形状 (n_det, 5)
+    """
+    N = mag_db.shape[0]
+    DEV = mag_db.device
+
+    # 1. 环形局部最大值检测 (批量 roll — 2 次 kernel)
+    p_l = torch.roll(mag_db, 1, dims=1)
+    p_l[:, 0] = mag_db[:, 0]
+    p_r = torch.roll(mag_db, -1, dims=1)
+    p_r[:, -1] = mag_db[:, -1]
+    threshold = mag_db.max(dim=1, keepdim=True).values - threshold_db  # (N, 1)
+    mask = (mag_db >= p_l) & (mag_db >= p_r) & (mag_db >= threshold)    # (N, 256)
+
+    # 2. 非峰值置 -inf → topk 取最强 max_targets 个
+    masked = torch.where(mask, mag_db, torch.full_like(mag_db, -1e9))
+    topk_vals, topk_idx = torch.topk(masked, k=max_targets, dim=1)      # (N, K)
+    valid = topk_vals > -1e8                                             # (N, K)
+
+    # 3. 批量插值 (parabolic) — 用 gather 一次取所有邻居
+    K = max_targets
+    idx = torch.clamp(topk_idx, 1, fft_len - 2)                         # (N, K) safe for ±1
+    row_offsets = torch.arange(N, device=DEV).view(-1, 1) * fft_len     # (N, 1)
+    idx_flat = (idx + row_offsets).reshape(-1)                           # (N*K,)
+
+    # gather flat: mag_db as 1D
+    mag_flat = mag_db.reshape(-1)                                        # (N*256,)
+    v_c = mag_flat[idx_flat].reshape(N, K)                               # (N, K)
+    v_l = mag_flat[(idx - 1 + row_offsets).reshape(-1)].reshape(N, K)
+    v_r = mag_flat[(idx + 1 + row_offsets).reshape(-1)].reshape(N, K)
+
+    denom = v_l - 2.0 * v_c + v_r                                       # (N, K)
+    safe_denom = denom.abs() > 1e-9
+    offset = torch.where(safe_denom, (v_l - v_r) / (2.0 * denom), torch.zeros_like(denom))
+    offset = torch.clamp(offset, -0.5, 0.5)
+    interp_bin = topk_idx.to(torch.float32) + offset                    # (N, K)
+
+    # 4. sin(θ) → angle (批量)
+    shift = torch.where(interp_bin < (fft_len / 2), interp_bin, interp_bin - fft_len)
+    sin_theta = torch.clamp((2.0 * shift) / fft_len, -1.0, 1.0)
+    angle_deg = torch.rad2deg(torch.asin(sin_theta))
+
+    # 5. 组装 (N, K, 5) — 批量写入 pinned 然后一次性返回
+    results_all = torch.stack([
+        valid.to(torch.float32),                                         # valid_flag
+        topk_idx.to(torch.float32),                                      # bin_idx
+        v_c,                                                             # power_dB (peak value)
+        interp_bin,                                                      # interp_bin
+        angle_deg,                                                       # angle_deg
+    ], dim=-1)  # (N, K, 5)
+
+    # 6. 拆分为 per-row numpy 列表 (CPU 传输一次完成)
+    results_np = results_all.cpu().numpy()                               # (N, K, 5)
+    all_results = []
+    for i in range(N):
+        row = results_np[i]                                              # (K, 5)
+        valid_rows = row[row[:, 0] > 0.5]                                # 仅 valid
+        all_results.append(valid_rows.astype(np.float32, copy=False))
+    return all_results

@@ -71,7 +71,7 @@ from ft_framework.signal_process.preprocessing import radar_signal_process_final
 from ft_framework.signal_process.doppler import doppler_processing_gpu
 from ft_framework.signal_process.peak_detection import peak_search_gpu
 from ft_framework.signal_process.arraySim import RadarArrayInitializer
-from ft_framework.signal_process.doa_proc import doa_main_ultra_separated, doa_env
+from ft_framework.signal_process.doa_proc import doa_main_ultra_separated, doa_main_batch, doa_env
 from ft_framework.signal_process.data_io import readRawBinCasc
 
 
@@ -109,6 +109,9 @@ class RspCudaNode(Node):
         if not doa_env.is_initialized:
             doa_env.prepare_mapping_indices(
                 self.array_env.Array_Azi, self.array_env.Array_Ele)
+            # 缓存子阵选择索引 (GPU tensors), 供批量 DOA 使用
+            doa_env.cache_selection_indices(
+                self.array_env.AziIdx_Select_gpu, self.array_env.EleIdx_Select_gpu)
 
         self.get_logger().info(
             f'雷达参数初始化完成: '
@@ -233,52 +236,50 @@ class RspCudaNode(Node):
         adc_stamp = self._latest_adc.header.stamp
         adc_bytes = self._latest_adc.data
 
-        # ---- 核心 RSP 处理: 完整流水线 (与 rsp_mil_python 一致) ----
+        # ---- 核心 RSP 处理: 完整流水线 (GPU 加速版) ----
         try:
             # 1. ADC 字节 → (512, 16, 2048) 原始数据
             raw_data = self.raw_data
             # raw_data = self._adc_bytes_to_raw_data(adc_bytes)
 
-            # 2. 预处理 + Range-FFT
+            # 2. 预处理 + Range-FFT (GPU)
             cube, dc_est, _ = radar_signal_process_final(
                 raw_data, self.cfg.n_samples, self.cfg.n_rx,
                 self.cfg.n_chirps, self.cfg.threshold_scale)
 
-            # 3. Doppler-FFT + 非相干积累
+            # 3. Doppler-FFT + 非相干积累 (GPU)
             rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci = \
                 doppler_processing_gpu(
                     cube, self.cfg.n_rx, self.cfg.n_chirps, cube.shape[2],
                     self.cfg.tx_ddma_idx, self.cfg.n_subbands, self.cfg.noise_est_ratio)
 
-            # 4. 峰值检测
+            # 4. 峰值检测 (GPU)
             peaks = peak_search_gpu(
                 rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise_est,
                 self.cfg.tx_ddma_idx, cube.shape[2], self.cfg.n_chirps, self.cfg.n_subbands,
                 self.cfg.ps_scale, self.cfg.max_peaks_per_rb, self.cfg.max_total_peaks)
 
-            # 5. DOA 估计 + 点云生成
+            # 5. DOA 估计 + 点云生成 (GPU DOA + CPU 构造)
             range_res = self.cfg.range_resolution
             doppler_res = self.cfg.doppler_resolution
             ambgt = self.cfg.ambgt
             doa_threshold_db = 28.0
 
-            det_points = []
-            for peak in peaks:
-                rb = peak['rb']
-                db = peak['db']
-                channel_data = peak['channel']  # (256,) complex numpy from GPU
+            # 5a. 批量 DOA: 堆叠所有通道 → 一次并行 FFT (N, 256)
+            channel_batch = torch.stack([p['channel_gpu'] for p in peaks])  # (N, 256)
+            all_azi, all_ele = doa_main_batch(channel_batch, doa_threshold_db)
 
-                # channel_data 是 numpy (CPU), doa_proc.py 需要 torch tensor on GPU
-                channel_tensor = torch.from_numpy(channel_data).to(torch.device('cuda'))
-                azi_results, ele_results = doa_main_ultra_separated(
-                    channel_tensor,
-                    self.array_env.Array_Azi_gpu, self.array_env.AziIdx_Select_gpu,
-                    self.array_env.Array_Ele_gpu, self.array_env.EleIdx_Select_gpu,
-                    doa_threshold_db)
+            # 5b. 点云生成 (CPU — 结果展开 + 坐标变换)
+            det_points = []
+            for i, peak in enumerate(peaks):
+                azi_results = all_azi[i]
+                ele_results = all_ele[i]
 
                 if len(azi_results) == 0 or len(ele_results) == 0:
                     continue
 
+                rb = peak['rb']
+                db = peak['db']
                 rng = rb * range_res
                 vel = db * doppler_res
                 pow_linear = peak['pow_vch']
@@ -335,8 +336,6 @@ class RspCudaNode(Node):
             import traceback
             self.get_logger().error(traceback.format_exc())
             return
-
-        t_proc = (time.perf_counter() - t0) * 1000.0
 
         # ---- 构造 DetList (v2 41 字段) ----
         det_list = DetList()
@@ -415,6 +414,7 @@ class RspCudaNode(Node):
 
         # ---- 定期日志 ----
         if self.frame_count % 10 == 0:
+            t_proc = (time.perf_counter() - t0) * 1000.0
             if det_points:
                 ranges = [p['range'] for p in det_points]
                 range_str = (f'最近={min(ranges):.1f}m, '
@@ -426,7 +426,7 @@ class RspCudaNode(Node):
             self.get_logger().info(
                 f'[RSP-CUDA] 帧 #{self.frame_count}: '
                 f'{len(det_points)} 检测点, {range_str}, '
-                f'处理耗时={t_proc:.1f}ms')
+                f'耗时={t_proc:.1f}ms')
 
     # ------------------------------------------------------------------
     # 销毁

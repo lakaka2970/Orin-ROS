@@ -3,8 +3,16 @@
 """
 FT 雷达信号处理节点 —— Python/MIL 实现 (RSP MIL Python)
 ================================================================================
-融合 ADC 数据和车辆数据，执行雷达信号处理（模拟），
-输出检测目标列表 DetList。
+融合 ADC 数据和车辆数据，执行完整的雷达信号处理流水线。
+
+信号处理流水线:
+  1. ADC reshape: 32 MiB byte buffer → (1024, 8, 2048) float32
+  2. Range-FFT: 2048-pt FFT (Hann window) → 距离谱
+  3. TDM 分离: TX0 [0:512], TX1 [512:1024]
+  4. Doppler-FFT: 512-pt FFT (Hann window) → 距离-多普勒谱
+  5. 2D CFAR: 两级 CA-CFAR 恒虚警检测
+  6. Angle FFT: 8-RX 波束形成 → 方位角估计
+  7. DetPoint: 14 字段填充 + 球坐标 → 车体系 Cartesian
 
 规格:
   - 处理帧率: 10 Hz
@@ -37,12 +45,6 @@ PROCESSING_FPS  = 10.0        # 处理帧率 (Hz)
 SNR_THRESHOLD   = 10.0        # 信噪比阈值 (dB)
 VELOCITY_SCALE  = 0.5         # 速度估算缩放因子
 
-# ---------- 模拟检测参数 ----------
-SIM_NUM_TARGETS = 30          # 每帧模拟检测目标数
-SIM_RANGE_MAX   = 300.0       # 最大探测距离 (m)
-SIM_RANGE_MIN   = 30.0        # 最小探测距离 (m)
-SIM_AZ_RANGE    = 45.0        # 方位角范围 (±°)
-
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
 
@@ -50,14 +52,13 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
-import math
-import numpy as np
+import time
 
 import rclpy
 from rclpy.node import Node
 
 from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
-from ft_framework.common import filter_det_points
+from ft_framework.rsp_processor import create_processor
 
 
 # ============================================================================
@@ -65,19 +66,12 @@ from ft_framework.common import filter_det_points
 # ============================================================================
 
 class RspMilPythonNode(Node):
-    """
-    Python 雷达信号处理节点
+    """Python 雷达信号处理节点。
 
     话题:
       订阅: /adc/raw_data       (AdcRawData)
             /vehicle/ego_motion (EgoMotion)
       发布: /processing/radar/det_list (DetList)
-
-    功能说明:
-      - 接收 ADC 原始数据和车辆数据
-      - 执行 SNR 滤波和速度补偿（模拟）
-      - 输出 14 字段 DetPoint
-      - 通过 rsp_mode 参数控制: 仅 python/both/both_compare 模式时运行
     """
 
     def __init__(self):
@@ -87,7 +81,7 @@ class RspMilPythonNode(Node):
         self.declare_parameter('processing_fps', PROCESSING_FPS)
         self.declare_parameter('snr_threshold', SNR_THRESHOLD)
         self.declare_parameter('velocity_scale', VELOCITY_SCALE)
-        self.declare_parameter('rsp_mode', 'cuda')       # 外部通过 node 参数传入
+        self.declare_parameter('rsp_mode', 'cuda')
         self.declare_parameter('fixed_frame', FIXED_FRAME)
 
         self.processing_fps = float(self.get_parameter('processing_fps').value)
@@ -95,6 +89,19 @@ class RspMilPythonNode(Node):
         self.velocity_scale = float(self.get_parameter('velocity_scale').value)
         self.rsp_mode       = self.get_parameter('rsp_mode').value
         self.fixed_frame    = self.get_parameter('fixed_frame').value
+
+        # ---------- RSP 处理器 ----------
+        rsp_config = {
+            'snr_threshold':      self.snr_threshold,
+            'velocity_scale':     self.velocity_scale,
+            'processing_fps':     self.processing_fps,
+        }
+        self._processor = create_processor(rsp_config)
+        self.get_logger().info(
+            f'RSP 处理器初始化完成: '
+            f'Range-FFT={self._processor.p["range_fft_size"]}pt, '
+            f'Doppler-FFT={self._processor.p["doppler_fft_size"]}pt, '
+            f'CFAR={self._processor.p["peak_prominence_db"]}dB')
 
         # ---------- 数据缓存 ----------
         self._latest_adc     = None
@@ -142,83 +149,67 @@ class RspMilPythonNode(Node):
     # ------------------------------------------------------------------
 
     def _on_process(self):
-        """
-        模拟雷达信号处理 pipeline:
-          1. 从 ADC 数据提取时间戳
-          2. 获取车辆速度用于补偿
-          3. 生成模拟检测目标（SNR 滤波 + 速度补偿）
-          4. 填充 DetPoint 14 字段
-          5. 发布 DetList
-        """
+        """雷达信号处理主回调: ADC bytes → RSP → DetList 发布。"""
         if not self._pub_enabled or self._latest_adc is None:
             return
 
         self.frame_count += 1
-        # 透传 ADC 时间戳，不得重新生成（全局时间戳规则）
+        t0 = time.perf_counter()
+
+        # 透传 ADC 时间戳
         adc_stamp = self._latest_adc.header.stamp
+        adc_bytes = self._latest_adc.data
 
-        # 获取车辆速度
-        ego_vx = 0.0
-        if self._latest_ego is not None and not self._latest_ego.is_default:
-            ego_vx = self._latest_ego.vx
+        # ---- 核心 RSP 处理 ----
+        try:
+            det_points = self._processor.process(adc_bytes)
+        except Exception as e:
+            self.get_logger().error(f'RSP 处理异常: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return
 
-        # ---- 模拟检测处理（替换为真实 RSP 算法） ----
-        n = SIM_NUM_TARGETS
-        ranges   = np.random.uniform(SIM_RANGE_MIN, SIM_RANGE_MAX, n)
-        azimuths = np.random.uniform(
-            -math.radians(SIM_AZ_RANGE), math.radians(SIM_AZ_RANGE), n)
-        elevations = np.random.uniform(-math.radians(5.0), math.radians(5.0), n)
-
-        # 球→笛卡尔（车辆系）
-        x = ranges * np.cos(elevations) * np.cos(azimuths)
-        y = ranges * np.cos(elevations) * np.sin(azimuths)
-        z = ranges * np.sin(elevations)
-
-        # SNR 过滤模拟
-        snrs = 20.0 * np.log10(SIM_RANGE_MAX / (ranges + 1e-3))
-        snrs = np.clip(snrs, 0, 60)
-        mask = snrs >= self.snr_threshold
-        valid_idx = np.where(mask)[0]
-
-        # 速度补偿
-        distances = ranges * 1.0
-        dopplers = self.velocity_scale * (distances * 0.01 - ego_vx)
+        t_proc = (time.perf_counter() - t0) * 1000.0
 
         # ---- 构造 DetList ----
         det_list = DetList()
-        det_list.header.stamp = adc_stamp          # 透传 ADC 原始时间戳
+        det_list.header.stamp = adc_stamp
         det_list.header.frame_id = self.fixed_frame
 
-        for i in valid_idx:
-            det = DetPoint()
-            det.x = float(x[i])
-            det.y = float(y[i])
-            det.z = float(z[i])
-            det.range = float(ranges[i])
-            det.azimuth = float(azimuths[i])
-            det.elevation = float(elevations[i])
-            det.rcs = -20.0 + np.random.uniform(-10, 10)   # 模拟 RCS
-            det.snr = float(snrs[i])
-            det.ambgt = 21.82                                # 典型值
-            det.exist_prob = int(np.random.randint(30, 100))  # ≥30 保留
-            det.multi_tgt_prob = 100
-            det.ambgt_prob = int(np.random.randint(40, 100))  # ≥40 保留
-            det.raw_doppler = float(dopplers[i])
-            det.idx = 128                                     # 有效值
-            det_list.points.append(det)
-
-        # ---- 应用 spec 6 条过滤规则 ----
-        filtered, fstats = filter_det_points(det_list.points)
-        det_list.points = filtered
+        for dp in det_points:
+            pt = DetPoint()
+            pt.x             = dp['x']
+            pt.y             = dp['y']
+            pt.z             = dp['z']
+            pt.range         = dp['range']
+            pt.azimuth       = dp['azimuth']
+            pt.elevation     = dp['elevation']
+            pt.rcs           = dp['rcs']
+            pt.snr           = dp['snr']
+            pt.ambgt         = dp['ambgt']
+            pt.exist_prob    = dp['exist_prob']
+            pt.multi_tgt_prob = dp['multi_tgt_prob']
+            pt.ambgt_prob    = dp['ambgt_prob']
+            pt.raw_doppler   = dp['raw_doppler']
+            pt.idx           = dp['idx']
+            det_list.points.append(pt)
 
         self.pub_det.publish(det_list)
-        self.get_logger().info(
-            f'[RSP-PY] 帧 #{self.frame_count}: '
-            f'{fstats["total"]} 候选 → {len(filtered)} 有效 '
-            f'(过滤: ROI={fstats["roi"]} 高度={fstats["height"]} '
-            f'RCS={fstats["rcs"]} 存在概率={fstats["exist_prob"]} '
-            f'SNA={fstats["sna"]} 模糊概率={fstats["ambgt_prob"]}, '
-            f'SNR>{self.snr_threshold}dB, ego_vx={ego_vx:.1f}m/s)')
+
+        # ---- 定期日志 ----
+        if self.frame_count % 10 == 0:
+            if det_points:
+                ranges = [p['range'] for p in det_points]
+                range_str = (f'最近={min(ranges):.1f}m, '
+                             f'最远={max(ranges):.1f}m, '
+                             f'中位={_median(ranges):.1f}m')
+            else:
+                range_str = '无检测点'
+
+            self.get_logger().info(
+                f'[RSP-PY] 帧 #{self.frame_count}: '
+                f'{len(det_points)} 检测点, {range_str}, '
+                f'处理耗时={t_proc:.1f}ms')
 
     # ------------------------------------------------------------------
     # 销毁
@@ -227,6 +218,21 @@ class RspMilPythonNode(Node):
     def destroy_node(self):
         self.get_logger().info(f'RSP MIL Python 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+
+def _median(arr):
+    """中位数 (无 numpy 依赖)。"""
+    if not arr:
+        return 0.0
+    s = sorted(arr)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
 # ============================================================================

@@ -7,8 +7,8 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 
 规格:
   - 帧率: 10 Hz
-  - 数据量: 16 MiB/帧 (1024 chirps × 4 RX × 2048 samples/chirp × int16)
-    = 512 chirps × 2 groups × 4 RX × 2048 samples
+  - 数据量: 32 MiB/帧 (1024 chirps × 8 RX × 2048 samples/chirp × int16)
+    = ctrx0(4 RX) + ctrx1(4 RX), 各512 chirps × 2 groups
   - 时间戳: 全局统一，微秒 (μs) 精度，使用 time.monotonic_ns()
 
 话题:
@@ -29,12 +29,13 @@ FT 雷达 ADC 数据接收节点 (ADC Rx)
 # ============================================================================
 
 # ---------- 采集参数 ----------
-# 数据格式 (8T8R, ctrx0 半集):
-#   每帧 = 512 chirps × 2 groups × 4 RX × 2048 samples = 8,388,608 int16 = 16 MiB
+# 数据格式 (16T16R 雷达拆分为 2×8T8R = ctrx0 + ctrx1):
+#   每半集 = 512 chirps × 2 groups × 4 RX × 2048 samples = 8,388,608 int16 = 16 MiB
+#   合并后  = 1024 chirps × 8 RX × 2048 samples = 16,777,216 int16 = 32 MiB
 #   AdcRawData: num_rows(总chirp) × num_chirps_per_row(RX数) × num_samples_per_chirp
 ADC_FPS                    = 10        # 帧率 (Hz)
 NUM_ROWS                   = 1024      # 总 chirp 数 (512 chirps/group × 2 groups)
-NUM_CHIRPS_PER_ROW         = 4         # RX 天线数
+NUM_CHIRPS_PER_ROW         = 8         # RX 天线数 (ctrx0:4 + ctrx1:4)
 NUM_SAMPLES_PER_CHIRP      = 2048      # 每个 chirp 的采样点数
 
 # ---------- 模拟参数 ----------
@@ -42,8 +43,9 @@ SIM_NOISE_LEVEL            = 100       # 模拟噪声幅度（±）
 SIM_NOISE_POOL_FACTOR      = 4         # 噪声池倍数 (预生成池 = 帧大小 × 倍数)
 
 # ---------- 文件回放参数 ----------
-BIN_FILE_PATH              = 'data/ctrx0_raw.bin'  # 预采集的 .bin 文件路径
-USE_BIN_FILE               = True      # 是否优先使用 .bin 文件回放（否则使用噪声池）
+BIN_FILE_CTRX0             = 'data/ctrx0_raw.bin'  # 8T8R 半集 0 (RX 0-3)
+BIN_FILE_CTRX1             = 'data/ctrx1_raw.bin'  # 8T8R 半集 1 (RX 4-7)
+USE_BIN_FILE               = True      # 是否优先使用 .bin 文件回放（否则使用噪声池)
 
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
@@ -79,7 +81,7 @@ class AdcRxNode(Node):
     功能说明:
       - 模拟 v4l2 驱动的 ADC 数据采集
       - 在采集第一时间注入全局统一时间戳（微秒精度）
-      - 发布 1024×4×2048 int16 原始数据（16 MiB/帧，8T8R ctrx0 半集）
+      - 预加载 ctrx0 + ctrx1 双文件，拼接为完整 1024×8×2048 int16 (32 MiB/帧)
     """
 
     def __init__(self):
@@ -90,7 +92,8 @@ class AdcRxNode(Node):
         self.declare_parameter('num_rows', NUM_ROWS)
         self.declare_parameter('num_chirps_per_row', NUM_CHIRPS_PER_ROW)
         self.declare_parameter('num_samples_per_chirp', NUM_SAMPLES_PER_CHIRP)
-        self.declare_parameter('bin_file_path', BIN_FILE_PATH)
+        self.declare_parameter('bin_file_ctrx0', BIN_FILE_CTRX0)
+        self.declare_parameter('bin_file_ctrx1', BIN_FILE_CTRX1)
         self.declare_parameter('use_bin_file', USE_BIN_FILE)
         self.declare_parameter('fixed_frame', FIXED_FRAME)
         self.declare_parameter('profiler_enabled', True)
@@ -101,7 +104,8 @@ class AdcRxNode(Node):
         self.num_rows           = int(self.get_parameter('num_rows').value)
         self.num_chirps_per_row = int(self.get_parameter('num_chirps_per_row').value)
         self.num_samples        = int(self.get_parameter('num_samples_per_chirp').value)
-        self.bin_file_path      = self.get_parameter('bin_file_path').value
+        self.bin_file_ctrx0     = self.get_parameter('bin_file_ctrx0').value
+        self.bin_file_ctrx1     = self.get_parameter('bin_file_ctrx1').value
         self.use_bin_file       = bool(self.get_parameter('use_bin_file').value)
         self.fixed_frame        = self.get_parameter('fixed_frame').value
 
@@ -148,15 +152,30 @@ class AdcRxNode(Node):
             f'每帧 {self._total_samples * 2 / 1024 / 1024:.1f} MiB')
 
         # ---------- 数据源初始化（文件预加载优先，噪声池备选） ----------
-        self._file_frames = []      # 预加载的文件帧列表
+        self._file_frames = []      # 预加载的合并帧列表
         self._file_frame_idx = 0    # 当前回放帧索引
 
-        if self.use_bin_file and self.bin_file_path and os.path.exists(self.bin_file_path):
-            self._load_bin_frames()
-        else:
-            if self.use_bin_file:
+        if self.use_bin_file:
+            ctrx0_ok = self.bin_file_ctrx0 and os.path.exists(self.bin_file_ctrx0)
+            ctrx1_ok = self.bin_file_ctrx1 and os.path.exists(self.bin_file_ctrx1)
+            if ctrx0_ok and ctrx1_ok:
+                self._load_bin_frames_dual()
+            elif ctrx0_ok and not ctrx1_ok:
                 self.get_logger().warning(
-                    f'bin 文件不存在: {self.bin_file_path}, 回退到噪声池')
+                    f'ctrx1 文件不存在: {self.bin_file_ctrx1}, '
+                    f'仅加载 ctrx0 单半集')
+                self._load_bin_frames_single(self.bin_file_ctrx0)
+            elif ctrx1_ok and not ctrx0_ok:
+                self.get_logger().warning(
+                    f'ctrx0 文件不存在: {self.bin_file_ctrx0}, '
+                    f'仅加载 ctrx1 单半集')
+                self._load_bin_frames_single(self.bin_file_ctrx1)
+            else:
+                self.get_logger().warning(
+                    f'bin 文件均不存在: {self.bin_file_ctrx0}, '
+                    f'{self.bin_file_ctrx1}, 回退到噪声池')
+                self._init_noise_pool()
+        else:
             self._init_noise_pool()
 
         # ---------- 预分配消息对象 (复用避免每帧 malloc) ----------
@@ -167,34 +186,76 @@ class AdcRxNode(Node):
         self._msg.num_samples_per_chirp = self.num_samples
 
     # ------------------------------------------------------------------
-    # 数据源：从 .bin 文件预加载帧
+    # 数据源：从双 .bin 文件预加载帧（ctrx0 + ctrx1 合并为完整 16T16R）
     # ------------------------------------------------------------------
 
-    def _load_bin_frames(self):
-        """从 .bin 文件中预加载所有帧到内存（循环回放）。"""
-        frame_bytes = self._total_samples * 2  # int16 × 2 bytes
-        file_size = os.path.getsize(self.bin_file_path)
+    def _load_bin_frames_dual(self):
+        """预加载 ctrx0 + ctrx1，逐帧拼接为完整 32 MiB 帧。"""
+        half_samples = self._total_samples // 2  # 每个半集 int16 数
+
+        # --- 验证两个文件帧数一致 ---
+        n0, file_size0 = self._count_frames(self.bin_file_ctrx0, half_samples)
+        n1, file_size1 = self._count_frames(self.bin_file_ctrx1, half_samples)
+
+        if n0 < 1 or n1 < 1:
+            self.get_logger().warning('bin 文件帧数不足, 回退到噪声池')
+            self._init_noise_pool()
+            return
+
+        total_frames = min(n0, n1)
+        if n0 != n1:
+            self.get_logger().warning(
+                f'ctrx0 和 ctrx1 帧数不一致 ({n0} vs {n1}), '
+                f'取较小值 {total_frames}')
+
+        # --- 逐帧读取并拼接 ---
+        try:
+            mmap0 = np.memmap(self.bin_file_ctrx0, dtype=np.int16, mode='r',
+                              shape=(n0 * half_samples,))
+            mmap1 = np.memmap(self.bin_file_ctrx1, dtype=np.int16, mode='r',
+                              shape=(n1 * half_samples,))
+            for i in range(total_frames):
+                start = i * half_samples
+                end = start + half_samples
+                half0 = mmap0[start:end].copy()
+                half1 = mmap1[start:end].copy()
+                # 拼接 ctrx0(RX0-3) + ctrx1(RX4-7) → 完整 8 RX
+                merged = np.concatenate([half0, half1])
+                self._file_frames.append(merged)
+            del mmap0, mmap1
+        except Exception as e:
+            self.get_logger().warning(
+                f'bin 文件读取失败: {e}, 回退到噪声池')
+            self._file_frames.clear()
+            self._init_noise_pool()
+            return
+
+        total_mb = (file_size0 + file_size1) / 1048576.0
+        self.get_logger().info(
+            f'bin 文件已预加载 (双半集): {total_frames} 帧 ({total_mb:.1f} MB), '
+            f'来自 {self.bin_file_ctrx0} + {self.bin_file_ctrx1}')
+
+    def _load_bin_frames_single(self, filepath: str):
+        """从单个 .bin 文件预加载帧（单半集回退模式）。"""
+        file_size = os.path.getsize(filepath)
+        frame_bytes = self._total_samples * 2
         total_frames = file_size // frame_bytes
 
         if total_frames < 1:
             self.get_logger().warning(
-                f'bin 文件太小 ({file_size} bytes < 1 frame {frame_bytes} bytes), '
-                f'回退到噪声池')
+                f'bin 文件太小 ({file_size} bytes < 1 frame), 回退到噪声池')
             self._init_noise_pool()
             return
 
-        # 逐帧读取，避免一次性分配过大内存
         try:
             mmap_array = np.memmap(
-                self.bin_file_path, dtype=np.int16, mode='r',
+                filepath, dtype=np.int16, mode='r',
                 shape=(total_frames * self._total_samples,))
             for i in range(total_frames):
                 start = i * self._total_samples
                 end = start + self._total_samples
-                # 复制到独立 buffer，释放 mmap 资源后可继续使用
-                frame = mmap_array[start:end].copy()
-                self._file_frames.append(frame)
-            del mmap_array  # 释放 mmap
+                self._file_frames.append(mmap_array[start:end].copy())
+            del mmap_array
         except Exception as e:
             self.get_logger().warning(
                 f'bin 文件读取失败: {e}, 回退到噪声池')
@@ -203,8 +264,18 @@ class AdcRxNode(Node):
             return
 
         self.get_logger().info(
-            f'bin 文件已预加载: {total_frames} 帧 ({file_size / 1048576:.1f} MB), '
-            f'来自 {self.bin_file_path}')
+            f'bin 文件已预加载 (单半集): {total_frames} 帧 '
+            f'({file_size / 1048576:.1f} MB), 来自 {filepath}')
+
+    @staticmethod
+    def _count_frames(filepath: str, per_frame_elems: int) -> tuple:
+        """返回 (帧数, 文件大小) 或 (0, 0)。"""
+        try:
+            sz = os.path.getsize(filepath)
+            n = sz // (per_frame_elems * 2)  # int16 = 2 bytes
+            return (n, sz)
+        except OSError:
+            return (0, 0)
 
     # ------------------------------------------------------------------
     # 数据源：生成模拟噪声池（备选）

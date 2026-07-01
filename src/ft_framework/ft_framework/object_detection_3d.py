@@ -230,7 +230,8 @@ class ObjectDetection3DNode(Node):
         self.get_logger().info(
             f'3D Object Detection 启动: '
             f'聚类距离={self.cluster_distance}m, '
-            f'最小簇={self.min_cluster_size} [AI 模拟]')
+            f'最小簇={self.min_cluster_size} '
+            f'(速度/yaw 待算法实现)')
 
     # ------------------------------------------------------------------
     # 检测回调
@@ -280,12 +281,12 @@ class ObjectDetection3DNode(Node):
             min_xyz = cluster.min(axis=0)
             max_xyz = cluster.max(axis=0)
 
-            cx = (min_xyz[0] + max_xyz[0]) / 2.0
-            cy = (min_xyz[1] + max_xyz[1]) / 2.0
-            cz = (min_xyz[2] + max_xyz[2]) / 2.0
-            L = max(max_xyz[0] - min_xyz[0], 1.0)
-            W = max(max_xyz[1] - min_xyz[1], 1.0)
-            H = max(max_xyz[2] - min_xyz[2], DEFAULT_BOX_H)
+            cx = float((min_xyz[0] + max_xyz[0]) / 2.0)
+            cy = float((min_xyz[1] + max_xyz[1]) / 2.0)
+            cz = float((min_xyz[2] + max_xyz[2]) / 2.0)
+            L  = float(max(float(max_xyz[0] - min_xyz[0]), 1.0))
+            W  = float(max(float(max_xyz[1] - min_xyz[1]), 1.0))
+            H  = float(max(float(max_xyz[2] - min_xyz[2]), DEFAULT_BOX_H))
 
             # ---- 填充 Object3D 14 字段 ----
             obj = Object3D()
@@ -299,9 +300,9 @@ class ObjectDetection3DNode(Node):
             obj.l = L
             obj.w = W
             obj.h = H
-            obj.yaw = 0.0                                  # 模拟
-            obj.vx_absolute = float(np.random.uniform(-5, 15))
-            obj.vy_absolute = float(np.random.uniform(-2, 2))
+            obj.yaw = 0.0                                  # TODO: 角度估计算法
+            obj.vx_absolute = 0.0                           # TODO: 多普勒速度估计
+            obj.vy_absolute = 0.0                           # TODO: 多普勒速度估计
             obj.vz_absolute = 0.0
             obj.moving_state = 0 if abs(obj.vx_absolute) > 1 else 1
             obj_list.objects.append(obj)

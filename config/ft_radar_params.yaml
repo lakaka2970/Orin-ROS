@@ -9,7 +9,7 @@
 # ════════════════════════════════════════════════════════════════════════════
 # 话题频率概览 (Hz)
 # ════════════════════════════════════════════════════════════════════════════
-#   /adc/raw_data                    15 Hz  ← adc_rx (16 MiB/帧, 8T8R ctrx0)
+#   /adc/raw_data                    15 Hz  ← adc_rx (32 MiB/帧, ctrx0+ctrx1 16T16R 合并)
 #   /camera/image_raw                30 Hz  ← camera_rx
 #   /vehicle/ego_motion              50 Hz  ← vehicle_data_rx
 #   /processing/radar/det_list       10 Hz  ← rsp_* (⚠ 低于ADC 15Hz)
@@ -44,14 +44,18 @@ system:
 # ====================================================================
 # 节点: ADC Rx — 雷达 ADC 数据接收
 # ====================================================================
-# 规格: 8T8R ctrx0 半集, 16 MiB/帧, 1024 chirps × 4 RX × 2048 samples × int16
-#   Frame = 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB
+# 规格: 16T16R 拆分 2×8T8R (ctrx0 + ctrx1 双文件), 32 MiB/帧
+#   ctrx0: 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB (RX 0-3)
+#   ctrx1: 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB (RX 4-7)
+#   合并:  1024 chirps × 8 RX × 2048 samples × 2B = 32 MiB
 adc_rx:
   fps: 15
   num_rows: 1024                           # 总 chirp: 512 chirps/group × 2 groups
-  num_chirps_per_row: 4                    # RX 天线数
+  num_chirps_per_row: 8                    # RX 天线数: ctrx0(4) + ctrx1(4) = 8
   num_samples_per_chirp: 2048
-  frame_size_bytes: 16777216               # 1024×4×2048×2 = 16 MiB
+  bin_file_ctrx0: "data/ctrx0_raw.bin"     # 8T8R 半集 0
+  bin_file_ctrx1: "data/ctrx1_raw.bin"     # 8T8R 半集 1
+  frame_size_bytes: 33554432               # 1024×8×2048×2 = 32 MiB
   data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
   max_preload_files: 30                    # 最多预加载文件数 (~960 MB)
   use_noise_pool: true                     # 无文件时自动回退到噪声池
@@ -75,6 +79,7 @@ camera_rx:
 vehicle_data_rx:
   fps: 50
   timeout_cycles: 3                        # 超时周期数（3周期 = 60ms）
+  can_interface: "can0"                     # CAN 接口名 (接入总线后启用)
   defaults:
     vx: 0.0                               # 车速 (m/s)
     yaw_rate: 0.0                         # 偏航角速度 (rad/s)
@@ -93,16 +98,41 @@ vehicle_data_rx:
 #   both_compare:  双路并行 + 自动对比输出差异
 rsp:
   default_mode: "cuda"
+
+  # -- 信号处理流水线参数 (共享) --
+  # FFT 尺寸
+  range_fft_size: 2048                      # Range FFT 点数
+  doppler_fft_size: 512                     # Doppler FFT 点数 (= chirps_per_tx)
+  angle_fft_size: 64                        # 角度 FFT 点数 (零填充超分辨)
+
+  # 物理参数 (77 GHz 汽车雷达典型值, 待实测校准)
+  range_resolution_m: 0.1465                # 距离分辨率 (m), c/(2B)
+  velocity_max_ms: 16.0                     # 最大不模糊速度 (m/s), λ/(4*T_chirp)
+
+  # CFAR 检测参数
+  cfar_threshold_db: 12.0                   # CFAR 检测阈值 (dB)
+  cfar_guard_range: 4                       # Range 维保护单元数
+  cfar_guard_doppler: 4                     # Doppler 维保护单元数
+  cfar_train_range: 8                       # Range 维参考单元数
+  cfar_train_doppler: 8                     # Doppler 维参考单元数
+
+  # 检测后处理
+  min_snr_db: 10.0                          # 最小 SNR 阈值 (dB)
+  min_range_m: 1.0                          # 最小检测距离 (m), 滤除近场耦合
+  max_range_m: 150.0                        # 最大检测距离 (m)
+  max_detections: 200                       # 每帧最大检测点数
+
   # Python 版参数
   python:
-    processing_fps: 10.0                     # 处理帧率 (Hz), 当前低于 ADC 15Hz
-    snr_threshold: 10.0                   # SNR 阈值 (dB)
-    velocity_scale: 0.5                   # 速度估算缩放因子
+    processing_fps: 10.0                    # 处理帧率 (Hz)
+    snr_threshold: 10.0                     # SNR 阈值 (dB)
+    velocity_scale: 0.5                     # 速度估算缩放因子
+
   # CUDA 版参数
   cuda:
-    processing_fps: 10.0                     # 处理帧率 (Hz), 当前低于 ADC 15Hz
-    snr_threshold: 8.0                    # SNR 阈值 (dB)，更低 = 更高灵敏度
-    velocity_scale: 0.5                   # 速度估算缩放因子
+    processing_fps: 10.0                    # 处理帧率 (Hz)
+    snr_threshold: 8.0                      # SNR 阈值 (dB), 更低 = 更高灵敏度
+    velocity_scale: 0.5                     # 速度估算缩放因子
 
 # ====================================================================
 # 节点: 3D Object Detection — 3D 目标检测（AI 模拟）
@@ -164,7 +194,7 @@ rviz_image:
 #       └── <timestamp_us>.bin
 #
 # 帧数上限策略:
-#   ADC:     100 帧 → 约 1.6 GB (100 × 16 MiB)
+#   ADC:     100 帧 → 约 3.2 GB (100 × 32 MiB)
 #   Image:   1000 帧
 #   Det_List: 1000 帧
 #   Ego_Motion: 1000 帧

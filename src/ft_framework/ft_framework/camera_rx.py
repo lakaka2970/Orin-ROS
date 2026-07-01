@@ -138,23 +138,27 @@ class CameraRxNode(Node):
 
     def _on_timer(self):
         """
-        发布极小空图像以维持节点拓扑, 不生成测试图案, 不占用硬盘空间.
-        4×4×3 = 48 bytes/frame, 30 Hz ≈ 1.4 KB/s.
+        TODO: 接入真实 GMSL/FPD-Link 相机驱动，替换空图像占位。
+             参见 docs/详细化开发方案.md
+
+        当前状态: 发布极小空图像以维持节点拓扑。
+                  4×4×3 = 48 bytes/frame, 30 Hz ≈ 1.4 KB/s。
         """
         self.frame_count += 1
         sec, nsec = monotonic_us_stamp()
 
-        # 极小空图像
+        # 空图像占位 (待替换为真实相机采集)
         img = np.zeros((self.image_height, self.image_width, 3), dtype=np.uint8)
 
-        # 发布图像
         img_msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         img_msg.header.frame_id = self.fixed_frame
         img_msg.header.stamp.sec = sec
         img_msg.header.stamp.nanosec = nsec
         self.pub_img.publish(img_msg)
-        self.get_logger().debug(
-            f'Camera Rx 帧 #{self.frame_count}: timestamp={sec}.{nsec:09d}')
+
+        if self.frame_count == 1:
+            self.get_logger().info(
+                'Camera Rx: 相机驱动未接入, 发布空图像占位 (待替换)')
 
     # ------------------------------------------------------------------
     # 销毁

@@ -54,10 +54,11 @@ src/*/test_results/
 # Reference materials
 参考/
 docs/FT_visualizer
-docs/
+#docs/
 ft_dataset/
 *.o
 *.cmd
+docs/
 
 src/integration-carkit88c0-gmsl/src/modules/radar/
 src/integration-carkit88c0-gmsl/src/modules/max929x/

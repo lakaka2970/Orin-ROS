@@ -3,8 +3,16 @@
 """
 FT 雷达信号处理节点 —— Python/MIL 实现 (RSP MIL Python)
 ================================================================================
-融合 ADC 数据和车辆数据，执行雷达信号处理（模拟），
-输出检测目标列表 DetList。
+融合 ADC 数据和车辆数据，执行完整的雷达信号处理流水线。
+
+信号处理流水线:
+  1. ADC reshape: 32 MiB byte buffer → (1024, 8, 2048) float32
+  2. Range-FFT: 2048-pt FFT (Hann window) → 距离谱
+  3. TDM 分离: TX0 [0:512], TX1 [512:1024]
+  4. Doppler-FFT: 512-pt FFT (Hann window) → 距离-多普勒谱
+  5. 2D CFAR: 两级 CA-CFAR 恒虚警检测
+  6. Angle FFT: 8-RX 波束形成 → 方位角估计
+  7. DetPoint: 14 字段填充 + 球坐标 → 车体系 Cartesian
 
 规格:
   - 处理帧率: 10 Hz
@@ -37,12 +45,6 @@ PROCESSING_FPS  = 10.0        # 处理帧率 (Hz)
 SNR_THRESHOLD   = 10.0        # 信噪比阈值 (dB)
 VELOCITY_SCALE  = 0.5         # 速度估算缩放因子
 
-# ---------- 模拟检测参数 ----------
-SIM_NUM_TARGETS = 30          # 每帧模拟检测目标数
-SIM_RANGE_MAX   = 300.0       # 最大探测距离 (m)
-SIM_RANGE_MIN   = 30.0        # 最小探测距离 (m)
-SIM_AZ_RANGE    = 45.0        # 方位角范围 (±°)
-
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
 
@@ -50,14 +52,14 @@ FIXED_FRAME = 'radar'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
-import math
-import numpy as np
+import time
 
 import rclpy
 from rclpy.node import Node
 
 from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
 from ft_framework.common import filter_det_points
+from ft_framework.rsp_processor import create_processor
 
 
 # ============================================================================
@@ -65,19 +67,12 @@ from ft_framework.common import filter_det_points
 # ============================================================================
 
 class RspMilPythonNode(Node):
-    """
-    Python 雷达信号处理节点
+    """Python 雷达信号处理节点。
 
     话题:
       订阅: /adc/raw_data       (AdcRawData)
             /vehicle/ego_motion (EgoMotion)
       发布: /processing/radar/det_list (DetList)
-
-    功能说明:
-      - 接收 ADC 原始数据和车辆数据
-      - 执行 SNR 滤波和速度补偿（模拟）
-      - 输出 14 字段 DetPoint
-      - 通过 rsp_mode 参数控制: 仅 python/both/both_compare 模式时运行
     """
 
     def __init__(self):
@@ -87,7 +82,7 @@ class RspMilPythonNode(Node):
         self.declare_parameter('processing_fps', PROCESSING_FPS)
         self.declare_parameter('snr_threshold', SNR_THRESHOLD)
         self.declare_parameter('velocity_scale', VELOCITY_SCALE)
-        self.declare_parameter('rsp_mode', 'cuda')       # 外部通过 node 参数传入
+        self.declare_parameter('rsp_mode', 'cuda')
         self.declare_parameter('fixed_frame', FIXED_FRAME)
 
         self.processing_fps = float(self.get_parameter('processing_fps').value)
@@ -95,6 +90,19 @@ class RspMilPythonNode(Node):
         self.velocity_scale = float(self.get_parameter('velocity_scale').value)
         self.rsp_mode       = self.get_parameter('rsp_mode').value
         self.fixed_frame    = self.get_parameter('fixed_frame').value
+
+        # ---------- RSP 处理器 ----------
+        rsp_config = {
+            'snr_threshold':      self.snr_threshold,
+            'velocity_scale':     self.velocity_scale,
+            'processing_fps':     self.processing_fps,
+        }
+        self._processor = create_processor(rsp_config)
+        self.get_logger().info(
+            f'RSP 处理器初始化完成: '
+            f'Range-FFT={self._processor.p["range_fft_size"]}pt, '
+            f'Doppler-FFT={self._processor.p["doppler_fft_size"]}pt, '
+            f'CFAR={self._processor.p["peak_prominence_db"]}dB')
 
         # ---------- 数据缓存 ----------
         self._latest_adc     = None
@@ -142,47 +150,27 @@ class RspMilPythonNode(Node):
     # ------------------------------------------------------------------
 
     def _on_process(self):
-        """
-        模拟雷达信号处理 pipeline:
-          1. 从 ADC 数据提取时间戳
-          2. 获取车辆速度用于补偿
-          3. 生成模拟检测目标（SNR 滤波 + 速度补偿）
-          4. 填充 DetPoint 14 字段
-          5. 发布 DetList
-        """
+        """雷达信号处理主回调: ADC bytes → RSP → DetList 发布。"""
         if not self._pub_enabled or self._latest_adc is None:
             return
 
         self.frame_count += 1
-        # 透传 ADC 时间戳，不得重新生成（全局时间戳规则）
+        t0 = time.perf_counter()
+
+        # 透传 ADC 时间戳
         adc_stamp = self._latest_adc.header.stamp
+        adc_bytes = self._latest_adc.data
 
-        # 获取车辆速度
-        ego_vx = 0.0
-        if self._latest_ego is not None and not self._latest_ego.is_default:
-            ego_vx = self._latest_ego.vx
+        # ---- 核心 RSP 处理 ----
+        try:
+            det_points = self._processor.process(adc_bytes)
+        except Exception as e:
+            self.get_logger().error(f'RSP 处理异常: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return
 
-        # ---- 模拟检测处理（替换为真实 RSP 算法） ----
-        n = SIM_NUM_TARGETS
-        ranges   = np.random.uniform(SIM_RANGE_MIN, SIM_RANGE_MAX, n)
-        azimuths = np.random.uniform(
-            -math.radians(SIM_AZ_RANGE), math.radians(SIM_AZ_RANGE), n)
-        elevations = np.random.uniform(-math.radians(5.0), math.radians(5.0), n)
-
-        # 球→笛卡尔（车辆系）
-        x = ranges * np.cos(elevations) * np.cos(azimuths)
-        y = ranges * np.cos(elevations) * np.sin(azimuths)
-        z = ranges * np.sin(elevations)
-
-        # SNR 过滤模拟
-        snrs = 20.0 * np.log10(SIM_RANGE_MAX / (ranges + 1e-3))
-        snrs = np.clip(snrs, 0, 60)
-        mask = snrs >= self.snr_threshold
-        valid_idx = np.where(mask)[0]
-
-        # 速度补偿
-        distances = ranges * 1.0
-        dopplers = self.velocity_scale * (distances * 0.01 - ego_vx)
+        t_proc = (time.perf_counter() - t0) * 1000.0
 
         # ---- 构造 DetList (v2 41 字段) ----
         det_list = DetList()
@@ -190,81 +178,89 @@ class RspMilPythonNode(Node):
         det_list.header.frame_id = self.fixed_frame
         det_list.frame_id = self.frame_count        # 2. u16FrameID: 雷达帧序号
 
-        for i in valid_idx:
-            det = DetPoint()
-            det.idx = 128                                     # 有效值
-            # -- 空间位置（车辆坐标系） --
-            det.x = float(x[i])                     # 4.  f32XPos
-            det.y = float(y[i])                     # 5.  f32YPos
-            det.z = float(z[i])                     # 6.  f32ZPos
+        for dp in det_points:
+            pt = DetPoint()
 
-            # -- 雷达原视测量 --
-            det.rad_vel_abs = float(dopplers[i])    # 7.  f32RadVelAbs  绝对径向速度
-            det.range = float(ranges[i])            # 8.  f32Range
-            det.speed = float(abs(dopplers[i]))     # 9.  f32Speed     合速度（取径向速度幅值）
-            det.azimuth_ang = float(azimuths[i])    # 10. f32AzimuthAng
-            det.ele_ang = float(elevations[i])      # 11. f32EleAng
+            # -- 空间位置（车辆坐标系） --
+            pt.x            = dp['x']              # 4.  f32XPos
+            pt.y            = dp['y']              # 5.  f32YPos
+            pt.z            = dp['z']              # 6.  f32ZPos
+
+            # -- 雷达原视测量（雷达传感器坐标系） --
+            pt.rad_vel_abs  = dp['raw_doppler']    # 7.  f32RadVelAbs  绝对径向速度
+            pt.range        = dp['range']          # 8.  f32Range
+            pt.speed        = abs(dp['raw_doppler'])# 9.  f32Speed     合速度
+            pt.azimuth_ang  = dp['azimuth']        # 10. f32AzimuthAng
+            pt.ele_ang      = dp['elevation']      # 11. f32EleAng
 
             # -- 信号特征 --
-            det.snr_db = float(snrs[i])             # 12. f32SNRdB
-            det.rcs_db = -20.0 + np.random.uniform(-10, 10)  # 13. f32RcsdB  模拟 RCS
-            det.power_db = float(snrs[i]) - 10.0    # 14. f32PowerdB 回波功率（SNR 近似换算）
+            pt.snr_db       = dp['snr']            # 12. f32SNRdB
+            pt.rcs_db       = dp['rcs']            # 13. f32RcsdB
+            pt.power_db     = dp['snr'] - 10.0     # 14. f32PowerdB  回波功率 (SNR 近似换算)
 
-            # -- 检测标志位（模拟/默认值） --
-            det.strategy_flag = 0                   # 15. u32StrategyFlag
-            det.obj_same_rv = 0                     # 16. u32ObjSameRV
-            det.obj_quality = 0                     # 17. u32ObjQuality
-            det.obj_track_flag = 0                  # 18. u32ObjTrackFlag
-            det.ele_confident = 0                   # 19. u32EleConfident
-            det.predict_det_flag = 0                # 20. u32PredictDetflag
+            # -- 检测标志位 --
+            pt.strategy_flag     = 0               # 15. u32StrategyFlag
+            pt.obj_same_rv       = 0               # 16. u32ObjSameRV
+            pt.obj_quality       = 0               # 17. u32ObjQuality
+            pt.obj_track_flag    = 0               # 18. u32ObjTrackFlag
+            pt.ele_confident     = 0               # 19. u32EleConfident
+            pt.predict_det_flag  = 0               # 20. u32PredictDetflag
 
             # -- DOA 与角度关联 --
-            det.doa_method = 0                      # 25. u32DOAMethod
-            det.asso_angle_filter_id = 0            # 26. u32AssoAngleFilterId
+            pt.doa_method          = 0             # 25. u32DOAMethod
+            pt.asso_angle_filter_id = 0            # 26. u32AssoAngleFilterId
 
-            # -- RD 索引（模拟值） --
-            det.rd_cell_idx = int(128 * i)          # 27. u16RdCellIdx     RD 单元总索引
-            det.range_idx = int(ranges[i] / 0.5)    # 28. u16RangeIdx      距离维索引（0.5m 分辨率）
-            det.doppler_idx = 128                   # 29. u16DopplerIdx    多普勒速度维索引（有效值）
-            det.azimuth_idx = 0                     # 30. u8AzimuthIdx
-            det.elevation_idx = 0                   # 31. u8ElevationIdx
+            # -- RD 索引 --
+            pt.rd_cell_idx   = dp.get('rd_cell_idx', 0)   # 27. u16RdCellIdx
+            pt.range_idx     = dp.get('range_idx', 0)     # 28. u16RangeIdx
+            pt.doppler_idx   = dp['idx']                  # 29. u16DopplerIdx
+            pt.azimuth_idx   = 0                          # 30. u8AzimuthIdx
+            pt.elevation_idx = 0                          # 31. u8ElevationIdx
 
             # -- 峰值与 SNR --
-            det.peak_val = int(np.clip(snrs[i] * 100, 0, 65535))  # 32. u16PeakVal
-            det.sin_azim_snr_lin = 0                # 33. u16SinAzimSNRLin
-            det.sin_elev_snr_lin = 0                # 34. u16SinElevSNRLin
+            pt.peak_val         = dp.get('peak_val', 0)   # 32. u16PeakVal
+            pt.sin_azim_snr_lin = 0                       # 33. u16SinAzimSNRLin
+            pt.sin_elev_snr_lin = 0                       # 34. u16SinElevSNRLin
 
             # -- 速度解模糊 --
-            det.vel_amb_fac = 0                     # 35. s8VelAmbFac     速度解模糊因子
+            pt.vel_amb_fac = dp.get('vel_amb_fac', 0)     # 35. s8VelAmbFac
 
             # -- 枚举状态 --
-            det.det_ambig_state = 0                 # 36. eDetAmbigState  目标速度模糊状态
-            det.det_motion_pat = 0                  # 37. eDetMotionPat   目标运动模式（0=静止, 1=运动）
+            pt.det_ambig_state = dp.get('det_ambig_state', 0)  # 36. eDetAmbigState
+            pt.det_motion_pat  = dp.get('det_motion_pat', 0)   # 37. eDetMotionPat
 
             # -- 置信度与帧间标志 --
-            det.det_conf = int(np.random.randint(30, 255))  # 38. u8DetConf     检测点基础置信度
-            det.inter_frame_flag = 0                # 39. u8InterFrameFlag
-            det.asso_trk_num = 0                    # 40. u8AssoTrkNum    关联跟踪目标数量
-            det.chanl_phase_max = 0                 # 41. u8ChanlPhaseMax 天线通道最大相位差
+            pt.det_conf         = dp['exist_prob']        # 38. u8DetConf
+            pt.inter_frame_flag = 0                       # 39. u8InterFrameFlag
+            pt.asso_trk_num     = 0                       # 40. u8AssoTrkNum
+            pt.chanl_phase_max  = 0                       # 41. u8ChanlPhaseMax
 
-            det_list.points.append(det)
+            det_list.points.append(pt)
 
         # 3. u16DetObjNum: 当前帧检测到的目标总点数
         det_list.det_obj_num = len(det_list.points)
 
-        # ---- 应用过滤规则（适配 v2 字段名） ----
-        filtered, fstats = filter_det_points(det_list.points)
+        # ---- 应用过滤规则（v2 字段名） ----
+        filtered, _ = filter_det_points(det_list.points)
         det_list.points = filtered
         det_list.det_obj_num = len(filtered)        # 更新为过滤后的目标数
 
         self.pub_det.publish(det_list)
-        self.get_logger().info(
-            f'[RSP-PY] 帧 #{self.frame_count}: '
-            f'{fstats["total"]} 候选 → {len(filtered)} 有效 '
-            f'(过滤: ROI={fstats["roi"]} 高度={fstats["height"]} '
-            f'RCS={fstats["rcs"]} 存在概率={fstats["exist_prob"]} '
-            f'SNA={fstats["sna"]} 模糊概率={fstats["ambgt_prob"]}, '
-            f'SNR>{self.snr_threshold}dB, ego_vx={ego_vx:.1f}m/s)')
+
+        # ---- 定期日志 ----
+        if self.frame_count % 10 == 0:
+            if det_points:
+                ranges = [p['range'] for p in det_points]
+                range_str = (f'最近={min(ranges):.1f}m, '
+                             f'最远={max(ranges):.1f}m, '
+                             f'中位={_median(ranges):.1f}m')
+            else:
+                range_str = '无检测点'
+
+            self.get_logger().info(
+                f'[RSP-PY] 帧 #{self.frame_count}: '
+                f'{len(det_points)} 检测点, {range_str}, '
+                f'处理耗时={t_proc:.1f}ms')
 
     # ------------------------------------------------------------------
     # 销毁
@@ -273,6 +269,21 @@ class RspMilPythonNode(Node):
     def destroy_node(self):
         self.get_logger().info(f'RSP MIL Python 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+
+def _median(arr):
+    """中位数 (无 numpy 依赖)。"""
+    if not arr:
+        return 0.0
+    s = sorted(arr)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
 # ============================================================================

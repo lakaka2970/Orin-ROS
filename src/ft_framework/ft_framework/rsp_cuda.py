@@ -5,13 +5,13 @@ FT 雷达信号处理节点 —— CUDA 加速实现 (RSP Cuda)
 ================================================================================
 融合 ADC 数据和车辆数据，以 CUDA GPU 加速方式执行雷达信号处理。
 
-当前状态: 使用 Python RSP 处理器 (待 CUDA GPU 移植)。
-          GPU 加速版本将使用 CuPy/Numba CUDA 实现 FFT + CFAR kernel。
+当前状态: 使用完整 Python/MIL 信号处理管线 (与 rsp_mil_python 一致)。
+          GPU 加速版本待移植: CuPy/Numba CUDA 实现 FFT + CFAR kernel。
 
 规格:
   - 处理帧率: 10 Hz
   - SNR 阈值: 比 Python 版更低（GPU 更高灵敏度）
-  - 输出字段: DetPoint 14 字段与 FT_radar_dataset_requirement 完全对齐
+  - 输出字段: DetPoint 41 字段与 FT_radar_dataset_requirement 完全对齐
   - 启动模式: 通过 rsp_mode 参数控制发布话题
 
 信号处理流水线:
@@ -21,7 +21,7 @@ FT 雷达信号处理节点 —— CUDA 加速实现 (RSP Cuda)
   4. Doppler-FFT: 512-pt FFT (Hann window) → 距离-多普勒谱
   5. 2D CFAR: 两级 CA-CFAR 恒虚警检测
   6. Angle FFT: 8-RX 波束形成 → 方位角估计
-  7. DetPoint: 14 字段填充 + 球坐标 → 车体系 Cartesian
+  7. DetPoint: 41 字段填充 + 球坐标 → 车体系 Cartesian
 
 话题:
   订阅: /adc/raw_data         ft_radar_msgs/AdcRawData
@@ -58,11 +58,21 @@ FIXED_FRAME = 'radar'
 
 import time
 
+import numpy as np
+import torch
 import rclpy
 from rclpy.node import Node
 
 from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
+from ft_framework.common import filter_det_points
 from ft_framework.rsp_processor import create_processor
+from ft_framework.signal_process.config import RadarConfig
+from ft_framework.signal_process.preprocessing import radar_signal_process_final
+from ft_framework.signal_process.doppler import doppler_processing_gpu
+from ft_framework.signal_process.peak_detection import peak_search_gpu
+from ft_framework.signal_process.arraySim import RadarArrayInitializer
+from ft_framework.signal_process.doa_proc import doa_main_ultra_separated, doa_env
+from ft_framework.signal_process.data_io import readRawBinCasc
 
 
 # ============================================================================
@@ -72,7 +82,7 @@ from ft_framework.rsp_processor import create_processor
 class RspCudaNode(Node):
     """CUDA 雷达信号处理节点。
 
-    (当前为 Python 实现，GPU 内核待移植。)
+    (当前使用完整 Python/MIL 管线，GPU 内核待移植。)
     """
 
     def __init__(self):
@@ -91,21 +101,39 @@ class RspCudaNode(Node):
         self.rsp_mode       = self.get_parameter('rsp_mode').value
         self.fixed_frame    = self.get_parameter('fixed_frame').value
 
-        # ---------- RSP 处理器 ----------
-        # 从 ROS 参数构建配置字典, 传入处理器工厂
+        # ---------- 雷达参数与阵列初始化 ----------
+        self.cfg = RadarConfig()
+        self.array_env = RadarArrayInitializer()
+
+        # 初始化 DOA 环境（预先准备 FFT 索引映射，避免每帧重复计算）
+        if not doa_env.is_initialized:
+            doa_env.prepare_mapping_indices(
+                self.array_env.Array_Azi, self.array_env.Array_Ele)
+
+        self.get_logger().info(
+            f'雷达参数初始化完成: '
+            f'n_samples={self.cfg.n_samples}, '
+            f'n_chirps={self.cfg.n_chirps}, '
+            f'n_rx={self.cfg.n_rx}, '
+            f'range_res={self.cfg.range_resolution:.3f}m, '
+            f'doppler_res={self.cfg.doppler_resolution:.3f}m/s')
+
+        # 预加载测试 RAW 数据（离线模式）
+        self.raw_data = readRawBinCasc(
+            "/home/orin/projects/radar_test/Orin-ROS/src/ft_framework/ft_framework",
+            frameNr=0,
+            nSamples=self.cfg.n_samples,
+            nRamps=self.cfg.n_chirps,
+            nChannels=self.cfg.n_rx
+        )
+
+        # 保留 RSP 处理器作为备用
         rsp_config = {
             'snr_threshold':      self.snr_threshold,
             'velocity_scale':     self.velocity_scale,
             'processing_fps':     self.processing_fps,
         }
         self._processor = create_processor(rsp_config)
-        self.get_logger().info(
-            f'RSP 处理器初始化完成: '
-            f'Range-FFT={self._processor.p["range_fft_size"]}pt, '
-            f'Doppler-FFT={self._processor.p["doppler_fft_size"]}pt, '
-            f'Angle-FFT={self._processor.p["angle_fft_size"]}pt, '
-            f'CFAR={self._processor.p["peak_prominence_db"]}dB, '
-            f'范围=[{self._processor.p["min_range_m"]}, {self._processor.p["max_range_m"]}]m')
 
         # ---------- 数据缓存 ----------
         self._latest_adc = None
@@ -152,6 +180,44 @@ class RspCudaNode(Node):
         self._latest_ego = msg
 
     # ------------------------------------------------------------------
+    # ADC 数据格式转换
+    # ------------------------------------------------------------------
+
+    def _adc_bytes_to_raw_data(self, adc_bytes: bytes) -> np.ndarray:
+        """将 ROS ADC 字节流转换为 radar_signal_process_final 需要的格式.
+
+        ADC 消息包含 ctrx0 + ctrx1 原始 int16 数据拼接:
+          - 每半集: 4 RF × Ns samples × 2 I/Q × Nc chirps (Fortran order)
+          - I/Q 分离 → 8 虚拟通道/CTRX
+          - 两片 CTRX → 16 通道
+
+        与 readRawBinCasc 的解析逻辑一致, 但数据源来自 ROS 消息而非文件.
+
+        Returns:
+            np.ndarray: 形状 (n_chirps, n_rx, n_samples) = (512, 16, 2048), dtype float64
+        """
+        data = np.frombuffer(adc_bytes, dtype=np.int16)
+        half_elems = len(data) // 2
+
+        Ns = self.cfg.n_samples   # 2048
+        Nc = self.cfg.n_chirps    # 512
+
+        raw_channels = []
+        for half_idx in range(2):
+            ctrx_data = data[half_idx * half_elems : (half_idx + 1) * half_elems]
+            # reshape (4, Ns, 2, Nc) Fortran order — 与 MATLAB reshape(data, [4,Ns,2,Nc]) 一致
+            ctrx_tmp = ctrx_data.reshape((4, Ns, 2, Nc), order='F')  # (4, Ns, 2, Nc)
+            I_comp = ctrx_tmp[:, :, 0, :].copy()  # (4, Ns, Nc) — I 分量 → ch0~3
+            Q_comp = ctrx_tmp[:, :, 1, :].copy()  # (4, Ns, Nc) — Q 分量 → ch4~7
+            ch = np.concatenate([I_comp, Q_comp], axis=0)  # (8, Ns, Nc)
+            raw_channels.append(ch)
+
+        # 合并 → (16, Ns, Nc) → transpose → (Nc, 16, Ns)
+        raw = np.concatenate(raw_channels, axis=0)  # (16, 2048, 512)
+        raw = np.transpose(raw, (2, 0, 1))           # (512, 16, 2048)
+        return raw.astype(np.float64, copy=False)
+
+    # ------------------------------------------------------------------
     # 处理回调
     # ------------------------------------------------------------------
 
@@ -167,54 +233,199 @@ class RspCudaNode(Node):
         adc_stamp = self._latest_adc.header.stamp
         adc_bytes = self._latest_adc.data
 
-        # ---- 核心 RSP 处理 ----
+        # ---- 核心 RSP 处理: 完整流水线 (与 rsp_mil_python 一致) ----
         try:
-            det_points = self._processor.process(adc_bytes)
+            # 1. ADC 字节 → (512, 16, 2048) 原始数据
+            raw_data = self.raw_data
+            # raw_data = self._adc_bytes_to_raw_data(adc_bytes)
+
+            # 2. 预处理 + Range-FFT
+            cube, dc_est, _ = radar_signal_process_final(
+                raw_data, self.cfg.n_samples, self.cfg.n_rx,
+                self.cfg.n_chirps, self.cfg.threshold_scale)
+
+            # 3. Doppler-FFT + 非相干积累
+            rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci = \
+                doppler_processing_gpu(
+                    cube, self.cfg.n_rx, self.cfg.n_chirps, cube.shape[2],
+                    self.cfg.tx_ddma_idx, self.cfg.n_subbands, self.cfg.noise_est_ratio)
+
+            # 4. 峰值检测
+            peaks = peak_search_gpu(
+                rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise_est,
+                self.cfg.tx_ddma_idx, cube.shape[2], self.cfg.n_chirps, self.cfg.n_subbands,
+                self.cfg.ps_scale, self.cfg.max_peaks_per_rb, self.cfg.max_total_peaks)
+
+            # 5. DOA 估计 + 点云生成
+            range_res = self.cfg.range_resolution
+            doppler_res = self.cfg.doppler_resolution
+            ambgt = self.cfg.ambgt
+            doa_threshold_db = 28.0
+
+            det_points = []
+            for peak in peaks:
+                rb = peak['rb']
+                db = peak['db']
+                channel_data = peak['channel']  # (256,) complex numpy from GPU
+
+                # channel_data 是 numpy (CPU), doa_proc.py 需要 torch tensor on GPU
+                channel_tensor = torch.from_numpy(channel_data).to(torch.device('cuda'))
+                azi_results, ele_results = doa_main_ultra_separated(
+                    channel_tensor,
+                    self.array_env.Array_Azi_gpu, self.array_env.AziIdx_Select_gpu,
+                    self.array_env.Array_Ele_gpu, self.array_env.EleIdx_Select_gpu,
+                    doa_threshold_db)
+
+                if len(azi_results) == 0 or len(ele_results) == 0:
+                    continue
+
+                rng = rb * range_res
+                vel = db * doppler_res
+                pow_linear = peak['pow_vch']
+                snr_db_val = (10.0 * np.log10(pow_linear / peak['noise'])
+                              if peak['noise'] > 0 else 0.0)
+                rcs_db_val = 10.0 * np.log10(pow_linear)
+
+                # 筛选有效目标 (flag==1), 按能量降序
+                valid_azi = [t for t in azi_results if t[0] == 1]
+                valid_ele = [t for t in ele_results if t[0] == 1]
+                valid_azi.sort(key=lambda t: t[2], reverse=True)
+                valid_ele.sort(key=lambda t: t[2], reverse=True)
+
+                if len(valid_azi) == 2 and len(valid_ele) == 2:
+                    pairs = [(valid_azi[0], valid_ele[0]),
+                             (valid_azi[1], valid_ele[1])]
+                else:
+                    pairs = [(a, e) for a in valid_azi for e in valid_ele]
+
+                for a_target, e_target in pairs:
+                    azi_deg = a_target[4]
+                    azi_rad = np.deg2rad(azi_deg)
+                    ele_deg = e_target[4]
+                    ele_rad = np.deg2rad(ele_deg)
+
+                    x = rng * np.cos(ele_rad) * np.cos(azi_rad)
+                    y = rng * np.cos(ele_rad) * np.sin(azi_rad)
+                    z = rng * np.sin(ele_rad)
+
+                    point = {
+                        'x': x, 'y': y, 'z': z,
+                        'range': rng,
+                        'azimuth': azi_rad,
+                        'elevation': ele_rad,
+                        'rcs': rcs_db_val,
+                        'snr': snr_db_val,
+                        'ambgt': ambgt,
+                        'exist_prob': 100,
+                        'multi_tgt_prob': 100,
+                        'ambgt_prob': 100,
+                        'raw_doppler': vel,
+                        'idx': 128 if vel != 0 else 0,
+                        'rd_cell_idx': 0,
+                        'range_idx': rb,
+                        'peak_val': int(np.clip(pow_linear, 0, 65535)),
+                        'vel_amb_fac': 0,
+                        'det_ambig_state': 0,
+                        'det_motion_pat': 0,
+                    }
+                    det_points.append(point)
+
         except Exception as e:
             self.get_logger().error(f'RSP 处理异常: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             return
 
         t_proc = (time.perf_counter() - t0) * 1000.0
 
-        # ---- 构造 DetList ----
+        # ---- 构造 DetList (v2 41 字段) ----
         det_list = DetList()
-        det_list.header.stamp = adc_stamp
+        det_list.header.stamp = adc_stamp          # 1. u32TimeStamp: 透传 ADC 原始时间戳（微秒）
         det_list.header.frame_id = self.fixed_frame
+        det_list.frame_id = self.frame_count        # 2. u16FrameID: 雷达帧序号
 
         for dp in det_points:
             pt = DetPoint()
-            pt.x             = dp['x']
-            pt.y             = dp['y']
-            pt.z             = dp['z']
-            pt.range         = dp['range']
-            pt.azimuth       = dp['azimuth']
-            pt.elevation     = dp['elevation']
-            pt.rcs           = dp['rcs']
-            pt.snr           = dp['snr']
-            pt.ambgt         = dp['ambgt']
-            pt.exist_prob    = dp['exist_prob']
-            pt.multi_tgt_prob = dp['multi_tgt_prob']
-            pt.ambgt_prob    = dp['ambgt_prob']
-            pt.raw_doppler   = dp['raw_doppler']
-            pt.idx           = dp['idx']
+
+            # -- 空间位置（车辆坐标系） --
+            pt.x            = float(dp['x'])              # 4.  f32XPos
+            pt.y            = float(dp['y'])              # 5.  f32YPos
+            pt.z            = float(dp['z'])              # 6.  f32ZPos
+
+            # -- 雷达原视测量（雷达传感器坐标系） --
+            pt.rad_vel_abs  = float(dp['raw_doppler'])    # 7.  f32RadVelAbs  绝对径向速度
+            pt.range        = float(dp['range'])          # 8.  f32Range
+            pt.speed        = float(abs(dp['raw_doppler']))# 9.  f32Speed     合速度
+            pt.azimuth_ang  = float(dp['azimuth'])        # 10. f32AzimuthAng
+            pt.ele_ang      = float(dp['elevation'])      # 11. f32EleAng
+
+            # -- 信号特征 --
+            pt.snr_db       = float(dp['snr'])            # 12. f32SNRdB
+            pt.rcs_db       = float(dp['rcs'])            # 13. f32RcsdB
+            pt.power_db     = float(dp['snr'] - 10.0)     # 14. f32PowerdB  回波功率 (SNR 近似换算)
+
+            # -- 检测标志位 --
+            pt.strategy_flag     = 0               # 15. u32StrategyFlag
+            pt.obj_same_rv       = 0               # 16. u32ObjSameRV
+            pt.obj_quality       = 0               # 17. u32ObjQuality
+            pt.obj_track_flag    = 0               # 18. u32ObjTrackFlag
+            pt.ele_confident     = 0               # 19. u32EleConfident
+            pt.predict_det_flag  = 0               # 20. u32PredictDetflag
+
+            # -- DOA 与角度关联 --
+            pt.doa_method          = 0             # 25. u32DOAMethod
+            pt.asso_angle_filter_id = 0            # 26. u32AssoAngleFilterId
+
+            # -- RD 索引 --
+            pt.rd_cell_idx   = int(dp.get('rd_cell_idx', 0))   # 27. u16RdCellIdx
+            pt.range_idx     = int(dp.get('range_idx', 0))     # 28. u16RangeIdx
+            pt.doppler_idx   = int(dp['idx'])                  # 29. u16DopplerIdx
+            pt.azimuth_idx   = 0                               # 30. u8AzimuthIdx
+            pt.elevation_idx = 0                               # 31. u8ElevationIdx
+
+            # -- 峰值与 SNR --
+            pt.peak_val         = int(dp.get('peak_val', 0))   # 32. u16PeakVal
+            pt.sin_azim_snr_lin = 0                            # 33. u16SinAzimSNRLin
+            pt.sin_elev_snr_lin = 0                            # 34. u16SinElevSNRLin
+
+            # -- 速度解模糊 --
+            pt.vel_amb_fac = int(dp.get('vel_amb_fac', 0))     # 35. s8VelAmbFac
+
+            # -- 枚举状态 --
+            pt.det_ambig_state = int(dp.get('det_ambig_state', 0))  # 36. eDetAmbigState
+            pt.det_motion_pat  = int(dp.get('det_motion_pat', 0))   # 37. eDetMotionPat
+
+            # -- 置信度与帧间标志 --
+            pt.det_conf         = int(dp['exist_prob'])        # 38. u8DetConf
+            pt.inter_frame_flag = 0                            # 39. u8InterFrameFlag
+            pt.asso_trk_num     = 0                            # 40. u8AssoTrkNum
+            pt.chanl_phase_max  = 0                            # 41. u8ChanlPhaseMax
+
             det_list.points.append(pt)
+
+        # 3. u16DetObjNum: 当前帧检测到的目标总点数
+        det_list.det_obj_num = len(det_list.points)
+
+        # ---- 应用过滤规则（v2 字段名） ----
+        filtered, _ = filter_det_points(det_list.points)
+        det_list.points = filtered
+        det_list.det_obj_num = len(filtered)        # 更新为过滤后的目标数
 
         self.pub_det.publish(det_list)
 
         # ---- 定期日志 ----
         if self.frame_count % 10 == 0:
-            range_str = ''
             if det_points:
                 ranges = [p['range'] for p in det_points]
-                range_str = (f'最近={min(ranges):.1f}m, 最远={max(ranges):.1f}m, '
-                             f'中位={np_median(ranges):.1f}m')
+                range_str = (f'最近={min(ranges):.1f}m, '
+                             f'最远={max(ranges):.1f}m, '
+                             f'中位={_median(ranges):.1f}m')
             else:
                 range_str = '无检测点'
 
             self.get_logger().info(
                 f'[RSP-CUDA] 帧 #{self.frame_count}: '
-                f'{len(det_points)} 检测点, '
-                f'{range_str}, '
+                f'{len(det_points)} 检测点, {range_str}, '
                 f'处理耗时={t_proc:.1f}ms')
 
     # ------------------------------------------------------------------
@@ -230,8 +441,8 @@ class RspCudaNode(Node):
 # 辅助函数
 # ============================================================================
 
-def np_median(arr):
-    """计算列表的中位数 (避免导入 numpy 仅为此用途)。"""
+def _median(arr):
+    """中位数 (无 numpy 依赖)。"""
     if not arr:
         return 0.0
     s = sorted(arr)

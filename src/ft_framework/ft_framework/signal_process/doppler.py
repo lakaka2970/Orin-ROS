@@ -39,8 +39,14 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
     # radarcube: (rx, chirp, range) -> 乘窗后 FFT
     rd_cube = torch.fft.fft(radarcube * win_doppler, dim=1)   # (rx, chirp, range)
 
-    # ----- 2. RX 非相干积累（功率求和）-----
-    rx_nci = torch.sum(torch.abs(rd_cube).pow(2), dim=0)       # (chirp, range)
+    # ----- 2. RX 非相干积累：rx 0-7 正常, rx 8-15 偏移累加 -----
+    n_rx_half = n_rx // 2
+    rx_nci = torch.sum(torch.abs(rd_cube[:n_rx_half]), dim=0)           # (chirp, range)
+    rd_shifted = torch.abs(rd_cube[n_rx_half:])                         # (8, chirps, range)
+    rd_shifted = torch.roll(rd_shifted, shifts=-4, dims=1)              # doppler+4
+    rd_shifted = torch.roll(rd_shifted, shifts=-1, dims=2)              # range+1
+    rd_shifted[:, :, -1] = 0.0                                          # 防 range 溢出
+    rx_nci += torch.sum(rd_shifted, dim=0)
     # 转换为对数域（近似 dB，系数 4096 为经验缩放）
     rx_nci = 4096.0 * torch.log2(rx_nci + 1e-12)
 
@@ -49,13 +55,23 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
     noise_est = torch.quantile(rx_nci, q, dim=0).to(torch.float32)   # (range,)
 
     # ----- 4. VCH 非相干积累（DDMA 解调）-----
-    tx_ddma = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)  # (n_tx,)
-    doppler_indices = torch.arange(n_chirps, dtype=torch.int64, device=DEVICE)[None, :]  # (1, chirp)
-    # 每个发射天线对应的多普勒频移索引（循环移位）
-    db_idx = (doppler_indices + tx_ddma[:, None] * (n_chirps // n_subbands)) % n_chirps   # (n_tx, n_chirps)
+    tx_ddma = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)
+    n_tx = tx_ddma.shape[0]
+    n_tx_half = n_tx // 2
+    doppler_indices = torch.arange(n_chirps, dtype=torch.int64, device=DEVICE)[None, :]
+    doppler_step = n_chirps // n_subbands
 
-    # 按发射天线求和，然后转置为 (range, chirp) 便于后续子带处理
-    vch_nci = torch.sum(rx_nci[db_idx, :], dim=0).t().contiguous()    # (range, chirp)
+    # 前一半 tx: 正常多普勒索引
+    db_idx_first = (doppler_indices + tx_ddma[:n_tx_half, None] * doppler_step) % n_chirps
+    vch_first = rx_nci[db_idx_first, :]                                    # (n_tx_half, chirp, range)
+
+    # 后一半 tx: doppler+4, range+1
+    db_idx_second = (doppler_indices + 4 + tx_ddma[n_tx_half:, None] * doppler_step) % n_chirps
+    vch_second = rx_nci[db_idx_second, :]                                  # (n_tx_half, chirp, range)
+    vch_second = torch.roll(vch_second, shifts=-1, dims=2)                 # range+1
+    vch_second[:, :, -1] = 0.0                                             # 防 range 溢出
+
+    vch_nci = (torch.sum(vch_first, dim=0) + torch.sum(vch_second, dim=0)).t().contiguous()
 
     # ----- 5. 子带最大值提取（避免 view 导致的不连续内存错误）-----
     subband_step = n_chirps // n_subbands

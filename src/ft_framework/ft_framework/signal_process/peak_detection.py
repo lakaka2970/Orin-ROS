@@ -4,6 +4,8 @@ TopK 截断，同时提取对应通道的复数据用于 DOA 估计。
 """
 
 import torch
+import numpy as np
+from calibration import apply_calibration
 
 DEVICE = torch.device('cuda')
 
@@ -12,7 +14,8 @@ DEVICE = torch.device('cuda')
 def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
                     tx_ddma_idx, n_range_bins, n_doppler, n_subbands,
                     ps_scale=25.0, max_peaks_per_rb=12, max_total_peaks=1024,
-                    frame_timestamp_us=0, frame_id=0, idle_time_idx=0):
+                    frame_timestamp_us=0, frame_id=0, idle_time_idx=0,
+                    do_calibrate=True):
     """
     全向量化 GPU 峰值检测与筛选。
 
@@ -82,9 +85,21 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
 
     n_tx = 16
     n_rx = 16
+    n_tx_half = n_tx // 2
+    n_rx_half = n_rx // 2
     tx_idx = torch.arange(n_tx, device=DEVICE).view(-1, 1).expand(n_tx, n_rx)   # (16,16)
     rx_idx = torch.arange(n_rx, device=DEVICE).view(1, -1).expand(n_tx, n_rx)   # (16,16)
     tx_ddma = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)
+
+    # 预分离 4 象限索引矩阵，避免循环内重复切片
+    #   Q1: tx 0-7, rx 0-7   | Q3: tx 0-7, rx 8-15
+    #   Q2: tx 8-15, rx 0-7  | Q4: tx 8-15, rx 8-15
+    rx_q = [rx_idx[:n_tx_half, :n_rx_half], rx_idx[n_tx_half:, :n_rx_half],
+            rx_idx[:n_tx_half, n_rx_half:], rx_idx[n_tx_half:, n_rx_half:]]
+    tx_q = [tx_idx[:n_tx_half, :n_rx_half], tx_idx[n_tx_half:, :n_rx_half],
+            tx_idx[:n_tx_half, n_rx_half:], tx_idx[n_tx_half:, n_rx_half:]]
+    db_offs = [0, 4, 4, 8]
+    rb_offs = [0, 1, 1, 2]
 
     # ----- 6. 提取每个峰值的通道数据（256 个虚拟通道）-----
     n_peaks = final_rb.shape[0]
@@ -92,13 +107,27 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     for i in range(n_peaks):
         rb = final_rb[i]
         db = final_db[i]
-        # DDMA 解调：每个发射天线对应的多普勒偏移步长（此处为 16）
-        idx_dem_dop = (db + tx_ddma[tx_idx] * 16) % n_doppler   # (16,16)
-        # rd_cube 索引: (rx, chirp, range) -> 注意此处 rd_cube 形状为 (rx, chirp, range)
-        # 使用 rx_idx 和 idx_dem_dop 索引多普勒维，rb 索引距离维
-        channel_mat = rd_cube[rx_idx, idx_dem_dop, rb]           # (16,16) 复数
-        channel_flat = channel_mat.flatten().cpu().numpy()       # (256,)
+
+        quads = []
+        for q in range(4):
+            db_q = (db + db_offs[q]) % n_doppler                       # doppler 取模防溢出
+            rb_q = rb + rb_offs[q]
+            if rb_q >= n_range_bins:                                    # range 防溢出 → 填零
+                quads.append(torch.zeros(n_tx_half, n_rx_half, dtype=torch.complex64, device=DEVICE))
+            else:
+                idx_dop_q = (db_q + tx_ddma[tx_q[q]] * 16) % n_doppler
+                quads.append(rd_cube[rx_q[q], idx_dop_q, rb_q])        # (8,8)
+
+        # 拼接: [Q1|Q3] 上, [Q2|Q4] 下 → (16,16)
+        top    = torch.cat([quads[0], quads[2]], dim=1)
+        bottom = torch.cat([quads[1], quads[3]], dim=1)
+        channel_mat = torch.cat([top, bottom], dim=0)
+        channel_flat = channel_mat.flatten().cpu().numpy()             # (256,)
         channel_list.append(channel_flat)
+
+    # 通道校准
+    if do_calibrate:
+        channel_list = [apply_calibration(ch) for ch in channel_list]
 
     # ----- 7. 组装返回字典（移至 CPU）-----
     rb_cpu = final_rb.cpu().numpy()

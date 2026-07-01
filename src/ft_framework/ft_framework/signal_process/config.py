@@ -19,15 +19,16 @@ class RadarConfig:
     # ----- 处理参数 -----
     threshold_scale = 8       # 干扰检测门限系数（相对于差分均值）
     noise_est_ratio = 50      # 噪声估计百分位数（例如 50% 中位数）
-    ps_scale = 19.0           # 峰值搜索门限缩放因子（倍乘噪声基底）
+    ps_scale = 20.0           # 峰值搜索门限缩放因子（倍乘噪声基底）
     max_peaks_per_rb = 12     # 每个距离门最多保留的峰值数
     max_total_peaks = 1024    # 全局最多保留的峰值总数
 
     # DDMA 发射天线索引（前8个master CTRX0，后8个slave CTRX1）
-    tx_ddma_idx = np.array([
+    tx_ddma_idx_config = np.array([
         0,  1,  2,  3,  4,  9, 10, 12,       # master  (phase_deg / 11.25)
         14, 16, 19, 23, 24, 27, 29, 30        # slave
     ], dtype=np.int64)
+    tx_ddma_idx = 32 - tx_ddma_idx_config
 
     # ----- 波形具体参数（需与硬件/固件一致）-----
     freq_start_hz = 77.5e9                       # 起始频率 [Hz]

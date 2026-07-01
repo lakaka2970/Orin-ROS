@@ -2,6 +2,7 @@
 峰值检测模块：在距离-多普勒谱中检测局部极值，并提取对应通道数据
 """
 import numpy as np
+from calibration import apply_calibration
 
 
 def peak_search_numpy(
@@ -19,7 +20,8 @@ def peak_search_numpy(
     max_total_peaks: int = 1024,
     frame_timestamp_us: int = 0,
     frame_id: int = 0,
-    idle_time_idx: int = 0
+    idle_time_idx: int = 0,
+    do_calibrate: bool = True
 ) -> list:
     """
     峰值检测主函数
@@ -116,14 +118,48 @@ def peak_search_numpy(
     tx_grid = np.arange(n_tx)[:, np.newaxis]       # (16,1)
     rx_grid = np.arange(n_rx)[np.newaxis, :]       # (1,16)
 
+    n_tx_half = n_tx // 2                                           # 8
+    n_rx_half = n_rx // 2                                           # 8
+
+    # 4 象限定义: (tx_slice, rx_slice, db_offset, rb_offset)
+    #   Q1: tx 0-7, rx 0-7   → 正常
+    #   Q2: tx 8-15, rx 0-7  → doppler+4, range+1
+    #   Q3: tx 0-7, rx 8-15  → doppler+4, range+1
+    #   Q4: tx 8-15, rx 8-15 → doppler+8, range+2
+    tx_slices = [slice(0, n_tx_half), slice(n_tx_half, n_tx),
+                 slice(0, n_tx_half), slice(n_tx_half, n_tx)]
+    rx_slices = [slice(0, n_rx_half), slice(0, n_rx_half),
+                 slice(n_rx_half, n_rx), slice(n_rx_half, n_rx)]
+    db_offsets = [0, 4, 4, 8]
+    rb_offsets = [0, 1, 1, 2]
+
     channel_list = []
     for i in range(len(final_rb)):
         rb = final_rb[i]
         db = final_db[i]
-        # 计算每个发射天线对应的多普勒索引（DDMA解调）
-        idx_dem_dop = (db + tx_ddma[:, np.newaxis] * 16) % n_doppler   # (16,16)
-        channel_mat = rd_cube[rx_grid, idx_dem_dop, rb]                # (16,16)
+
+        quadrants = []
+        for tx_sl, rx_sl, db_off, rb_off in zip(tx_slices, rx_slices, db_offsets, rb_offsets):
+            db_q = (db + db_off) % n_doppler                           # doppler 取模防溢出
+            rb_q = rb + rb_off
+            if rb_q >= n_range_bins:                                   # range 防溢出 → 填零
+                n_tx_q = tx_sl.stop - tx_sl.start
+                n_rx_q = rx_sl.stop - rx_sl.start
+                chan_q = np.zeros((n_tx_q, n_rx_q), dtype=np.complex64)
+            else:
+                idx_dop_q = (db_q + tx_ddma[tx_sl, np.newaxis] * 16) % n_doppler
+                chan_q = rd_cube[rx_grid[:, rx_sl], idx_dop_q, rb_q]   # (n_tx_q, n_rx_q)
+            quadrants.append(chan_q)
+
+        # 拼接: [Q1|Q3] 上, [Q2|Q4] 下 → (16,16)
+        top    = np.hstack([quadrants[0], quadrants[2]])
+        bottom = np.hstack([quadrants[1], quadrants[3]])
+        channel_mat = np.vstack([top, bottom])
         channel_list.append(channel_mat.flatten().astype(np.complex64))
+
+    # 通道校准
+    if do_calibrate:
+        channel_list = [apply_calibration(ch) for ch in channel_list]
 
     # 9. 构造返回列表（字段与 RDCell 结构体对齐）
     rdcell_list = []

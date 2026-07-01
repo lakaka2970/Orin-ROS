@@ -184,32 +184,78 @@ class RspMilPythonNode(Node):
         distances = ranges * 1.0
         dopplers = self.velocity_scale * (distances * 0.01 - ego_vx)
 
-        # ---- 构造 DetList ----
+        # ---- 构造 DetList (v2 41 字段) ----
         det_list = DetList()
-        det_list.header.stamp = adc_stamp          # 透传 ADC 原始时间戳
+        det_list.header.stamp = adc_stamp          # 1. u32TimeStamp: 透传 ADC 原始时间戳（微秒）
         det_list.header.frame_id = self.fixed_frame
+        det_list.frame_id = self.frame_count        # 2. u16FrameID: 雷达帧序号
 
         for i in valid_idx:
             det = DetPoint()
-            det.x = float(x[i])
-            det.y = float(y[i])
-            det.z = float(z[i])
-            det.range = float(ranges[i])
-            det.azimuth = float(azimuths[i])
-            det.elevation = float(elevations[i])
-            det.rcs = -20.0 + np.random.uniform(-10, 10)   # 模拟 RCS
-            det.snr = float(snrs[i])
-            det.ambgt = 21.82                                # 典型值
-            det.exist_prob = int(np.random.randint(30, 100))  # ≥30 保留
-            det.multi_tgt_prob = 100
-            det.ambgt_prob = int(np.random.randint(40, 100))  # ≥40 保留
-            det.raw_doppler = float(dopplers[i])
             det.idx = 128                                     # 有效值
+            # -- 空间位置（车辆坐标系） --
+            det.x = float(x[i])                     # 4.  f32XPos
+            det.y = float(y[i])                     # 5.  f32YPos
+            det.z = float(z[i])                     # 6.  f32ZPos
+
+            # -- 雷达原视测量 --
+            det.rad_vel_abs = float(dopplers[i])    # 7.  f32RadVelAbs  绝对径向速度
+            det.range = float(ranges[i])            # 8.  f32Range
+            det.speed = float(abs(dopplers[i]))     # 9.  f32Speed     合速度（取径向速度幅值）
+            det.azimuth_ang = float(azimuths[i])    # 10. f32AzimuthAng
+            det.ele_ang = float(elevations[i])      # 11. f32EleAng
+
+            # -- 信号特征 --
+            det.snr_db = float(snrs[i])             # 12. f32SNRdB
+            det.rcs_db = -20.0 + np.random.uniform(-10, 10)  # 13. f32RcsdB  模拟 RCS
+            det.power_db = float(snrs[i]) - 10.0    # 14. f32PowerdB 回波功率（SNR 近似换算）
+
+            # -- 检测标志位（模拟/默认值） --
+            det.strategy_flag = 0                   # 15. u32StrategyFlag
+            det.obj_same_rv = 0                     # 16. u32ObjSameRV
+            det.obj_quality = 0                     # 17. u32ObjQuality
+            det.obj_track_flag = 0                  # 18. u32ObjTrackFlag
+            det.ele_confident = 0                   # 19. u32EleConfident
+            det.predict_det_flag = 0                # 20. u32PredictDetflag
+
+            # -- DOA 与角度关联 --
+            det.doa_method = 0                      # 25. u32DOAMethod
+            det.asso_angle_filter_id = 0            # 26. u32AssoAngleFilterId
+
+            # -- RD 索引（模拟值） --
+            det.rd_cell_idx = int(128 * i)          # 27. u16RdCellIdx     RD 单元总索引
+            det.range_idx = int(ranges[i] / 0.5)    # 28. u16RangeIdx      距离维索引（0.5m 分辨率）
+            det.doppler_idx = 128                   # 29. u16DopplerIdx    多普勒速度维索引（有效值）
+            det.azimuth_idx = 0                     # 30. u8AzimuthIdx
+            det.elevation_idx = 0                   # 31. u8ElevationIdx
+
+            # -- 峰值与 SNR --
+            det.peak_val = int(np.clip(snrs[i] * 100, 0, 65535))  # 32. u16PeakVal
+            det.sin_azim_snr_lin = 0                # 33. u16SinAzimSNRLin
+            det.sin_elev_snr_lin = 0                # 34. u16SinElevSNRLin
+
+            # -- 速度解模糊 --
+            det.vel_amb_fac = 0                     # 35. s8VelAmbFac     速度解模糊因子
+
+            # -- 枚举状态 --
+            det.det_ambig_state = 0                 # 36. eDetAmbigState  目标速度模糊状态
+            det.det_motion_pat = 0                  # 37. eDetMotionPat   目标运动模式（0=静止, 1=运动）
+
+            # -- 置信度与帧间标志 --
+            det.det_conf = int(np.random.randint(30, 255))  # 38. u8DetConf     检测点基础置信度
+            det.inter_frame_flag = 0                # 39. u8InterFrameFlag
+            det.asso_trk_num = 0                    # 40. u8AssoTrkNum    关联跟踪目标数量
+            det.chanl_phase_max = 0                 # 41. u8ChanlPhaseMax 天线通道最大相位差
+
             det_list.points.append(det)
 
-        # ---- 应用 spec 6 条过滤规则 ----
+        # 3. u16DetObjNum: 当前帧检测到的目标总点数
+        det_list.det_obj_num = len(det_list.points)
+
+        # ---- 应用过滤规则（适配 v2 字段名） ----
         filtered, fstats = filter_det_points(det_list.points)
         det_list.points = filtered
+        det_list.det_obj_num = len(filtered)        # 更新为过滤后的目标数
 
         self.pub_det.publish(det_list)
         self.get_logger().info(

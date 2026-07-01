@@ -88,18 +88,18 @@ def filter_det_points(points: list,
             stats['height'] += 1
             continue
 
-        # 规则 3: RCS 分段过滤
+        # 规则 3: RCS 分段过滤 (v2: rcs → rcs_db)
         if p.range <= rcs_range_split:
-            if p.rcs <= rcs_near_threshold:
+            if p.rcs_db <= rcs_near_threshold:
                 stats['rcs'] += 1
                 continue
         else:
-            if p.rcs <= rcs_far_threshold:
+            if p.rcs_db <= rcs_far_threshold:
                 stats['rcs'] += 1
                 continue
 
-        # 规则 4: 存在概率
-        if p.exist_prob < exist_prob_min:
+        # 规则 4: 存在概率 (v2: exist_prob → det_conf)
+        if p.det_conf < exist_prob_min:
             stats['exist_prob'] += 1
             continue
 
@@ -108,8 +108,9 @@ def filter_det_points(points: list,
             stats['sna'] += 1
             continue
 
-        # 规则 6: 模糊概率
-        if p.ambgt_prob < ambgt_prob_min:
+        # 规则 6: 模糊概率 (v2: ambgt_prob → det_ambig_state)
+        # det_ambig_state: 0=无模糊, 1=轻微模糊, 2+=严重模糊 → 剔除
+        if p.det_ambig_state >= ambgt_prob_min:
             stats['ambgt_prob'] += 1
             continue
 

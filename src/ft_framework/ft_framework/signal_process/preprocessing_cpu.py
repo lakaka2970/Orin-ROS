@@ -49,7 +49,7 @@ def radar_signal_process_final(
 
     # 4. 超过阈值的点置零
     mask = np.abs(adc_data) > threshold
-    adc_data = np.where(mask, 0, adc_data)
+    #adc_data = np.where(mask, 0, adc_data)
 
     # 5. 转换为浮点并加距离维窗
     adc_float = adc_data.astype(np.float32) * WIN_RANGE

@@ -52,7 +52,7 @@ def radar_signal_process_final(adc_data_np: np.ndarray, n_samples: int, n_rx: in
     threshold = (diff_ave * threshold_scale)[:, :, None]                # (chirp, rx, 1)
     # 超过阈值的采样点置零
     mask = adc_data > threshold
-    adc_data = torch.where(mask, ZERO_INT16, adc_data)
+    #adc_data = torch.where(mask, ZERO_INT16, adc_data)
 
     # ----- 4. 转换为浮点并加窗 -----
     adc_float = adc_data.to(torch.float32) * WIN_RANGE_GPU              # (chirp, rx, samp)

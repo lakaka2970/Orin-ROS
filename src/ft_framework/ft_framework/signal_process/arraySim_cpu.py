@@ -26,16 +26,16 @@ class RadarArrayInitializer:
     def __init__(self):
         # 发射天线坐标 [3, N_tx]
         self.tx_pos = np.array([
-            [0, 0, 0], [4, 0, 0], [8, 0, 0], [12, 0, 0], [16, 0, 0],
-            [20, 0, 0], [24, 0, 0], [28, 0, 0], [38, 0, 0], [45, 0, 0],
-            [53, 0, 0], [53, 7, 0], [53, 14, 0], [53, 27, 0], [53, 34, 0], [53, 41, 0]
+            [24, 0, 0], [28, 0, 0], [20, 0, 0], [16, 0, 0], [12, 0, 0],
+            [8, 0, 0], [4, 0, 0], [0, 0, 0], [53, 34, 0], [53, 41, 0],
+            [53, 27, 0], [53, 14, 0], [53, 7, 0], [53, 0, 0], [45, 0, 0], [38, 0, 0]
         ], dtype=np.float32).T
 
         # 接收天线坐标 [3, N_rx]
         self.rx_pos = np.array([
-            [0, 0, 0], [5, 40, 0], [10, 40, 0], [15, 40, 0], [19, 40, 0],
-            [24, 40, 0], [28, 40, 0], [33, 40, 0], [38, 40, 0], [46, 40, 0],
-            [52, 40, 0], [0, 8, 0], [0, 16, 0], [0, 24, 0], [0, 32, 0], [0, 40, 0]
+            [10, 40, 0], [5, 40, 0], [0, 40, 0], [0, 32, 0], [0, 24, 0],
+            [0, 16, 0], [0, 0, 0], [0, 8, 0], [52, 40, 0], [46, 40, 0],
+            [38, 40, 0], [33, 40, 0], [28, 40, 0], [24, 40, 0], [15, 40, 0], [19, 40, 0]
         ], dtype=np.float32).T
 
         # 合成虚拟阵列 (3, N_tx * N_rx)
@@ -45,30 +45,47 @@ class RadarArrayInitializer:
     def _separate_subarrays(self):
         """
         从虚拟阵列中分离方位子阵和俯仰子阵：
-        - 方位子阵：选取y,z坐标重复最多的点，并按x排序去重
-        - 俯仰子阵：选取x,z坐标重复最多的点，并按y排序去重
+        - 方位子阵：选取 y,z 重复最多的坐标组，Tx→Rx 顺序遍历，x 先到先得去重
+        - 俯仰子阵：选取 x,z 重复最多的坐标组，Tx→Rx 顺序遍历，y 先到先得去重
         """
         arr = self.virtual_array_np
-        # ---- 方位子阵 ----
+        n_tx = self.tx_pos.shape[1]
+        n_rx = self.rx_pos.shape[1]
+
+        # ---- 方位子阵：y=40, z=0 ----
         yz_hash = arr[1, :] * 10000.0 + arr[2, :]
-        _, counts = np.unique(yz_hash, return_counts=True)
-        best_yz = np.unique(yz_hash)[np.argmax(counts)]
-        azi_mask = (yz_hash == best_yz)
-        idx = np.where(azi_mask)[0]
-        idx = idx[np.argsort(arr[0, idx])]                     # 按x排序
-        _, uniq = np.unique(arr[0, idx], return_index=True)    # x去重
-        self.AziIdx_Select = idx[np.sort(uniq)]
+        unique_yz, counts = np.unique(yz_hash, return_counts=True)
+        best_yz = unique_yz[np.argmax(counts)]
+
+        seen_x = set()
+        azi_ch_list = []
+        for tx_idx in range(n_tx):
+            for rx_idx in range(n_rx):
+                ch = tx_idx * n_rx + rx_idx
+                if yz_hash[ch] == best_yz:
+                    x_val = arr[0, ch]
+                    if x_val not in seen_x:
+                        seen_x.add(x_val)
+                        azi_ch_list.append(ch)
+        self.AziIdx_Select = np.array(azi_ch_list, dtype=np.int64)
         self.Array_Azi = arr[:, self.AziIdx_Select]
 
-        # ---- 俯仰子阵 ----
+        # ---- 俯仰子阵：x=53, z=0 ----
         xz_hash = arr[0, :] * 10000.0 + arr[2, :]
-        _, counts_ele = np.unique(xz_hash, return_counts=True)
-        best_xz = np.unique(xz_hash)[np.argmax(counts_ele)]
-        ele_mask = (xz_hash == best_xz)
-        idx_ele = np.where(ele_mask)[0]
-        idx_ele = idx_ele[np.argsort(arr[1, idx_ele])]         # 按y排序
-        _, uniq_ele = np.unique(arr[1, idx_ele], return_index=True)
-        self.EleIdx_Select = idx_ele[np.sort(uniq_ele)]
+        unique_xz, counts_ele = np.unique(xz_hash, return_counts=True)
+        best_xz = unique_xz[np.argmax(counts_ele)]
+
+        seen_y = set()
+        elv_ch_list = []
+        for tx_idx in range(n_tx):
+            for rx_idx in range(n_rx):
+                ch = tx_idx * n_rx + rx_idx
+                if xz_hash[ch] == best_xz:
+                    y_val = arr[1, ch]
+                    if y_val not in seen_y:
+                        seen_y.add(y_val)
+                        elv_ch_list.append(ch)
+        self.EleIdx_Select = np.array(elv_ch_list, dtype=np.int64)
         self.Array_Ele = arr[:, self.EleIdx_Select]
 
 

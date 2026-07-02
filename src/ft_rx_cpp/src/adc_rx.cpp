@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -99,23 +100,31 @@ public:
   bool fill_message(AdcRawData &msg)
   {
     if (v4l2_fd_ < 0) {
-      // 设备未连接: 尝试重新打开
-      open_device();
-      msg.data.clear();
-    } else {
-      uint8_t *buf = nullptr;
-      size_t   bytes_used = 0;
-
-      // Blocking DQBUF: waits until hardware has a frame ready
-      if (dequeue_buffer(buf, bytes_used)) {
-        msg.data.assign(buf, buf + bytes_used);
-        enqueue_buffer(v4l2_buf_index_);
-        prof_.checkpoint("v4l2_dequeue");
-      } else {
-        // Device error (e.g. disconnected) — publish empty frame
-        msg.data.clear();
+      // 设备未连接: 每隔 N 帧尝试重连, 避免忙等
+      if (++reconnect_counter_ >= RECONNECT_INTERVAL) {
+        reconnect_counter_ = 0;
+        open_device();
+        if (v4l2_fd_ >= 0)
+          RCLCPP_INFO(get_logger(), "V4L2 重连成功");
       }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return false;  // 无数据 — 不发布, 避免下游收到空帧
     }
+
+    uint8_t *buf = nullptr;
+    size_t   bytes_used = 0;
+
+    // Blocking DQBUF: waits until hardware has a frame ready
+    if (!dequeue_buffer(buf, bytes_used)) {
+      // Device error (e.g. disconnected) — 清理并等待下次重连
+      stop_streaming();
+      close_device();
+      return false;
+    }
+
+    msg.data.assign(buf, buf + bytes_used);
+    enqueue_buffer(v4l2_buf_index_);
+    prof_.checkpoint("v4l2_dequeue");
 
     // V4L2 帧: width=8192(4RX×2048samples 逐像素交错), height=1024 chirps
     // AdcRawData 约定: num_rows=总chirp数, num_chirps_per_row=RX数, num_samples_per_chirp=每RX采样数
@@ -379,6 +388,10 @@ private:
   bool      streaming_        = false;
   uint32_t  v4l2_buf_index_   = 0;
   std::vector<V4l2Buffer> v4l2_bufs_;
+
+  // ── 重连机制 ──
+  static constexpr int RECONNECT_INTERVAL = 90;  // 每 N 帧尝试重连 (~3s @ 30fps)
+  int reconnect_counter_ = 0;
 
   // ── TF 广播器 ──
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_bc_;

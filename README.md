@@ -42,14 +42,27 @@ ls -la /dev/camera_capture /dev/radar_ctrx0 /dev/radar_ctrx1
 
 ### 启动雷达硬件
 
+已集成到 `scripts/build.sh` 和 `scripts/start.sh`，无需手动执行:
+
+```bash
+# 硬件初始化已集成至构建脚本 (默认自动执行)
+bash scripts/build.sh                    # 含 sudo python3 init_jetson.py
+bash scripts/build.sh --skip-init-hw     # 跳过硬件初始化 (已初始化时使用)
+
+# 雷达数据采集已集成至启动脚本 (开发管线)
+bash scripts/start.sh --capture-only --rsps    # 采集 + RSPS 离线点云可视化
+```
+
+**原始手动流程** (仍可用于独立调试):
+
 ```bash
 # 1. 启动雷达解串板 (加载 GMSL 驱动 + 配置 MAX929x)
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl
-sudo python init_jetson.py
+sudo python3 init_jetson.py
 cd src/demo_app/boards/carkit_88c0/example/bin
 sudo ./carkit88c0_gmsl_example
 
-# 2. 采集雷达数据 (生成 data/ctrx0_raw.bin 和 data/ctrx1_raw.bin)
+# 2. 采集雷达数据 (生成 output/ctrx0_raw.bin 和 output/ctrx1_raw.bin)
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts
 bash capture_video0_2048x1024.sh
 ```
@@ -105,11 +118,15 @@ bash scripts/install_deps.sh --with-ros2 --with-cyclonedds
 echo "source ~/Orin-ROS/scripts/env.sh" >> ~/.bashrc
 source ~/.bashrc
 
-# 1. 构建 (消息包 + Python 节点 + C++ rx 节点)
+# 1. 构建 (含 Jetson 硬件初始化: Pinmux + GMSL 驱动 + 雷达驱动)
 bash scripts/build.sh
+#    可选: bash scripts/build.sh --skip-init-hw   # 跳过硬件初始化
 
-# 2. 一键启动
-bash scripts/start.sh python
+# 2. 一键启动 (生产管线: adc_rx → ROS2 topics → RSP → det_list)
+bash scripts/start.sh
+
+# 2b. (可选) 开发管线: 采集雷达原始数据 + RSPS 离线点云可视化
+bash scripts/start.sh --capture-only --rsps
 ```
 
 > 完成步骤 0b 后，每次开新终端自动完成环境加载，不再需要手动 `source`。
@@ -127,11 +144,17 @@ bash scripts/start.sh python
 ### 启动选项
 
 ```bash
+# ── 生产管线 (ROS2 框架) ──
 bash scripts/start.sh                   # 默认 cuda + C++ rx
 bash scripts/start.sh python            # Python RSP + C++ rx
 bash scripts/start.sh cuda --rviz       # CUDA + RViz
 bash scripts/start.sh both_compare      # 双路对比
 bash scripts/start.sh python --py-rx    # Python RSP + Python rx (回退)
+
+# ── 开发管线 (离线调试, 与 ROS 框架互斥 — 共享 /dev/video0) ──
+bash scripts/start.sh --capture-only           # 仅采集雷达原始数据 (v4l2-ctl)
+bash scripts/start.sh --capture-only --rsps    # 采集 + RSPS 离线点云可视化
+bash scripts/start.sh --capture --rsps         # 采集 + RSPS → 自动启动 ROS 框架
 ```
 
 ### 验证运行状态
@@ -429,8 +452,8 @@ Orin-ROS/
 ├── scripts/
 │   ├── env.sh                      # 环境加载 (自动 CycloneDDS)
 │   ├── install_deps.sh             # 依赖安装 (含 CycloneDDS)
-│   ├── build.sh                    # 一键构建 (3 个包)
-│   ├── start.sh                    # 一键启动 (推荐入口)
+│   ├── build.sh                    # 一键构建 (3 个包 + Jetson 硬件初始化)
+│   ├── start.sh                    # 一键启动 (生产管线 + 开发管线)
 │   ├── launch_all.sh               # 兼容入口 → start.sh
 │   └── 99-ft-sensors.rules        # udev 设备持久化命名规则
 ├── src/

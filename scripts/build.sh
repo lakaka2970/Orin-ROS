@@ -7,10 +7,11 @@
 #   Ubuntu 22.04 → Humble (/opt/ros/humble/setup.bash)
 #
 # 用法:
-#   bash scripts/build.sh                          # 增量构建
+#   bash scripts/build.sh                          # 增量构建 (含 Jetson 硬件初始化)
 #   bash scripts/build.sh --clean                  # 清理后重新构建
 #   bash scripts/build.sh --launch                 # 构建后直接启动
 #   bash scripts/build.sh --clean --launch         # 清理→构建→启动
+#   bash scripts/build.sh --skip-init-hw           # 跳过硬件初始化 (已初始化时使用)
 #
 # 作者: zhengyuan.liu
 # 日期: 2026.6.10
@@ -25,11 +26,13 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # ===== 解析参数 =====
 DO_CLEAN=false
 DO_LAUNCH=false
+SKIP_INIT_HW=false
 
 for arg in "$@"; do
     case "$arg" in
         --clean) DO_CLEAN=true ;;
         --launch) DO_LAUNCH=true ;;
+        --skip-init-hw) SKIP_INIT_HW=true ;;
     esac
 done
 
@@ -67,7 +70,7 @@ echo "=============================================="
 # ===== 步骤 1: 加载 ROS2 环境 =====
 if [ -f "$ROS2_SETUP" ]; then
     source "$ROS2_SETUP"
-    echo "[1/5] [OK] ROS2 $ROS2_DISTRO 环境已加载"
+    echo "[1/6] [OK] ROS2 $ROS2_DISTRO 环境已加载"
 else
     echo "[ERROR] 未找到 $ROS2_SETUP"
     exit 1
@@ -75,18 +78,35 @@ fi
 
 cd "$PROJECT_ROOT"
 
-# ===== 步骤 2: 可选清理 =====
-if $DO_CLEAN; then
-    echo "[2/5] [CLEAN] 清理旧的构建产物..."
-    rm -rf build/ install/ log/
-    echo "[2/5] [OK] 清理完成"
+# ===== 步骤 2: Jetson 硬件初始化 (GMSL 驱动加载) =====
+INIT_HW_SCRIPT="$PROJECT_ROOT/src/integration-carkit88c0-gmsl/init_jetson.py"
+
+if $SKIP_INIT_HW; then
+    echo "[2/6] [SKIP]  跳过 Jetson 硬件初始化"
 else
-    echo "[2/5] [SKIP]  跳过清理（增量构建）"
+    echo "[2/6] [HW]   初始化 Jetson 硬件 (Pinmux + GMSL 驱动 + 雷达驱动)..."
+    if [ -f "$INIT_HW_SCRIPT" ]; then
+        sudo python3 "$INIT_HW_SCRIPT"
+        if [ $? -eq 0 ]; then
+            echo "[2/6] [OK]   硬件初始化完成"
+        else
+            echo "[2/6] [WARN] 硬件初始化返回非零退出码, 继续构建..."
+        fi
+    else
+        echo "[2/6] [WARN] 未找到 $INIT_HW_SCRIPT , 跳过硬件初始化"
+    fi
+fi
+if $DO_CLEAN; then
+    echo "[3/6] [CLEAN] 清理旧的构建产物..."
+    rm -rf build/ install/ log/
+    echo "[3/6] [OK] 清理完成"
+else
+    echo "[3/6] [SKIP]  跳过清理（增量构建）"
 fi
 
-# ===== 步骤 3: 构建 =====
+# ===== 步骤 4: 构建 =====
 # 先构建消息包，加载后构建节点包
-echo "[3/5] [BUILD] 构建 ft_radar_msgs (自定义消息)..."
+echo "[4/6] [BUILD] 构建 ft_radar_msgs (自定义消息)..."
 colcon build --packages-select ft_radar_msgs --symlink-install \
     --cmake-force-configure \
     --allow-overriding ft_radar_msgs \
@@ -104,7 +124,7 @@ if ! source "$PROJECT_ROOT/install/setup.bash" 2>/dev/null; then
     echo "[WARN] 无法加载 install/setup.bash, 后续包可能找不到 ft_radar_msgs"
 fi
 
-echo "[4/5] [BUILD] 构建 ft_framework (10 个节点)..."
+echo "[5/6] [BUILD] 构建 ft_framework (10 个节点)..."
 colcon build --packages-select ft_framework --symlink-install \
     2>&1 | grep -v "WARNING.*doesn't exist\|WARNING.*colcon"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
@@ -113,7 +133,7 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
     exit 1
 fi
 
-echo "[5/5] [BUILD] 构建 ft_rx_cpp (C++ rx 节点)..."
+echo "[6/6] [BUILD] 构建 ft_rx_cpp (C++ rx 节点)..."
 colcon build --packages-select ft_rx_cpp --symlink-install \
     2>&1 | grep -v "WARNING.*doesn't exist\|WARNING.*colcon"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then

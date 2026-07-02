@@ -10,10 +10,20 @@
 #   bash scripts/start.sh cuda            # CUDA RSP 模式
 #   bash scripts/start.sh both_compare    # 双路对比模式
 #
+#   开发管线 (调试/验证雷达硬件, 与 ROS 采集互斥 — 共享 /dev/video0):
+#   bash scripts/start.sh --capture-only           # 仅采集雷达原始数据
+#   bash scripts/start.sh --capture-only --rsps    # 采集 + RSPS 离线点云可视化
+#   bash scripts/start.sh --capture --rsps         # 采集 + RSPS → 自动启动 ROS 框架
+#
 # 可选参数 (任意顺序):
-#   --analog   使用模拟 ADC 数据源 (噪声池/.bin), 默认 real (硬件设备)
-#   --py-rx    使用 Python 版 rx 节点 (默认 C++)
-#   --rviz     同时启动 RViz2
+#   --analog       使用模拟 ADC 数据源 (噪声池/.bin), 默认 real (硬件设备)
+#   --py-rx        使用 Python 版 rx 节点 (默认 C++)
+#   --rviz         同时启动 RViz2
+#
+#   开发管线 (调试/验证雷达硬件, 与 ROS 框架互斥 — 共享 /dev/video0):
+#   --capture      启动 ROS 框架前先采集雷达原始数据 + 可选 RSPS 处理
+#   --capture-only 仅采集雷达数据 + 可选 RSPS 处理 (不启动 ROS 框架)
+#   --rsps         采集后运行 RSPS 点云可视化处理 (需配合 --capture 或 --capture-only)
 #
 # 作者: zhengyuan.liu
 # 日期: 2026-06-18
@@ -28,6 +38,9 @@ RSP_MODE="cuda"
 USE_PY_RX=false
 USE_RVIZ=false
 ADC_SOURCE="real"
+DO_CAPTURE=false
+DO_RSPS=false
+CAPTURE_ONLY=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -35,6 +48,9 @@ for arg in "$@"; do
         --analog) ADC_SOURCE="analog" ;;
         --py-rx)  USE_PY_RX=true ;;
         --rviz)   USE_RVIZ=true ;;
+        --capture) DO_CAPTURE=true ;;
+        --capture-only) DO_CAPTURE=true; CAPTURE_ONLY=true ;;
+        --rsps)   DO_RSPS=true ;;
         *)        echo "未知参数: $arg"; exit 1 ;;
     esac
 done
@@ -88,7 +104,89 @@ _ft_kill_stale() {
 }
 _ft_kill_stale
 
-# ── 5. 启动 ──
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.6 开发管线: 雷达原始数据采集 + RSPS 离线点云处理 (可选)
+#
+# 与 ROS 生产管线互斥 — 都需独占 /dev/video0 (/dev/radar_ctrx0)。
+# 采集在 ROS 框架启动前完成 (20 帧 × 2 设备 ≈ 2-3 秒)。
+# ══════════════════════════════════════════════════════════════════════════════
+CAPTURE_SCRIPT="$PROJECT_ROOT/src/integration-carkit88c0-gmsl/scripts/capture_video0_2048x1024.sh"
+CAPTURE_DIR="$PROJECT_ROOT/src/integration-carkit88c0-gmsl/scripts"
+RSPS_SCRIPT="$CAPTURE_DIR/RSPS/RSPS_main.py"
+RSPS_OUTPUT_DIR="$CAPTURE_DIR/output/rsps_plots"
+
+if $DO_CAPTURE; then
+    echo "=============================================="
+    echo "  [开发管线] 雷达原始数据采集 (v4l2-ctl)"
+    echo "  设备: /dev/radar_ctrx0 + /dev/radar_ctrx1"
+    echo "  输出: $CAPTURE_DIR/output/"
+    echo "=============================================="
+
+    if [ -f "$CAPTURE_SCRIPT" ]; then
+        echo "[ft] 启动雷达数据采集..."
+        cd "$CAPTURE_DIR"
+        set +e
+        bash "$CAPTURE_SCRIPT"
+        CAPTURE_EXIT=$?
+        set -e
+        if [ $CAPTURE_EXIT -eq 0 ]; then
+            echo "[ft] [OK] 雷达数据采集完成"
+            echo "[ft]   ctrx0_raw.bin → $CAPTURE_DIR/output/"
+            echo "[ft]   ctrx1_raw.bin → $CAPTURE_DIR/output/"
+        else
+            echo "[ft] [WARN] 雷达数据采集异常"
+        fi
+        cd "$PROJECT_ROOT"
+    else
+        echo "[ft] [WARN] 采集脚本不存在: $CAPTURE_SCRIPT"
+    fi
+
+    # ── 4.7 RSPS 离线点云可视化 (可选) ──
+    if $DO_RSPS; then
+        echo ""
+        echo "=============================================="
+        echo "  [开发管线] RSPS 雷达点云离线处理"
+        echo "  输入: $CAPTURE_DIR/output/ctrx0_raw.bin"
+        echo "=============================================="
+
+        if [ -f "$RSPS_SCRIPT" ]; then
+            echo "[ft] 运行 RSPS 点云处理 (Range/Doppler FFT + CFAR + DOA)..."
+            cd "$CAPTURE_DIR"
+            # 使用 Agg 后端避免无显示器报错
+            set +e
+            MPLBACKEND=Agg python3 "$RSPS_SCRIPT" \
+                --save --save-dir "$RSPS_OUTPUT_DIR"
+            RSPS_EXIT=$?
+            set -e
+            if [ $RSPS_EXIT -eq 0 ]; then
+                echo "[ft] [OK] RSPS 点云处理完成"
+                echo "[ft]   可视化输出: $RSPS_OUTPUT_DIR/"
+                if [ -d "$RSPS_OUTPUT_DIR" ]; then
+                    ls -lh "$RSPS_OUTPUT_DIR/" 2>/dev/null
+                fi
+            else
+                echo "[ft] [WARN] RSPS 点云处理异常"
+            fi
+            cd "$PROJECT_ROOT"
+        else
+            echo "[ft] [WARN] RSPS_main.py 不存在: $RSPS_SCRIPT"
+        fi
+    fi
+
+    echo ""
+
+    # --capture-only: 仅开发管线, 不启动 ROS 框架
+    if $CAPTURE_ONLY; then
+        echo "[ft] [开发管线] 采集完成, 退出 (--capture-only)"
+        echo "[ft]   提示: 去掉 --capture-only 可在采集后自动启动 ROS 框架"
+        exit 0
+    fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. 生产管线: ROS2 框架启动
+#    adc_rx (C++) → /dev/video0 → ROS2 topics → RSP → det_list
+# ══════════════════════════════════════════════════════════════════════════════
 echo "=============================================="
 echo "  FT Radar Framework 启动"
 echo "  RSP 模式:   $RSP_MODE"

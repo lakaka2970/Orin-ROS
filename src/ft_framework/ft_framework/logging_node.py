@@ -249,11 +249,36 @@ class LoggingNode(Node):
             'obj_list':     os.path.join(self._root, 'obj_csv_radar'),
             'calib':        os.path.join(self._root, 'calibration'),
         }
+
+        # 先确保根目录可写, 给出明确错误提示
+        try:
+            os.makedirs(self._root, exist_ok=True)
+        except OSError as e:
+            self.get_logger().fatal(
+                f'无法创建输出根目录 {self._root}: {e}\n'
+                f'  请检查目录权限: ls -la {self._root}\n'
+                f'  若属主为 root, 执行: sudo chown -R $USER:$USER {self._root}\n'
+                f'  或修改 output_dir 参数指向可写路径.')
+            raise
+
+        # 验证根目录可写
+        test_file = os.path.join(self._root, '.ft_write_test')
+        try:
+            with open(test_file, 'w') as f:
+                f.write('')
+            os.remove(test_file)
+        except OSError as e:
+            self.get_logger().fatal(
+                f'输出根目录不可写 {self._root}: {e}\n'
+                f'  请检查目录权限: ls -la {self._root}\n'
+                f'  若属主为 root, 执行: sudo chown -R $USER:$USER {self._root}')
+            raise
+
         for _, d in self._dirs.items():
             try:
                 os.makedirs(d, exist_ok=True)
             except OSError as e:
-                self.get_logger().error(f'无法创建目录 {d}: {e}')
+                self.get_logger().error(f'无法创建子目录 {d}: {e}')
                 raise
 
         # 运行时状态 — 循环覆盖

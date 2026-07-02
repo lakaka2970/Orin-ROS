@@ -63,7 +63,7 @@ import torch
 import rclpy
 from rclpy.node import Node
 
-from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion
+from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion, RnNciData
 from ft_framework.common import filter_det_points
 from ft_framework.rsp_processor import create_processor
 from ft_framework.signal_process.config import RadarConfig
@@ -146,10 +146,13 @@ class RspCudaNode(Node):
             # 单路 CUDA 模式 → 主话题; 双路模式 → CUDA 专属话题
             if self.rsp_mode == 'cuda':
                 topic = '/processing/radar/det_list'
+                nci_topic = '/processing/radar/rn_nci_data'
             else:
                 topic = '/processing/radar/det_list_cuda'
+                nci_topic = '/processing/radar/rn_nci_data_cuda'
             self.pub_det = self.create_publisher(DetList, topic, 10)
-            self.get_logger().info(f'RSP Cuda 发布: {topic}')
+            self.pub_rn_nci = self.create_publisher(RnNciData, nci_topic, 10)
+            self.get_logger().info(f'RSP Cuda 发布: {topic}, {nci_topic}')
         else:
             self.get_logger().info(
                 f'RSP Cuda 已禁用 (rsp_mode={self.rsp_mode})')
@@ -408,6 +411,12 @@ class RspCudaNode(Node):
 
         self.pub_det.publish(det_list)
 
+        # ---- 发布 RnNci 中间数据 (独立异常保护, 不影响 DetList) ----
+        try:
+            self._publish_rn_nci(adc_stamp, peaks, rx_nci, vch_nci)
+        except Exception as e:
+            self.get_logger().error(f'RnNci 发布异常: {e}')
+
         # ---- 定期日志 ----
         if self.frame_count % 10 == 0:
             t_proc = (time.perf_counter() - t0) * 1000.0
@@ -423,6 +432,59 @@ class RspCudaNode(Node):
                 f'[RSP-CUDA] 帧 #{self.frame_count}: '
                 f'{len(det_points)} 检测点, {range_str}, '
                 f'耗时={t_proc:.1f}ms')
+
+    # ------------------------------------------------------------------
+    # 中间数据发布
+    # ------------------------------------------------------------------
+
+    def _publish_rn_nci(self, adc_stamp, peaks: list, rx_nci, vch_nci):
+        """构建并发布 RD Cell List + Rx NCI 中间数据 (GPU→CPU, 对齐 spec §7+§8)。"""
+        msg = RnNciData()
+        msg.header.stamp = adc_stamp
+        msg.header.frame_id = self.fixed_frame
+        msg.frame_id = self.frame_count
+        msg.frame_timestamp_us = (adc_stamp.sec * 1_000_000 + adc_stamp.nanosec // 1000) & 0xFFFFFFFF
+        msg.idle_time_idx = 0
+
+        nc = len(peaks)
+        msg.num_cells = nc
+        msg.rb_list   = [int(p['rb']) for p in peaks]
+        msg.db_list   = [int(p['db']) for p in peaks]
+
+        # f32PowRbNci_Q7dB[3]
+        msg.pow_rb_nci_0 = [float(p['pow_rb'][0]) for p in peaks]
+        msg.pow_rb_nci_1 = [float(p['pow_rb'][1]) for p in peaks]
+        msg.pow_rb_nci_2 = [float(p['pow_rb'][2]) for p in peaks]
+
+        # f32PowDbNci_Q7dB[3]
+        msg.pow_db_nci_0 = [float(p['pow_db'][0]) for p in peaks]
+        msg.pow_db_nci_1 = [float(p['pow_db'][1]) for p in peaks]
+        msg.pow_db_nci_2 = [float(p['pow_db'][2]) for p in peaks]
+
+        msg.peak_power_list = [float(p['f32PeakPowVchNci_Q7dB']) for p in peaks]
+        msg.noise_power_list = [float(p['noise']) for p in peaks]
+        msg.valid_flag_list  = [int(p.get('u8RdValidFlag', 1)) for p in peaks]
+        msg.peak_flag_list   = [int(p.get('u8RdPeakFlag', 1)) for p in peaks]
+
+        # sVch[256] — 通道复数 int32 (real, imag 交错)
+        ch_bytes_all = b''
+        for p in peaks:
+            ch = np.asarray(p['sVch'], dtype=np.complex64)  # (256,) complex64
+            real_part = np.int32(np.real(ch))
+            imag_part = np.int32(np.imag(ch))
+            interleaved = np.empty(512, dtype=np.int32)
+            interleaved[0::2] = real_part
+            interleaved[1::2] = imag_part
+            ch_bytes_all += interleaved.tobytes()
+        msg.channel_data_bytes = ch_bytes_all
+
+        # Rx NCI (GPU tensor → numpy float32)
+        rx_nci_np = rx_nci.cpu().numpy().astype(np.float32)
+        msg.rx_nci_rows = rx_nci_np.shape[0]
+        msg.rx_nci_cols = rx_nci_np.shape[1]
+        msg.rx_nci_data = rx_nci_np.tobytes()
+
+        self.pub_rn_nci.publish(msg)
 
     # ------------------------------------------------------------------
     # 销毁

@@ -111,8 +111,8 @@ camera_rx:
 ```bash
 cd ~/Orin-ROS
 
-# 0a. (仅首次) 安装系统依赖 + ROS2 + CycloneDDS
-bash scripts/install_deps.sh --with-ros2 --with-cyclonedds
+# 0a. (仅首次) 安装系统依赖 + ROS2
+bash scripts/install_deps.sh --with-ros2
 
 # 0b. (推荐) 免 source: 以后每次开终端自动加载环境
 echo "source ~/Orin-ROS/scripts/env.sh" >> ~/.bashrc
@@ -135,11 +135,11 @@ bash scripts/start.sh --capture-only --rsps
 
 | 场景 | 命令 |
 |------|------|
-| **全新系统** (含 ROS2) | `bash scripts/install_deps.sh --with-ros2 --with-cyclonedds` |
-| **已有 ROS2** | `bash scripts/install_deps.sh --with-cyclonedds` |
+| **全新系统** (含 ROS2) | `bash scripts/install_deps.sh --with-ros2` |
+| **已有 ROS2** | 直接构建即可，系统依赖已满足 |
 | **仅检查不安装** | `bash scripts/install_deps.sh --dry-run` |
 
-> **CycloneDDS 必须安装**: 32 MiB/帧 ADC 消息在默认 FastDDS 下会被 UDP 分片导致大量丢包。CycloneDDS 内置共享内存传输，本地 IPC 不走网络栈。
+> **RMW 传输**: 默认使用 **FastDDS**（ROS2 Foxy 内置），其内置 **SHM (共享内存) 传输**，同机节点间 32 MiB ADC 消息不经网络栈、零 UDP 分片。无需额外安装 CycloneDDS。
 
 ### 启动选项
 
@@ -192,7 +192,7 @@ ros2 topic info /processing/radar/det_list
 
 | 实现 | rx_impl 参数 | 采集/发布方式 | 说明 |
 |------|:---:|:---:|------|
-| **C++** (默认) | `rx_impl:=cpp` | 轮询模式 (adc/camera) + 混合模式 (vehicle) | 阻塞硬件读取, 即时 ROS 时间戳, CycloneDDS SHM 传输 |
+| **C++** (默认) | `rx_impl:=cpp` | 轮询模式 (adc/camera) + 混合模式 (vehicle) | 阻塞硬件读取, 即时 ROS 时间戳, FastDDS SHM 传输 |
 | Python | `rx_impl:=python` | 同 C++ 架构 | 轮询/混合模式, 用于对比验证 |
 
 ### 常见组合
@@ -219,8 +219,9 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 ### 数据流
 
 ```
-[ADC Rx C++] ──→ /adc/raw_data (32MiB/帧, 轮询模式-硬件实际频率, SHM传输)
+[ADC Rx C++] ──→ /adc/raw_data (32MiB/帧, 轮询模式, FastDDS SHM 共享内存传输)
                     ├──→ [RSP Python / CUDA] ──→ /processing/radar/det_list
+                    │                            └──→ /processing/radar/rn_nci_data
                     └──→ [Logging] ──→ output/ft_dataset/
 
 [Camera Rx C++] ──→ /camera/image_raw (轮询模式-硬件实际频率) ──→ [Rviz_Image] [Logging]
@@ -237,7 +238,7 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 | 第三层 | Rviz_radar, Rviz_Image, Logging | Python | 可视化, 日志记录 |
 | 第四层 | Object Detection 3D, Rviz_Ruler | Python | 目标检测, 坐标标尺 |
 
-> 第一层 rx 节点使用 C++ 实现（`ft_rx_cpp` 包），利用零拷贝、噪声池预生成、CycloneDDS SHM 传输保证 15 Hz 稳定发布。第二至四层保留 Python 便于算法迭代。
+> 第一层 rx 节点使用 C++ 实现（`ft_rx_cpp` 包），利用零拷贝、噪声池预生成、FastDDS SHM 传输保证 15 Hz 稳定发布。第二至四层保留 Python 便于算法迭代。
 
 ---
 
@@ -258,7 +259,7 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 | 噪声池预生成 (4x 帧大小) | 消除每帧 MT19937 开销 |
 | 单次 memcpy 入消息 | 替代 Python tolist() 的 16.7M 对象分配 |
 | `uint8[]` 消息类型 | ROS2 C 序列化走 memcpy 快速路径 |
-| CycloneDDS SHM 传输 | 32MiB 不走 UDP 分片, 本地 IPC 直通 |
+| FastDDS SHM 传输 | 32 MiB 消息走共享内存, 零网络栈开销, 零拷贝 |
 | Best Effort QoS | 模拟场景无需可靠传输, 消除 ACK 等待 |
 
 ### 第二层：信号处理 (Python)
@@ -292,8 +293,10 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 | `/adc/raw_data` | `AdcRawData` | adc_rx (C++) | rsp_*, logging_node |
 | `/camera/image_raw` | `sensor_msgs/Image` | camera_rx (C++) | rviz_image, logging_node |
 | `/vehicle/ego_motion` | `EgoMotion` | vehicle_data_rx (C++) | rsp_*, logging_node |
-| `/processing/radar/det_list` | `DetList` | rsp_mil_python / rsp_cuda | rviz_radar, obj_detection_3d, logging_node |
-| `/processing/radar/det_list_cuda` | `DetList` | rsp_cuda (双路模式) | rviz_radar, logging_node |
+| `/processing/radar/det_list` | `DetList` | rsp_mil_python / rsp_cuda | rviz_radar, obj_detection_3d, logging_node, monitor_rsp |
+| `/processing/radar/det_list_cuda` | `DetList` | rsp_cuda (双路模式) | rviz_radar, logging_node, monitor_rsp |
+| `/processing/radar/rn_nci_data` | `RnNciData` | rsp_mil_python / rsp_cuda | logging_node |
+| `/processing/radar/rn_nci_data_cuda` | `RnNciData` | rsp_cuda (双路模式) | logging_node |
 | `/perception/objects` | `ObjList` | object_detection_3d | rviz_radar, logging_node |
 | `/visualization/ruler` | `MarkerArray` | rviz_ruler | rviz_radar |
 | `/visualization/radar/display` | `PointCloud2` | rviz_radar | RViz |
@@ -310,11 +313,12 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 | 消息 | 字段数 | 说明 |
 |------|:------:|------|
 | `AdcRawData` | 4 + header | ADC 原始字节流 (uint8[]) |
-| `DetPoint` | 14 | 雷达检测目标点 |
-| `DetList` | header + DetPoint[] | 检测列表 |
+| `DetPoint` | 41 | 雷达检测目标点 (对齐 spec §5.3 / §6.3) |
+| `DetList` | header + frame_id + DetPoint[] | 检测列表 |
 | `Object3D` | 14 | 3D 目标 |
 | `ObjList` | header + Object3D[] | 目标列表 |
 | `EgoMotion` | 7 + header + is_default | 自车运动数据 |
+| `RnNciData` | 20 + header | RD Cell List + Rx NCI (对齐 spec §7 + §8) |
 
 ---
 
@@ -359,23 +363,23 @@ ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \
 |:----:|----------|:--------:|------|
 | ADC | `enable_adc` | 100 | `adc_data/{ts}.bin` |
 | Image | `enable_image` | 1000 | `camera_front_center/{ts}.jpg` |
-| Det_List | `enable_det_list` | 1000 | `pc_csv_radar_front_center/{ts}.csv` |
+| Det_List | `enable_det_list` | 1000 | `pc_pcd_radar_front_center/{ts}.pcd` + `pc_csv_radar_front_center/{ts}.csv` |
+| RnNci | `enable_rn_nci` | 1000 | `rdCell_csv_radar_front_center/{ts}.csv` + `rxNci_bin_radar_front_center/{ts}.bin` |
 | Ego_Motion | `enable_ego_motion` | 1000 | `ego_motion.csv` (保留最新 N 行) |
 | Obj_List | `enable_obj_list` | 1000 | `obj_csv_radar/{ts}.csv` |
 
 > 达到上限后**循环覆盖**: 删除最旧文件, 保留最新 N 帧。ego_motion.csv 保留最新 N 行后重写。
+> 所有数据格式对齐 `FT_FVR60_XD_radar_dataset_requirement.md` (spec §3~§9)。
 
 ### 数据格式
 
-ADC `.bin` 文件 = 20 字节 header + int16[] payload:
-
-```
-[0-7]   timestamp_us (uint64 LE)
-[8-11]  num_rows (uint32 LE)
-[12-15] num_chirps_per_row (uint32 LE)
-[16-19] num_samples_per_chirp (uint32 LE)
-[20-]   uint8[] payload  → np.frombuffer(payload, dtype=np.int16)
-```
+| 输出 | Spec | 格式 |
+|------|:----:|------|
+| `pc_pcd_radar_front_center/{ts}.pcd` | §5.3 | PCD v0.7 ASCII, 19 字段 (x/y/z/range/speed/azimuth_ang/ele_ang/snr_db/rcs_db/power_db/obj_same_rv/rd_cell_idx/range_idx/doppler_idx/azimuth_idx/elevation_idx/peak_val/sin_azim_snr_lin/sin_elev_snr_lin) |
+| `pc_csv_radar_front_center/{ts}.csv` | §6.3 | CSV, 22 列 (u32TimeStamp + u16FrameID + u16DetObjNum + 19 字段) |
+| `rdCell_csv_radar_front_center/{ts}.csv` | §7.3 | CSV, RD Cell List (13 字段, f32PowRbNci_Q7dB[3]→-0/-1/-2, sVch[256]→-0_r/-0_im...-255_r/-255_im) |
+| `rxNci_bin_radar_front_center/{ts}.bin` | §8.3 | 原始 float32 二维数组 (Rx NCI 全谱) |
+| `adc_data/{ts}.bin` | — | 20 字节 header + int16[] payload |
 
 ---
 
@@ -416,7 +420,7 @@ rviz2 -d config/ft_radar.rviz
 | **雷达 ADC** | ✅ 已接入 | `/dev/radar_ctrx0` (V4L2 mmap, 阻塞 DQBUF) | 轮询模式, ctrx0+ctrx1 双文件合并, 硬件实际频率, 32 MiB/帧 |
 | **USB 摄像头** | ✅ 已接入 | `/dev/camera_capture` (V4L2/OpenCV, 阻塞 read) | 轮询模式, Rmoncam A2 1080P, MJPEG 1920×1080, 硬件实际频率 → BGR8 |
 | **车辆数据** | ✅ 架构就绪 | CAN/ETH 总线 (待接入) | 混合模式: CAN读取线程+buffer+定时发布50Hz, 超时20ms检测, 当前默认值 |
-| **RSP 信号处理** | ⚠️ 占位 | — (待实现算法) | 当前透传空 DetList, 待实现 Range/Doppler FFT + CFAR |
+| **RSP 信号处理** | ✅ 完整 | Python (NumPy) + CUDA (PyTorch) | 完整流水线: DC去除+干扰抑制+Range FFT+Doppler FFT+DDMA+CFAR+DOA角度估计 |
 | **3D 目标检测** | ⚠️ 部分 | — (待部署 AI 模型) | 欧氏聚类可用, 待 TensorRT 推理 |
 
 ---
@@ -448,14 +452,14 @@ Orin-ROS/
 ├── config/
 │   ├── ft_radar_params.yaml
 │   ├── ft_radar.rviz
-│   └── fastdds_shm.xml            # FastDDS SHM 配置 (回退用)
+│   └── fastdds.xml                   # FastDDS SHM 配置 (128MB 段, 默认生效)
 ├── scripts/
-│   ├── env.sh                      # 环境加载 (自动 CycloneDDS)
-│   ├── install_deps.sh             # 依赖安装 (含 CycloneDDS)
-│   ├── build.sh                    # 一键构建 (3 个包 + Jetson 硬件初始化)
-│   ├── start.sh                    # 一键启动 (生产管线 + 开发管线)
-│   ├── launch_all.sh               # 兼容入口 → start.sh
-│   └── 99-ft-sensors.rules        # udev 设备持久化命名规则
+│   ├── env.sh                         # 环境加载 (默认 FastDDS + SHM 配置)
+│   ├── install_deps.sh                # 依赖安装
+│   ├── build.sh                       # 一键构建 (3 个包 + Jetson 硬件初始化)
+│   ├── start.sh                       # 一键启动 (生产管线 + 开发管线)
+│   ├── launch_all.sh                  # 兼容入口 → start.sh
+│   └── 99-ft-sensors.rules           # udev 设备持久化命名规则
 ├── src/
 │   └── integration-carkit88c0-gmsl/ # GMSL 雷达硬件集成 (驱动 + 采集脚本)
 ├── docs/                           # 架构与优化文档
@@ -470,4 +474,4 @@ Apache-2.0
 
 **作者**: zhengyuan.liu
 **创建**: 2026.6.8
-**更新**: 2026.7.1
+**更新**: 2026.7.2

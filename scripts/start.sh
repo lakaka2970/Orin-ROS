@@ -66,12 +66,8 @@ if [ ! -f "$PROJECT_ROOT/install/setup.bash" ]; then
     source "$PROJECT_ROOT/install/setup.bash"
 fi
 
-# ── 3. 检查 CycloneDDS ──
-if [ "$RMW_IMPLEMENTATION" != "rmw_cyclonedds_cpp" ]; then
-    echo "[ft] [WARN] CycloneDDS 未安装, 大消息可能丢包。安装:"
-    echo "    bash scripts/install_deps.sh --with-cyclonedds"
-    echo ""
-fi
+# ── 3. RMW 检查 ──
+echo "[ft] RMW 实现: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp (默认 FastDDS, 内置 SHM)}"
 
 # ── 4. 确定 rx 实现 ──
 if $USE_PY_RX; then

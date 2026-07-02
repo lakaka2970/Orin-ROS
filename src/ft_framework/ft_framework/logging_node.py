@@ -25,17 +25,19 @@ FT 数据日志记录节点 (Logging)
   L481:   destroy_node()         —— 安全清理
 
 ────────────────────────────────────────────────────────────────────────────────
-输出结构 (仅前向中心雷达)
+输出结构 (对齐 FT FVR60_XD Radar Dataset Requirement)
 ────────────────────────────────────────────────────────────────────────────────
   <dataset_root>/                           # 默认: output/ft_dataset
-  ├── ego_motion.csv                        # 单文件, 逐行追加
+  ├── ego_motion.csv                        # §3  自车运动
   ├── calibration/
-  │   └── radar_front_center_ft.yaml        # 从外部路径复制
-  ├── pc_pcd_radar_front_center/           # PCD v0.7 ASCII, 14 字段
-  ├── pc_csv_radar_front_center/           # CSV, 逗号分隔, 14 列
-  ├── obj_csv_radar/                       # CSV, 逗号分隔, 14 列
-  ├── camera_front_center/                 # JPEG 图像
-  └── adc_data/                            # 自定义二进制 (非 spec)
+  │   └── radar_front_center_ft.yaml        # §4  标定
+  ├── pc_pcd_radar_front_center/           # §5  PCD v0.7, 19 字段
+  ├── pc_csv_radar_front_center/           # §6  CSV, 19 字段
+  ├── rdCell_csv_radar_front_center/       # §7  RD Cell List CSV
+  ├── rxNci_bin_radar_front_center/        # §8  RX NCI BIN
+  ├── obj_csv_radar/                       # §9  3D 目标 CSV
+  ├── camera_front_center/                 # §10 图像
+  └── adc_data/                            # 内部: ADC 原始数据
 
 通道      开关参数            话题                          最大帧  输出
 ──────── ────────────────── ────────────────────────────  ────── ─────────────
@@ -43,6 +45,8 @@ ADC      enable_adc          /adc/raw_data                 100   <ts>.bin
 Image    enable_image        /camera/image_raw            1000   <ts>.jpg
 DetList  enable_det_list     /processing/radar/det_list   1000   <ts>.pcd+csv
 DetCUDA  enable_det_list     /processing/radar/det_list_cuda 1000 <ts>_cuda.*
+RnNci    enable_rn_nci       /processing/radar/rn_nci_data  1000  <ts>.csv+.bin
+RnNci_CU enable_rn_nci      /processing/radar/rn_nci_data_cuda 1000 <ts>_cuda.*
 Ego      enable_ego_motion   /vehicle/ego_motion          1000   ego_motion.csv
 Obj      enable_obj_list     /perception/objects          1000   <ts>.csv
 
@@ -71,6 +75,7 @@ ENABLE_IMAGE      = True
 ENABLE_DET_LIST   = True
 ENABLE_EGO_MOTION = True
 ENABLE_OBJ_LIST   = True
+ENABLE_RN_NCI     = True
 
 # ── 标定文件源路径 (空字符串 = 不复制) ──
 CALIBRATION_FILE = ""
@@ -81,6 +86,7 @@ CALIBRATION_FILE = ""
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 import os
+import struct
 import time
 import threading
 import queue
@@ -90,7 +96,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-from ft_radar_msgs.msg import AdcRawData, DetList, EgoMotion, ObjList
+from ft_radar_msgs.msg import AdcRawData, DetList, EgoMotion, ObjList, RnNciData
 
 # cv_bridge 的 pybind11 模块初始化依赖 cv2 先加载
 import cv2
@@ -123,18 +129,27 @@ def get_timestamp_us(msg) -> int:
 
 class AsyncWriter:
     """
-    独立线程 + 队列, 将磁盘 I/O 从 ROS2 主回调剥离。
+    独立线程 + 有界队列, 将磁盘 I/O 从 ROS2 主回调剥离。
 
-    两种入队方式:
-      enqueue(path, bytes, mode) —— 简单字节写入 (ADC / Image / ego)
-      enqueue_task(callable)      —— 可调用对象, 在写线程执行
-                                    (构建 PCD/CSV 字符串 + 写入)
+    入队方式:
+      enqueue(path, bytes, mode)   —— 简单字节写入 (ego / rn_nci)
+      enqueue_task(callable)       —— 可调用对象, 在写线程执行
+                                      (构建 PCD/CSV 字符串 + 写入)
+      enqueue_adc(...)             —— ADC 零拷贝写入 (header + data_array)
+      enqueue_image(...)           —— Image JPEG 编码 + 写入 (卸载到写线程)
+      enqueue_delete(path)         —— 延迟文件删除
 
     生命周期:  __init__() 启动 daemon 线程 → stop() 发送终止信号。
+
+    优化 (2026.7.2):
+      - 移除所有 os.makedirs() 重复调用 (目录已在 LoggingNode.__init__ 中创建)
+      - Queue 设 maxsize=500 防止内存无限增长
+      - ADC 写入用 struct.pack header + f.write(array.array) 零拷贝
+      - Image 编码卸载到写线程执行
     """
 
-    def __init__(self):
-        self._queue = queue.Queue()
+    def __init__(self, maxsize: int = 500):
+        self._queue = queue.Queue(maxsize=maxsize)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -143,11 +158,54 @@ class AsyncWriter:
 
     def enqueue(self, file_path: str, data: bytes, mode: str = 'wb'):
         """入队: 原始字节写入。"""
-        self._queue.put(('write', (file_path, data, mode)))
+        self._put(('write', (file_path, data, mode)))
 
     def enqueue_task(self, task):
         """入队: 可调用对象 (用于卸载字符串构建等重操作)。"""
-        self._queue.put(('task', task))
+        self._put(('task', task))
+
+    def enqueue_adc(self, file_path: str, ts: int,
+                    num_rows: int, num_chirps_per_row: int,
+                    num_samples_per_chirp: int, data_array):
+        """
+        入队: ADC 零拷贝写入。
+        data_array 为 array.array('B'), 支持 buffer protocol → f.write() 直接读取.
+        msg 的引用由调用方持有 (保持在 _on_adc 的局部变量中, 闭包捕获).
+        """
+        hdr = struct.pack('<QIII', ts, num_rows, num_chirps_per_row, num_samples_per_chirp)
+        self._put(('adc', (file_path, hdr, data_array)))
+
+    def enqueue_image(self, file_path: str, msg, bridge):
+        """入队: Image → JPEG 编码 + 写入 (卸载到写线程)。"""
+        self._put(('image', (file_path, msg, bridge)))
+
+    def enqueue_rn_nci_bin(self, file_path: str, data_array):
+        """
+        入队: RX NCI BIN 零拷贝写入.
+        data_array 为 array.array('B'), 支持 buffer protocol → f.write() 直接读取.
+        无需 bytes() 转换, 避免 5MB 额外内存拷贝.
+        """
+        self._put(('rn_nci_bin', (file_path, data_array)))
+
+    def enqueue_delete(self, file_path: str):
+        """入队: 延迟文件删除 (忽略文件不存在)。"""
+        self._put(('delete', file_path))
+
+    # ── 内部 ──
+
+    def _put(self, item):
+        """入队: 满时丢弃最旧任务并打印 warning。"""
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()  # 丢弃最旧
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                pass  # 极端情况, 放弃
 
     # ── 生命周期 ──
 
@@ -160,14 +218,7 @@ class AsyncWriter:
                 item = self._queue.get(timeout=0.1)
                 if item is None:
                     break
-                tag, payload = item
-                if tag == 'write':
-                    fpath, data, mode = payload
-                    os.makedirs(os.path.dirname(fpath), exist_ok=True)
-                    with open(fpath, mode) as f:
-                        f.write(data)
-                elif tag == 'task':
-                    payload()
+                self._process_item(item)
             except queue.Empty:
                 break
         # 发送终止信号
@@ -182,18 +233,42 @@ class AsyncWriter:
                 item = self._queue.get(timeout=1)
                 if item is None:              # 终止信号
                     break
-                tag, payload = item
-                if tag == 'write':
-                    fpath, data, mode = payload
-                    os.makedirs(os.path.dirname(fpath), exist_ok=True)
-                    with open(fpath, mode) as f:
-                        f.write(data)
-                elif tag == 'task':
-                    payload()
+                self._process_item(item)
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f'[AsyncWriter] 任务失败: {e}')
+
+    def _process_item(self, item):
+        """统一处理队列项 (worker 线程和 stop drain 共用)。"""
+        tag, payload = item
+        if tag == 'write':
+            fpath, data, mode = payload
+            with open(fpath, mode) as f:
+                f.write(data)
+        elif tag == 'task':
+            payload()
+        elif tag == 'adc':
+            fpath, hdr, data_array = payload
+            with open(fpath, 'wb') as f:
+                f.write(hdr)              # 20 字节 header
+                f.write(data_array)       # 零拷贝: array.array buffer protocol
+        elif tag == 'image':
+            fpath, msg, bridge = payload
+            cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            success, jpg = cv2.imencode('.jpg', cv_img)
+            if success:
+                with open(fpath, 'wb') as f:
+                    f.write(jpg.tobytes())
+        elif tag == 'delete':
+            try:
+                os.remove(payload)
+            except OSError:
+                pass
+        elif tag == 'rn_nci_bin':
+            fpath, data_array = payload
+            with open(fpath, 'wb') as f:
+                f.write(data_array)       # 零拷贝: array.array buffer protocol
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -215,11 +290,13 @@ class LoggingNode(Node):
         self.declare_parameter('max_frames.det_list', FRAME_LIMIT_OTHER)
         self.declare_parameter('max_frames.ego_motion', FRAME_LIMIT_OTHER)
         self.declare_parameter('max_frames.obj_list', FRAME_LIMIT_OTHER)
+        self.declare_parameter('max_frames.rn_nci',  FRAME_LIMIT_OTHER)
         self.declare_parameter('enable_adc',          ENABLE_ADC)
         self.declare_parameter('enable_image',        ENABLE_IMAGE)
         self.declare_parameter('enable_det_list',     ENABLE_DET_LIST)
         self.declare_parameter('enable_ego_motion',   ENABLE_EGO_MOTION)
         self.declare_parameter('enable_obj_list',     ENABLE_OBJ_LIST)
+        self.declare_parameter('enable_rn_nci',       ENABLE_RN_NCI)
         self.declare_parameter('calibration_file',    CALIBRATION_FILE)
 
         # 路径: 绝对路径不变, 相对路径用 CWD 解析
@@ -237,6 +314,10 @@ class LoggingNode(Node):
             'det_list_cuda': int(self.get_parameter('max_frames.det_list').value),
             'ego_motion':    int(self.get_parameter('max_frames.ego_motion').value),
             'obj_list':      int(self.get_parameter('max_frames.obj_list').value),
+            'rn_nci':        int(self.get_parameter('max_frames.rn_nci').value),
+            'rn_nci_cuda':   int(self.get_parameter('max_frames.rn_nci').value),
+            'rdcell':        int(self.get_parameter('max_frames.rn_nci').value),
+            'rdcell_cuda':   int(self.get_parameter('max_frames.rn_nci').value),
         }
 
         # 子目录映射  (key → <root>/<subdir>)
@@ -247,6 +328,10 @@ class LoggingNode(Node):
             'det_list_csv': os.path.join(self._root, 'pc_csv_radar_front_center'),
             'ego_motion':   os.path.join(self._root),     # ego_motion.csv 在根
             'obj_list':     os.path.join(self._root, 'obj_csv_radar'),
+            'rn_nci':       os.path.join(self._root, 'rxNci_bin_radar_front_center'),
+            'rn_nci_cuda':  os.path.join(self._root, 'rxNci_bin_radar_front_center'),
+            'rdcell':       os.path.join(self._root, 'rdCell_csv_radar_front_center'),
+            'rdcell_cuda':  os.path.join(self._root, 'rdCell_csv_radar_front_center'),
             'calib':        os.path.join(self._root, 'calibration'),
         }
 
@@ -290,6 +375,8 @@ class LoggingNode(Node):
         # ego_motion 行缓冲 (单文件追加, 满 N 行后重写)
         self._ego_lines: deque = deque(maxlen=self._max_frames['ego_motion'])
         self._ego_fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
+        self._ego_dirty = False          # 批量写入: 有未刷新行时为 True
+        self._ego_flush_every = 50       # 每 N 条消息触发一次文件重写
 
         # cv_bridge: Image → OpenCV → JPEG
         self._bridge = CvBridge() if CvBridge is not None else None
@@ -299,23 +386,32 @@ class LoggingNode(Node):
         # ego_motion 表头
         self._init_ego_csv()
 
-        # 订阅 (6 路) — Best Effort 匹配 C++ 发布者
-        _qos = rclpy.qos.QoSProfile(depth=10,
-            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
+        # 订阅 — 全部使用 Best Effort (匹配 C++ 发布者).
+        # 注意: 不能混用 Reliable, C++ rx 节点 (adc_rx, vehicle_data_rx,
+        # camera_rx) 全部使用 Best Effort, DDS 要求 publisher/subscriber
+        # reliability 一致, 否则无法匹配.
+        _qos_be = rclpy.qos.QoSProfile(
+            depth=10, reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
         self.sub_adc = self.create_subscription(
-            AdcRawData, '/adc/raw_data',  self._on_adc,  _qos)
+            AdcRawData, '/adc/raw_data',  self._on_adc,  _qos_be)
         self.sub_image = self.create_subscription(
-            Image, '/camera/image_raw',    self._on_image, _qos)
+            Image, '/camera/image_raw',    self._on_image, _qos_be)
         self.sub_det = self.create_subscription(
             DetList, '/processing/radar/det_list',
-            self._on_det_list, _qos)
+            self._on_det_list, _qos_be)
         self.sub_det_cu = self.create_subscription(
             DetList, '/processing/radar/det_list_cuda',
-            self._on_det_list_cuda, _qos)
+            self._on_det_list_cuda, _qos_be)
         self.sub_ego = self.create_subscription(
-            EgoMotion, '/vehicle/ego_motion', self._on_ego, _qos)
+            EgoMotion, '/vehicle/ego_motion', self._on_ego, _qos_be)
         self.sub_obj = self.create_subscription(
-            ObjList, '/perception/objects',   self._on_obj, _qos)
+            ObjList, '/perception/objects',   self._on_obj, _qos_be)
+        self.sub_rn_nci = self.create_subscription(
+            RnNciData, '/processing/radar/rn_nci_data',
+            self._on_rn_nci, _qos_be)
+        self.sub_rn_nci_cuda = self.create_subscription(
+            RnNciData, '/processing/radar/rn_nci_data_cuda',
+            lambda msg: self._on_rn_nci(msg, source='_cuda'), _qos_be)
 
         # 标定文件 (如果指定了路径且存在)
         if self._calibration_file and os.path.exists(self._calibration_file):
@@ -326,6 +422,8 @@ class LoggingNode(Node):
 
         # 状态定时器
         self.create_timer(self._status_interval, self._on_status)
+        # ego_motion 定期刷新定时器 (1 秒, 防止长时间无消息时数据丢失)
+        self._ego_flush_timer = self.create_timer(1.0, self._on_ego_flush)
         self._start_time = time.time()
 
         self.get_logger().info(
@@ -345,19 +443,17 @@ class LoggingNode(Node):
           [12-15] num_chirps_per_row     uint32 LE
           [16-19] num_samples_per_chirp  uint32 LE
           [20-  ] int16[] payload        (rows × chirps × samples)
+
+        优化: 零拷贝写入 — msg.data (array.array) 直接传给 AsyncWriter,
+              header 用 struct.pack 一次构建, 不拼接不拷贝.
         """
         if not self._get_switch('enable_adc', 'adc'):
             return
         ts = get_timestamp_us(msg)
-
-        hdr  = ts.to_bytes(8, 'little')
-        hdr += msg.num_rows.to_bytes(4, 'little')
-        hdr += msg.num_chirps_per_row.to_bytes(4, 'little')
-        hdr += msg.num_samples_per_chirp.to_bytes(4, 'little')
-
-        payload = bytes(msg.data)
         fpath = os.path.join(self._dirs['adc'], f'{ts}.bin')
-        self._writer.enqueue(fpath, hdr + payload, 'wb')
+        self._writer.enqueue_adc(fpath, ts,
+            msg.num_rows, msg.num_chirps_per_row,
+            msg.num_samples_per_chirp, msg.data)
         self._register_frame_file('adc', fpath)
         self._frame_counts['adc'] += 1
 
@@ -367,22 +463,18 @@ class LoggingNode(Node):
         """
         相机图像 → camera_front_center/<ts>.jpg
 
-        流程:  ROS Image → cv_bridge → BGR8 → cv2.imencode('.jpg') → 异步写盘
+        流程:  入队 Image msg 引用 → AsyncWriter 线程做 cv_bridge + imencode → 写盘
         依赖:  cv_bridge + python3-opencv
+
+        优化: cv_bridge 和 JPEG 编码已卸载到 writer 线程, 回调本身仅入队.
         """
         if not self._get_switch('enable_image', 'image') or self._bridge is None:
             return
-        try:
-            cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            ts = get_timestamp_us(msg)
-            success, jpg = cv2.imencode('.jpg', cv_img)
-            if success:
-                fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')
-                self._writer.enqueue(fpath, jpg.tobytes(), 'wb')
-                self._register_frame_file('image', fpath)
-                self._frame_counts['image'] += 1
-        except Exception as e:
-            self.get_logger().error(f'Image 写入失败: {e}')
+        ts = get_timestamp_us(msg)
+        fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')
+        self._writer.enqueue_image(fpath, msg, self._bridge)
+        self._register_frame_file('image', fpath)
+        self._frame_counts['image'] += 1
 
     # ── 2.3.4  DetList 回调 (点云) ───────────────────────────────────────
 
@@ -417,63 +509,70 @@ class LoggingNode(Node):
         self._on_det_list(msg, source='_cuda')
 
     def _build_det_list_task(self, ts: int, msg: DetList, source: str = ''):
-        """
-        构建 PCD + CSV 写入闭包, 返回零参数 callable。
-
-        在 AsyncWriter 线程中执行, 将字符串构建和磁盘写入
-        从 ROS2 主回调卸载。
-        """
+        """构建 PCD + CSV 写入闭包 (对齐 spec §5.3 + §6.3, 19 字段)."""
         n = len(msg.points)
         suffix = source                       # '' 或 '_cuda'
+        frame_id = msg.frame_id
 
         def _task():
-            # ── PCD v0.7 ASCII ──
-            # 字段顺序对齐 spec §5.3:
-            #   x y z  range azimuth elevation  RCS SNR ambgt
-            #   exist_prob multi_tgt_prob ambgt_prob  raw_doppler idx
+            # ── PCD v0.7 ASCII (§5.3) ──
             pcd = [
                 '# .PCD v0.7 - Point Cloud Data file format',
                 'VERSION 0.7',
-                'FIELDS x y z range azimuth elevation RCS SNR ambgt '
-                'exist_prob multi_tgt_prob ambgt_prob raw_doppler idx',
-                'SIZE 4 4 4 4 4 4 4 4 4 1 1 1 4 1',
-                'TYPE F F F F F F F F F U U U F U',
-                'COUNT 1 1 1 1 1 1 1 1 1 1 1 1 1 1',
+                'FIELDS x y z range speed azimuth_ang ele_ang '
+                'snr_db rcs_db power_db obj_same_rv rd_cell_idx '
+                'range_idx doppler_idx azimuth_idx elevation_idx '
+                'peak_val sin_azim_snr_lin sin_elev_snr_lin',
+                'SIZE 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4',
+                'TYPE F F F F F F F F F F F F F F F F F F F',
+                'COUNT 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1',
                 f'WIDTH {n}',
                 'HEIGHT 1',
-                'VIEWPOINT 0 0 0 1 0 0 0',
+                f'VIEWPOINT 0 0 0 1 0 0 0 {ts} {frame_id} {n}',
                 f'POINTS {n}',
                 'DATA ascii',
             ]
-            # float32 → .6f (防科学计数法), uint8 → 默认整数
             for p in msg.points:
                 pcd.append(
                     f'{p.x:.6f} {p.y:.6f} {p.z:.6f} '
-                    f'{p.range:.6f} {p.azimuth:.6f} {p.elevation:.6f} '
-                    f'{p.rcs:.6f} {p.snr:.6f} {p.ambgt:.6f} '
-                    f'{p.exist_prob} {p.multi_tgt_prob} {p.ambgt_prob} '
-                    f'{p.raw_doppler:.6f} {p.idx}')
+                    f'{p.range:.6f} {p.speed:.6f} '
+                    f'{p.azimuth_ang:.6f} {p.ele_ang:.6f} '
+                    f'{p.snr_db:.6f} {p.rcs_db:.6f} {p.power_db:.6f} '
+                    f'{p.obj_same_rv} {p.rd_cell_idx} '
+                    f'{p.range_idx} {p.doppler_idx} '
+                    f'{p.azimuth_idx} {p.elevation_idx} '
+                    f'{p.peak_val} {p.sin_azim_snr_lin} {p.sin_elev_snr_lin}')
             pcd_path = os.path.join(
                 self._dirs['det_list_pcd'], f'{ts}{suffix}.pcd')
-            os.makedirs(os.path.dirname(pcd_path), exist_ok=True)
             with open(pcd_path, 'wb') as f:
                 f.write('\n'.join(pcd).encode())
 
-            # ── CSV ──
-            csv = [
-                'x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,'
-                'exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx'
-            ]
+            # ── CSV (§6.3) ──
+            csv_hdr = (
+                'u32TimeStamp,u16FrameID,u16DetObjNum,'
+                'f32XPos,f32YPos,f32ZPos,'
+                'f32Range,f32Speed,'
+                'f32AzimuthAng,f32EleAng,'
+                'f32SNRdB,f32RcsdB,f32PowerdB,'
+                'u32ObjSameRV,'
+                'u16RdCellIdx,u16RangeIdx,u16DopplerIdx,'
+                'u8AzimuthIdx,u8ElevationIdx,'
+                'u16PeakVal,u16SinAzimSNRLin,u16SinElevSNRLin'
+            )
+            csv = [csv_hdr]
             for p in msg.points:
                 csv.append(
+                    f'{ts},{frame_id},{n},'
                     f'{p.x:.6f},{p.y:.6f},{p.z:.6f},'
-                    f'{p.range:.6f},{p.azimuth:.6f},{p.elevation:.6f},'
-                    f'{p.rcs:.6f},{p.snr:.6f},{p.ambgt:.6f},'
-                    f'{p.exist_prob},{p.multi_tgt_prob},{p.ambgt_prob},'
-                    f'{p.raw_doppler:.6f},{p.idx}')
+                    f'{p.range:.6f},{p.speed:.6f},'
+                    f'{p.azimuth_ang:.6f},{p.ele_ang:.6f},'
+                    f'{p.snr_db:.6f},{p.rcs_db:.6f},{p.power_db:.6f},'
+                    f'{p.obj_same_rv},'
+                    f'{p.rd_cell_idx},{p.range_idx},{p.doppler_idx},'
+                    f'{p.azimuth_idx},{p.elevation_idx},'
+                    f'{p.peak_val},{p.sin_azim_snr_lin},{p.sin_elev_snr_lin}')
             csv_path = os.path.join(
                 self._dirs['det_list_csv'], f'{ts}{suffix}.csv')
-            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
             with open(csv_path, 'wb') as f:
                 f.write('\n'.join(csv).encode())
 
@@ -487,6 +586,9 @@ class LoggingNode(Node):
 
         CSV 列 (对齐 spec §3.2):
           timestamp_us (uint64)  vx yaw_rate steering_angle  ax ay gear
+
+        优化: 批量写入 — 每 N 条消息 (默认50) 或每 1 秒刷新一次文件,
+              将文件重写频率从 50Hz 降低到 ~1Hz.
         """
         if not self._get_switch('enable_ego_motion', 'ego_motion'):
             return
@@ -495,12 +597,20 @@ class LoggingNode(Node):
                 f'{msg.vx:.6f},{msg.yaw_rate:.6f},{msg.steering_angle:.6f},'
                 f'{msg.ax:.6f},{msg.ay:.6f},{msg.gear}\n')
 
-        # 循环覆盖: 行缓冲满 N 行后重写整个文件
-        # _get_switch() 已在达到上限时重置计数器, 此处只需追加并递增
         self._ego_lines.append(line)
         self._frame_counts['ego_motion'] += 1
+        self._ego_dirty = True
 
-        self._writer.enqueue_task(self._build_ego_rewrite_task())
+        # 每 N 条消息触发一次文件重写
+        if len(self._ego_lines) % self._ego_flush_every == 0:
+            self._writer.enqueue_task(self._build_ego_rewrite_task())
+            self._ego_dirty = False
+
+    def _on_ego_flush(self):
+        """定时刷新: 若缓冲中有未写入的行, 触发文件重写。"""
+        if self._ego_dirty and len(self._ego_lines) > 0:
+            self._writer.enqueue_task(self._build_ego_rewrite_task())
+            self._ego_dirty = False
 
     # ── 2.3.6  ObjList 回调 (3D 目标) ────────────────────────────────────
 
@@ -526,6 +636,114 @@ class LoggingNode(Node):
         self._writer.enqueue_task(self._build_obj_csv_task(ts, msg))
         self._frame_counts['obj_list'] += 1
 
+    # ── 2.3.6b  RnNciData 回调 (RD Cell List + RX NCI) ───────────────────
+
+    def _on_rn_nci(self, msg: RnNciData, source: str = ''):
+        """
+        RnNciData → RD Cell List CSV (§7.3) + RX NCI BIN (§8.3).
+
+        RD Cell CSV 列 (按 spec §7.3, 数组/复数展开):
+          u32FrameTimeStamp, u16FrameId, u16NofRdCell, u8Index_Idletime,
+          u16Rb, u16Db,
+          f32PowRbNci_Q7dB-0, f32PowRbNci_Q7dB-1, f32PowRbNci_Q7dB-2,
+          f32PowDbNci_Q7dB-0, f32PowDbNci_Q7dB-1, f32PowDbNci_Q7dB-2,
+          f32PeakPowVchNci_Q7dB, f32NoiseNci_Q7dB,
+          u8RdValidFlag, u8RdPeakFlag,
+          sVch-0_r, sVch-0_im, sVch-1_r, sVch-1_im, ..., sVch-255_r, sVch-255_im
+
+        RX NCI BIN: 原始 float32 二维数组 (rx_nci_rows × rx_nci_cols)
+        """
+        channel = 'rn_nci_cuda' if source == '_cuda' else 'rn_nci'
+        if not self._get_switch('enable_rn_nci', channel):
+            return
+
+        ts = get_timestamp_us(msg)
+        suffix = source                       # '' 或 '_cuda'
+        nc = msg.num_cells
+
+        # ---- RD Cell List CSV (§7.3) ----
+        if nc > 0:
+            rdcell_channel = 'rdcell_cuda' if source == '_cuda' else 'rdcell'
+            if self._get_switch('enable_rn_nci', rdcell_channel):
+                rdcell_csv = os.path.join(self._dirs[rdcell_channel],
+                                          f'{ts}{suffix}.csv')
+                self._register_frame_file(rdcell_channel, rdcell_csv)
+                self._writer.enqueue_task(
+                    self._build_rdcell_csv_task(ts, msg, suffix, rdcell_channel))
+                self._frame_counts[rdcell_channel] += 1
+
+        # ---- RX NCI BIN (§8.3) —— 零拷贝写入 ----
+        fpath_bin = os.path.join(self._dirs[channel], f'{ts}{suffix}.bin')
+        self._writer.enqueue_rn_nci_bin(fpath_bin, msg.rx_nci_data)
+        self._register_frame_file(channel, fpath_bin)
+        self._frame_counts[channel] += 1
+
+    def _build_rdcell_csv_task(self, ts: int, msg: RnNciData,
+                                 suffix: str, channel: str):
+        """构建 RD Cell List CSV 写入闭包 (spec §7.3, 数组展开 + 复数分离)."""
+
+        nc = msg.num_cells
+
+        # 构建 CSV header
+        hdr_cols = [
+            'u32FrameTimeStamp', 'u16FrameId', 'u16NofRdCell', 'u8Index_Idletime',
+            'u16Rb', 'u16Db',
+        ]
+        # f32PowRbNci_Q7dB[3]
+        for ch_idx in range(3):
+            hdr_cols.append(f'f32PowRbNci_Q7dB-{ch_idx}')
+        # f32PowDbNci_Q7dB[3]
+        for ch_idx in range(3):
+            hdr_cols.append(f'f32PowDbNci_Q7dB-{ch_idx}')
+        hdr_cols += [
+            'f32PeakPowVchNci_Q7dB', 'f32NoiseNci_Q7dB',
+            'u8RdValidFlag', 'u8RdPeakFlag',
+        ]
+        # sVch[256] — complex int32: r=real, im=imag
+        for ch_idx in range(256):
+            hdr_cols.append(f'sVch-{ch_idx}_r')
+            hdr_cols.append(f'sVch-{ch_idx}_im')
+
+        def _task():
+            rows = [','.join(hdr_cols)]
+            # 解析 channel data bytes → int32 pairs per cell
+            ch_bytes = bytes(msg.channel_data_bytes)
+            cell_ch_stride = 256 * 2 * 4  # 256 complex × 2 int32 × 4 bytes
+            for i in range(nc):
+                row = [
+                    str(msg.frame_timestamp_us),
+                    str(msg.frame_id),
+                    str(nc),
+                    str(msg.idle_time_idx),
+                    str(msg.rb_list[i]),
+                    str(msg.db_list[i]),
+                    f'{msg.pow_rb_nci_0[i]:.3f}',
+                    f'{msg.pow_rb_nci_1[i]:.3f}',
+                    f'{msg.pow_rb_nci_2[i]:.3f}',
+                    f'{msg.pow_db_nci_0[i]:.3f}',
+                    f'{msg.pow_db_nci_1[i]:.3f}',
+                    f'{msg.pow_db_nci_2[i]:.3f}',
+                    f'{msg.peak_power_list[i]:.3f}',
+                    f'{msg.noise_power_list[i]:.3f}',
+                    str(msg.valid_flag_list[i]),
+                    str(msg.peak_flag_list[i]),
+                ]
+                # 解析 sVch[256]
+                import struct
+                offset = i * cell_ch_stride
+                for j in range(256):
+                    r_val = struct.unpack_from('<i', ch_bytes, offset + j * 8)[0]
+                    im_val = struct.unpack_from('<i', ch_bytes, offset + j * 8 + 4)[0]
+                    row.append(str(r_val))
+                    row.append(str(im_val))
+                rows.append(','.join(row))
+
+            csv_path = os.path.join(self._dirs[channel], f'{ts}{suffix}.csv')
+            with open(csv_path, 'wb') as f:
+                f.write('\n'.join(rows).encode())
+
+        return _task
+
     def _build_obj_csv_task(self, ts: int, msg: ObjList):
         """构建 ObjList CSV 写入闭包 (AsyncWriter 线程执行)。"""
 
@@ -544,7 +762,6 @@ class LoggingNode(Node):
                     f'{obj.vz_absolute:.6f},'
                     f'{obj.moving_state}')
             fpath = os.path.join(self._dirs['obj_list'], f'{ts}.csv')
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
             with open(fpath, 'wb') as f:
                 f.write('\n'.join(csv).encode())
 
@@ -579,31 +796,24 @@ class LoggingNode(Node):
         return True
 
     def _register_frame_file(self, channel: str, filepath: str):
-        """记录帧文件路径; deque 满时自动删除最旧文件。"""
+        """记录帧文件路径; deque 满时异步删除最旧文件。"""
         files = self._frame_files[channel]
-        # deque maxlen 会在 append 时自动丢弃最旧元素,
-        # 但我们需要先删除磁盘上的文件
         if len(files) >= files.maxlen and files:
             oldest = files[0]
-            try:
-                if os.path.exists(oldest):
-                    os.remove(oldest)
-            except OSError:
-                pass
+            self._writer.enqueue_delete(oldest)
         files.append(filepath)
 
     def _build_ego_rewrite_task(self):
         """构建 ego_motion.csv 重写闭包 (AsyncWriter 线程执行)。
 
-        每次追加新行后, 将行缓冲完整重写到文件, 保证文件只保留最新 N 行。
+        将行缓冲完整重写到文件, 保证文件只保留最新 N 行。
+        优化: 直接传 deque 引用 (writer 线程串行执行, 无竞争).
         """
-        lines = list(self._ego_lines)  # 快照当前缓冲
+        lines = self._ego_lines  # deque 引用, 无需 list() 快照拷贝
 
         def _task():
             header = 'timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n'
-            fpath = self._ego_fpath
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
-            with open(fpath, 'w') as f:
+            with open(self._ego_fpath, 'w') as f:
                 f.write(header)
                 f.writelines(lines)
 
@@ -640,8 +850,12 @@ class LoggingNode(Node):
     # ── 2.3.10  销毁 ─────────────────────────────────────────────────────
 
     def destroy_node(self):
-        """输出最终状态 → 停止写线程 → 父类清理。"""
+        """输出最终状态 → 刷新 ego 缓冲 → 停止写线程 → 父类清理。"""
         self._on_status()
+        # 最终刷新 ego_motion 未写入的行
+        if self._ego_dirty and len(self._ego_lines) > 0:
+            self._ego_dirty = False
+            self._writer.enqueue_task(self._build_ego_rewrite_task())
         self._writer.stop()
         self.get_logger().info('Logging 已停止')
         super().destroy_node()

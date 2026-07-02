@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  FT Radar Framework — CycloneDDS 共享内存传输配置
+  FT Radar Framework — CycloneDDS lo-only 本地传输配置
   ============================================================================
-  目标: 32 MiB/帧 × 15 Hz = 480 MiB/s 吞吐 (16T16R ctrx0+ctrx1), 走 SHM 避免 UDP 分片瓶颈.
+  强制所有 DDS 流量走本地回环 (127.0.0.1), 避免 32MB ADC 帧被发送到 WiFi 网卡.
 
-  关键配置:
-    SharedMemory/Enable = true    显式启用 SHM (本地 IPC 不走网络栈)
-    NetworkInterfaceAddress = lo  限制为本地回环 (WSL 无需物理网卡)
-    AllowMulticast = false        WSL 环境无多播, 关闭可加速发现
-    WhcHigh = 500KB               增大写缓存水位, 避免大消息背压
+  CycloneDDS 0.7.0 无 SHM 支持, 但 loopback UDP 在本地足够快:
+  lo MTU=65536, 32MB 消息 = 512 个 RTPS 分片, 每个最大 64KB, 本地传输几乎零丢包.
+
+  注意: ros2 CLI (topic list/echo) 依赖多播发现, lo 接口不支持多播,
+        但节点间的 Simple Participant Discovery 通过 unicast 仍可正常工作.
 
   用法:
     export CYCLONEDDS_URI="file://<path>/config/cyclonedds.xml"
@@ -18,8 +18,8 @@
 <CycloneDDS xmlns="https://cdds.io/config">
   <Domain id="any">
     <General>
-      <!-- 不指定 NetworkInterfaceAddress，让 CycloneDDS 自动选择物理网卡 -->
-      <!-- lo 回环接口不支持多播，会导致 ros2 CLI 报错 -->
+      <MaxMessageSize>33554432</MaxMessageSize>
+      <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
     </General>
     <Tracing>
       <Verbosity>warning</Verbosity>

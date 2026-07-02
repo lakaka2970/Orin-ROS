@@ -13,7 +13,7 @@
 //
 // 用法: 由 launch 文件通过 adc_source:=analog 参数自动选择本节点.
 //
-// 设计目标: 15 Hz × 32 MiB/帧 = 480 MiB/s 吞吐, CycloneDDS SHM 传输.
+// 设计目标: 15 Hz × 32 MiB/帧 = 480 MiB/s 吞吐, FastDDS SHM 共享内存传输.
 // ============================================================================
 
 #include <algorithm>
@@ -35,7 +35,7 @@ using AdcRawData = ft_radar_msgs::msg::AdcRawData;
 namespace fs = std::filesystem;
 
 namespace {
-  constexpr double FPS      = 15.0;
+  constexpr double FPS      = 10.0;
   constexpr int    NOISE_LEVEL = 100;      // ± 噪声幅度
   constexpr int    POOL_FACTOR = 4;        // 噪声池倍数 (预生成池 = 帧大小 × 倍数)
   constexpr size_t MAX_PRELOAD_FILES = 30; // 最多预加载文件数 (~960 MB)

@@ -4,7 +4,7 @@
 # ============================================================================
 # 一个 source 完成:
 #   1. 检测并载入 ROS2 发行版环境
-#   2. 启用 CycloneDDS (大消息可靠传输)
+#   2. 默认使用 FastDDS (内置 SHM 共享内存传输)
 #   3. 载入工作空间 install/setup.bash
 #
 # 用法:
@@ -40,16 +40,23 @@ if [ -f "$ROS2_SETUP" ] && [ -z "$ROS_DISTRO" ]; then
     source "$ROS2_SETUP"
 fi
 
-# ─── 2. 启用 CycloneDDS (优先于 FastDDS) ───
-# CycloneDDS 内置 SHM 传输, 32MB ADC 消息不再被 UDP 分片
-# 若未安装 ros-foxy-rmw-cyclonedds-cpp, 回退到默认 FastDDS
-if [ -f "/opt/ros/$ROS2_DISTRO/share/rmw_cyclonedds_cpp/local_setup.bash" ] || \
-   [ -d "/opt/ros/$ROS2_DISTRO/share/rmw_cyclonedds_cpp" ]; then
-    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-    # 显式加载 CycloneDDS XML 配置 (启用 SHM 传输, 避免 32MB 走 UDP 分片)
-    FT_CYCLONE_XML="$PROJECT_ROOT/config/cyclonedds.xml"
-    if [ -f "$FT_CYCLONE_XML" ]; then
-        export CYCLONEDDS_URI="file://$FT_CYCLONE_XML"
+# ─── 2. 默认使用 FastDDS (内置 SHM 传输, 同机节点走共享内存) ───
+# FastDDS 是 ROS2 Foxy 默认 RMW, 内置零拷贝 SHM 传输,
+# 32MB ADC 消息不走网络栈, 无 UDP 分片开销.
+#
+# 可选覆盖:
+#   RMW_IMPLEMENTATION=rmw_cyclonedds_cpp bash scripts/start.sh ...
+#   注意: CycloneDDS 0.7.0 无 SHM 支持, 仅推荐跨机通信时使用.
+if [ -z "$RMW_IMPLEMENTATION" ]; then
+    # 默认不设置 → ROS2 自动使用 FastDDS (rmw_fastrtps_cpp)
+    :  # no-op
+fi
+
+# 加载 FastDDS SHM 配置 (128MB 共享内存段, 适配 32MB ADC 帧)
+FT_FASTDDS_XML="$PROJECT_ROOT/config/fastdds.xml"
+if [ -z "$RMW_IMPLEMENTATION" ] || [ "$RMW_IMPLEMENTATION" = "rmw_fastrtps_cpp" ]; then
+    if [ -f "$FT_FASTDDS_XML" ]; then
+        export FASTRTPS_DEFAULT_PROFILES_FILE="$FT_FASTDDS_XML"
     fi
 fi
 

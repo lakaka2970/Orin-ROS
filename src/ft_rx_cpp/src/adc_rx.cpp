@@ -13,7 +13,7 @@
 //   open → QUERYCAP → S_FMT → S_CTRL(bypass_mode) → REQBUFS → QUERYBUF×N →
 //   mmap×N → QBUF×N → STREAMON → (DQBUF→copy→QBUF)×… → STREAMOFF → munmap → close
 //
-// 设计目标: 30 Hz, CycloneDDS SHM 传输.
+// 设计目标: 30 Hz, FastDDS SHM 共享内存传输.
 // ============================================================================
 
 #include <chrono>

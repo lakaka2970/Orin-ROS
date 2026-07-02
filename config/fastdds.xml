@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FT Radar Framework — FastDDS SHM 共享内存传输配置
+  ============================================================================
+  FastDDS (rmw_fastrtps_cpp) 内置 SHM 传输, 同机节点间所有消息走共享内存,
+  32MB ADC 帧不经网络栈, 零 UDP 分片.
+
+  传输策略:
+    - 本地节点 → SHM (共享内存, 128MB 段)
+    - 远程节点 → UDP (自动回退, builtin transports)
+
+  用法:
+    export FASTRTPS_DEFAULT_PROFILES_FILE="/path/to/config/fastdds.xml"
+    (由 scripts/env.sh 自动加载)
+
+  版本要求:
+    - eProsima FastDDS 2.1+ (ROS2 Foxy 自带 2.1.4)
+    - /dev/shm 挂载且可用 (Jetson 默认 tmpfs, ~3.5GB)
+  ============================================================================
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+
+  <!-- ── SHM 传输描述符 ── -->
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>ft_shm_transport</transport_id>
+      <type>SHM</type>
+      <!-- 128MB 段: 容纳 32MB 帧 + 5MB RnNci + 余量 -->
+      <segment_size>134217728</segment_size>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <!-- ── 默认 Participant 配置 (SHM 优先 + UDP 回退) ── -->
+  <participant profile_name="ft_default_participant" is_default_profile="true">
+    <rtps>
+      <!-- 自定义 SHM 传输 -->
+      <userTransports>
+        <transport_id>ft_shm_transport</transport_id>
+      </userTransports>
+      <!-- 保留内置 UDP 传输作为跨机回退 -->
+      <useBuiltinTransports>true</useBuiltinTransports>
+    </rtps>
+  </participant>
+
+</profiles>

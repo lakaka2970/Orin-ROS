@@ -140,7 +140,6 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     # ----- 7. 组装返回字典（移至 CPU）-----
     rb_cpu = final_rb.cpu().numpy()
     db_cpu = final_db.cpu().numpy()
-    vch_cpu = final_vch.cpu().numpy()
     noise_cpu = noise.cpu().numpy()
     p_up_c = p_up.cpu().numpy()
     p_down_c = p_down.cpu().numpy()
@@ -157,7 +156,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
             'u32FrameTimeStamp':   int(frame_timestamp_us),
             'u16FrameId':          int(frame_id),
             'u16NofRdCell':        0,
-            'u8Index_Idletime':    int(idle_time_idx),
+            'u8Index_Idletime':    0,
             'u16Rb':               int(r),
             'u16Db':               int(d),
             'f32PowRbNci_Q7dB':    [float(p_up_c[r, d]),
@@ -166,7 +165,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
             'f32PowDbNci_Q7dB':    [float(p_left_c[r, d]),
                                      float(rx_nci_c[r, d]),
                                      float(p_right_c[r, d])],
-            'f32PeakPowVchNci_Q7dB': float(vch_cpu[i]),
+            'f32PeakPowVchNci_Q7dB': float(rx_nci_c[r, d]),  # RX NCI 功率 (实际信号功率)
             'f32NoiseNci_Q7dB':     float(noise_cpu[r]),
             'u8RdValidFlag':       1,
             'u8RdPeakFlag':        1,
@@ -177,7 +176,6 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
             'pow_rb':  [float(p_up_c[r, d]), float(rx_nci_c[r, d]), float(p_down_c[r, d])],
             'pow_db':  [float(p_left_c[r, d]), float(rx_nci_c[r, d]), float(p_right_c[r, d])],
             'noise':   float(noise_cpu[r]),
-            'pow_vch': float(vch_cpu[i]),
             'channel':       channel_list[i],              # (256,) numpy — 兼容旧代码
             'channel_gpu':   channel_gpu_list[i],          # (256,) GPU tensor — DOA 直通, 零拷贝
         })

@@ -171,7 +171,7 @@ def main():
 
         rng = rb * range_res
         vel = db * doppler_res
-        pow_linear = peak['pow_vch']
+        pow_linear = peak['f32PeakPowVchNci_Q7dB']
         snr_db = 10 * np.log10(pow_linear / peak['noise']) if peak['noise'] > 0 else 0.0
         rcs_db = 10 * np.log10(pow_linear)
 

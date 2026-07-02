@@ -101,8 +101,19 @@ def doa_main_ultra_separated(
         mask = (mag >= left) & (mag >= right) & (mag >= (mag.max() - threshold_db))
         return np.where(mask)[0]
 
+    def sin_snr_lin(mag: np.ndarray, idx: np.ndarray) -> np.uint16:
+        """最强/次强峰值比 (dB) * 1000, clamp 到 uint16"""
+        if len(idx) < 2:
+            return np.uint16(0)
+        peaks = mag[idx]
+        top2 = np.sort(peaks)[-2:]  # 升序取最后2个
+        diff_db = top2[1] - top2[0]
+        return np.uint16(np.clip(diff_db * 1000.0, 0, 65535))
+
     idx_a = find_peaks(mag_azi_db)
     idx_e = find_peaks(mag_ele_db)
+    azi_snr_lin = sin_snr_lin(mag_azi_db, idx_a)
+    ele_snr_lin = sin_snr_lin(mag_ele_db, idx_e)
 
     n_azi = min(len(idx_a), doa_env.max_targets)
     n_ele = min(len(idx_e), doa_env.max_targets)
@@ -172,4 +183,4 @@ def doa_main_ultra_separated(
         )
         #print(f"多目标标志: {is_multi}, 比值(dB): {db_val:.2f}")
 
-    return res_azi, res_ele
+    return res_azi, res_ele, azi_snr_lin, ele_snr_lin

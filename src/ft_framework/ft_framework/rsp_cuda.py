@@ -256,7 +256,7 @@ class RspCudaNode(Node):
 
             # 5a. 批量 DOA: 堆叠所有通道 → 一次并行 FFT (N, 256)
             channel_batch = torch.stack([p['channel_gpu'] for p in peaks])  # (N, 256)
-            all_azi, all_ele = doa_main_batch(channel_batch, doa_threshold_db)
+            all_azi, all_ele, azi_snr, ele_snr = doa_main_batch(channel_batch, doa_threshold_db)
 
             # 5b. 点云生成 (CPU — 结果展开 + 坐标变换)
             det_points = []
@@ -270,11 +270,11 @@ class RspCudaNode(Node):
                 rb = peak['rb']
                 db = peak['db']
                 rng = rb * range_res
-                vel = db * doppler_res
-                pow_linear = peak['pow_vch']
-                snr_db_val = (10.0 * np.log10(pow_linear / peak['noise'])
+                vel = (db - rb*4) * doppler_res
+                pow_linear = peak['f32PeakPowVchNci_Q7dB']
+                snr_db_val = (20.0 * np.log10(pow_linear / peak['noise'])
                               if peak['noise'] > 0 else 0.0)
-                rcs_db_val = 10.0 * np.log10(pow_linear)
+                rcs_db_val = 20.0 * np.log10(pow_linear)
 
                 # 筛选有效目标 (flag==1), 按能量降序
                 valid_azi = [t for t in azi_results if t[0] == 1]
@@ -288,7 +288,8 @@ class RspCudaNode(Node):
                 else:
                     pairs = [(a, e) for a in valid_azi for e in valid_ele]
 
-                for a_target, e_target in pairs:
+                n_pairs = len(pairs)
+                for p_idx, (a_target, e_target) in enumerate(pairs):
                     azi_deg = a_target[4]
                     azi_rad = np.deg2rad(azi_deg)
                     ele_deg = e_target[4]
@@ -305,12 +306,18 @@ class RspCudaNode(Node):
                         'elevation': ele_rad,
                         'rcs': rcs_db_val,
                         'snr': snr_db_val,
+                        'power_db': rcs_db_val,       # 回波功率 dB = 20*log10(pow_linear)
                         'ambgt': ambgt,
                         'exist_prob': 100,
                         'multi_tgt_prob': 100,
                         'ambgt_prob': 100,
                         'raw_doppler': vel,
-                        'idx': 128 if vel != 0 else 0,
+                        'doppler_idx': int(db),       # u16DopplerIdx: 实际多普勒 bin
+                        'azimuth_idx': int(a_target[1]),   # u8AzimuthIdx:   DOA 方位 bin
+                        'elevation_idx': int(e_target[1]), # u8ElevationIdx: DOA 俯仰 bin
+                        'obj_same_rv': (p_idx + 1) if n_pairs > 1 else 0,  # i32ObjSameRV: 同RV, 第1个=1, 第2个=2
+                        'sin_azim_snr_lin': int(azi_snr[i]),   # u16SinAzimSNRLin: 最强/次强比*1000
+                        'sin_elev_snr_lin': int(ele_snr[i]),   # u16SinElevSNRLin
                         'rd_cell_idx': 0,
                         'range_idx': rb,
                         'peak_val': int(np.clip(pow_linear, 0, 65535)),
@@ -350,11 +357,11 @@ class RspCudaNode(Node):
             # -- 信号特征 --
             pt.snr_db       = float(dp['snr'])            # 12. f32SNRdB
             pt.rcs_db       = float(dp['rcs'])            # 13. f32RcsdB
-            pt.power_db     = float(dp['snr'] - 10.0)     # 14. f32PowerdB  回波功率 (SNR 近似换算)
+            pt.power_db     = float(dp['power_db'])        # 14. f32PowerdB  回波功率 dB = 20*log10(amplitude)
 
             # -- 检测标志位 --
             pt.strategy_flag     = 0               # 15. u32StrategyFlag
-            pt.obj_same_rv       = 0               # 16. u32ObjSameRV
+            pt.obj_same_rv       = int(dp.get('obj_same_rv', 0))   # 16. u32ObjSameRV
             pt.obj_quality       = 0               # 17. u32ObjQuality
             pt.obj_track_flag    = 0               # 18. u32ObjTrackFlag
             pt.ele_confident     = 0               # 19. u32EleConfident
@@ -367,14 +374,14 @@ class RspCudaNode(Node):
             # -- RD 索引 --
             pt.rd_cell_idx   = int(dp.get('rd_cell_idx', 0))   # 27. u16RdCellIdx
             pt.range_idx     = int(dp.get('range_idx', 0))     # 28. u16RangeIdx
-            pt.doppler_idx   = int(dp['idx'])                  # 29. u16DopplerIdx
-            pt.azimuth_idx   = 0                               # 30. u8AzimuthIdx
-            pt.elevation_idx = 0                               # 31. u8ElevationIdx
+            pt.doppler_idx   = int(dp.get('doppler_idx', 0))       # 29. u16DopplerIdx
+            pt.azimuth_idx   = int(dp.get('azimuth_idx', 0))       # 30. u8AzimuthIdx
+            pt.elevation_idx = int(dp.get('elevation_idx', 0))     # 31. u8ElevationIdx
 
             # -- 峰值与 SNR --
-            pt.peak_val         = int(dp.get('peak_val', 0))   # 32. u16PeakVal
-            pt.sin_azim_snr_lin = 0                            # 33. u16SinAzimSNRLin
-            pt.sin_elev_snr_lin = 0                            # 34. u16SinElevSNRLin
+            pt.peak_val         = int(dp.get('power_db', 0)*128)       # 32. u16PeakVal
+            pt.sin_azim_snr_lin = int(dp.get('sin_azim_snr_lin', 0))  # 33. u16SinAzimSNRLin
+            pt.sin_elev_snr_lin = int(dp.get('sin_elev_snr_lin', 0))  # 34. u16SinElevSNRLin
 
             # -- 速度解模糊 --
             pt.vel_amb_fac = int(dp.get('vel_amb_fac', 0))     # 35. s8VelAmbFac

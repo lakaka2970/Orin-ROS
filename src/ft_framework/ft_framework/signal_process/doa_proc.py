@@ -29,8 +29,10 @@ class DOA_Ultra_Initializer:
         self.window_gpu = torch.hamming_window(fft_len, periodic=False, dtype=torch.float32, device=DEVICE)
 
         # 锁页内存（pinned memory）用于异步拷贝结果，减少 CPU-GPU 传输延迟
-        self.azi_buffer_pinned = torch.empty((max_targets, 5), dtype=torch.float32, pin_memory=True)
-        self.ele_buffer_pinned = torch.empty((max_targets, 5), dtype=torch.float32, pin_memory=True)
+        # 仅在 CUDA 可用时启用 pin_memory
+        _use_pin = torch.cuda.is_available()
+        self.azi_buffer_pinned = torch.empty((max_targets, 5), dtype=torch.float32, pin_memory=_use_pin)
+        self.ele_buffer_pinned = torch.empty((max_targets, 5), dtype=torch.float32, pin_memory=_use_pin)
 
         self.is_initialized = False
 
@@ -216,7 +218,7 @@ def doa_main_ultra_separated(snap_data, Array_Azi, AziIdx_Select, Array_Ele, Ele
             channel_offsets=channel_offsets,
             lambda_coeff=-np.pi,
             nof_mbf_channel=len(AziIdx_Select),
-            device='cuda'
+            device='cuda' if torch.cuda.is_available() else 'cpu'
         )
 
         # 3. 提取子阵数据

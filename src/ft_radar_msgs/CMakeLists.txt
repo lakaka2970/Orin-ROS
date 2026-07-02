@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Object3D.msg"
   "msg/ObjList.msg"
   "msg/EgoMotion.msg"
+  "msg/RnNciData.msg"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

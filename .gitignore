@@ -35,6 +35,7 @@ ros2_ws/log/
 *.bag
 *.db3
 *.json
+*.csv
 
 # Temporary files
 *.tmp

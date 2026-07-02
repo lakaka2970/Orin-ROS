@@ -72,7 +72,6 @@ from ft_framework.signal_process.doppler import doppler_processing_gpu
 from ft_framework.signal_process.peak_detection import peak_search_gpu
 from ft_framework.signal_process.arraySim import RadarArrayInitializer
 from ft_framework.signal_process.doa_proc import doa_main_ultra_separated, doa_main_batch, doa_env
-from ft_framework.signal_process.data_io import readRawBinCasc
 
 
 # ============================================================================
@@ -120,15 +119,6 @@ class RspCudaNode(Node):
             f'n_rx={self.cfg.n_rx}, '
             f'range_res={self.cfg.range_resolution:.3f}m, '
             f'doppler_res={self.cfg.doppler_resolution:.3f}m/s')
-
-        # 预加载测试 RAW 数据（离线模式）
-        self.raw_data = readRawBinCasc(
-            "/home/orin/projects/radar_test/Orin-ROS/src/ft_framework/ft_framework",
-            frameNr=0,
-            nSamples=self.cfg.n_samples,
-            nRamps=self.cfg.n_chirps,
-            nChannels=self.cfg.n_rx
-        )
 
         # 保留 RSP 处理器作为备用
         rsp_config = {
@@ -239,8 +229,7 @@ class RspCudaNode(Node):
         # ---- 核心 RSP 处理: 完整流水线 (GPU 加速版) ----
         try:
             # 1. ADC 字节 → (512, 16, 2048) 原始数据
-            raw_data = self.raw_data
-            # raw_data = self._adc_bytes_to_raw_data(adc_bytes)
+            raw_data = self._adc_bytes_to_raw_data(adc_bytes)
 
             # 2. 预处理 + Range-FFT (GPU)
             cube, dc_est, _ = radar_signal_process_final(

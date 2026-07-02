@@ -67,7 +67,6 @@ from ft_framework.signal_process.doppler_cpu import doppler_processing_numpy
 from ft_framework.signal_process.peak_detection_cpu import peak_search_numpy
 from ft_framework.signal_process.arraySim_cpu import RadarArrayInitializer
 from ft_framework.signal_process.doa_proc_cpu import doa_main_ultra_separated, doa_env
-from ft_framework.signal_process.data_io import readRawBinCasc
 # ============================================================================
 # ROS2 节点
 # ============================================================================
@@ -113,13 +112,6 @@ class RspMilPythonNode(Node):
             f'n_rx={self.cfg.n_rx}, '
             f'range_res={self.cfg.range_resolution:.3f}m, '
             f'doppler_res={self.cfg.doppler_resolution:.3f}m/s')
-        self.raw_data = readRawBinCasc(
-            "/home/orin/projects/radar_test/Orin-ROS/src/ft_framework/ft_framework",
-            frameNr=0,
-            nSamples=self.cfg.n_samples,
-            nRamps=self.cfg.n_chirps,
-            nChannels=self.cfg.n_rx
-        )
         # 保留 RSP 处理器作为备用（仅在 rsp_mode='cuda' 时使用）
         rsp_config = {
             'snr_threshold':      self.snr_threshold,
@@ -225,8 +217,7 @@ class RspMilPythonNode(Node):
         # ---- 核心 RSP 处理: 完整流水线 (来自 main_timming_test_cpu) ----
         try:
             # 1. ADC 字节 → (512, 16, 2048) 原始数据
-            raw_data = self.raw_data 
-            #raw_data = self._adc_bytes_to_raw_data(adc_bytes)
+            raw_data = self._adc_bytes_to_raw_data(adc_bytes)
 
             # 2. 预处理 + Range-FFT
             cube, dc_est, _ = radar_signal_process_final(

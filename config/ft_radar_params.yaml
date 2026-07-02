@@ -53,8 +53,8 @@ adc_rx:
   num_rows: 1024                           # 总 chirp: 512 chirps/group × 2 groups
   num_chirps_per_row: 8                    # RX 天线数: ctrx0(4) + ctrx1(4) = 8
   num_samples_per_chirp: 2048
-  bin_file_ctrx0: "data/ctrx0_raw.bin"     # 8T8R 半集 0
-  bin_file_ctrx1: "data/ctrx1_raw.bin"     # 8T8R 半集 1
+  bin_file_ctrx0: "/home/zhengyuanliu/Desktop/adc_chamber/ant_0630/range5/5deg/ctrx0_raw.bin"     # 8T8R 半集 0
+  bin_file_ctrx1: "/home/zhengyuanliu/Desktop/adc_chamber/ant_0630/range5/5deg/ctrx1_raw.bin"     # 8T8R 半集 1
   frame_size_bytes: 33554432               # 1024×8×2048×2 = 32 MiB
   data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
   max_preload_files: 30                    # 最多预加载文件数 (~960 MB)

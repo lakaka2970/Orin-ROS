@@ -1,75 +1,26 @@
 """
-主程序入口：完整雷达信号处理流水线，包含数据读取、距离处理、多普勒处理、
-峰值检测、DOA 估计，最终生成点云并保存为 PCD/CSV 文件。
+主程序入口 — GPU 版本参数对齐 rsp_cuda, 用于单独验证信号处理流水线。
 """
 
 import time
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 from config import RadarConfig
 from data_io import readRawBinCasc
 from preprocessing import radar_signal_process_final
 from doppler import doppler_processing_gpu
 from peak_detection import peak_search_gpu
-from arraySim import RadarArrayInitializer
-from doa_proc import doa_main_ultra_separated, doa_env
-from plotting import (plot_range_profile, plot_range_chirp_energy,
-                      plot_rd_cube, plot_rx_nci, plot_noise_estimation,
-                      plot_vch_nci, plot_max_subband, plot_peaks_on_vch)
+from doa_proc import doa_main_batch, doa_main_ultra_separated, doa_env
 
 DEVICE = torch.device('cuda')
 
 
-def save_pointcloud_pcd(points: list, filename: str, timestamp_us: int):
-    """将点云保存为 PCD (Point Cloud Data) 格式 (ASCII)。"""
-    if not points:
-        print("无有效点云，跳过 PCD 保存")
-        return
-    pcd_path = f"{filename}_{timestamp_us}.pcd"
-    with open(pcd_path, 'w') as f:
-        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
-        f.write("VERSION 0.7\n")
-        f.write("FIELDS x y z range azimuth elevation RCS SNR ambgt exist_prob multi_tgt_prob ambgt_prob raw_doppler idx\n")
-        f.write("SIZE 4 4 4 4 4 4 4 4 4 1 1 1 4 1\n")
-        f.write("TYPE F F F F F F F F F U U U F U\n")
-        f.write("COUNT 1 1 1 1 1 1 1 1 1 1 1 1 1 1\n")
-        f.write(f"WIDTH {len(points)}\n")
-        f.write("HEIGHT 1\n")
-        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-        f.write(f"POINTS {len(points)}\n")
-        f.write("DATA ascii\n")
-        for p in points:
-            f.write(f"{p['x']:.6f} {p['y']:.6f} {p['z']:.6f} "
-                    f"{p['range']:.6f} {p['azimuth']:.6f} {p['elevation']:.6f} "
-                    f"{p['RCS']:.2f} {p['SNR']:.2f} {p['ambgt']:.3f} "
-                    f"{p['exist_prob']} {p['multi_tgt_prob']} {p['ambgt_prob']} "
-                    f"{p['raw_doppler']:.3f} {p['idx']}\n")
-    print(f"PCD 已保存: {pcd_path}")
-
-
-def save_pointcloud_csv(points: list, filename: str, timestamp_us: int):
-    """将点云保存为 CSV 格式。"""
-    if not points:
-        return
-    csv_path = f"{filename}_{timestamp_us}.csv"
-    with open(csv_path, 'w') as f:
-        f.write("x,y,z,range,azimuth,elevation,RCS,SNR,ambgt,exist_prob,multi_tgt_prob,ambgt_prob,raw_doppler,idx\n")
-        for p in points:
-            f.write(f"{p['x']:.6f},{p['y']:.6f},{p['z']:.6f},"
-                    f"{p['range']:.6f},{p['azimuth']:.6f},{p['elevation']:.6f},"
-                    f"{p['RCS']:.2f},{p['SNR']:.2f},{p['ambgt']:.3f},"
-                    f"{p['exist_prob']},{p['multi_tgt_prob']},{p['ambgt_prob']},"
-                    f"{p['raw_doppler']:.3f},{p['idx']}\n")
-    print(f"CSV 已保存: {csv_path}")
-
-
 def main():
-    """主处理流程。"""
     cfg = RadarConfig()
-    array_env = RadarArrayInitializer(use_gpu=True)
 
-    # ---- 天线阵列定义（用户指定）----
+    # ---- 天线阵列定义（与 rsp_cuda 一致）----
     AzmChUse = np.array([0,1,2,8,9,10,11,12,13,14,15,16,17,18,24,25,26,27,28,31,32,33,34,40,
                          42,43,45,46,48,49,50,56,58,59,61,62,64,65,66,72,74,75,77,78,80,81,82,
                          88,90,91,93,94,96,97,98,106,107,110,112,113,114,126,208,216,217,218,219,
@@ -85,90 +36,138 @@ def main():
 
     n_azi = len(AzmPosUse)
     n_ele = len(ElvPosUse)
-    Array_Azi_test = np.zeros((3, n_azi), dtype=np.float32)
-    Array_Azi_test[0, :] = AzmPosUse                                  # AzmPosUse → Array_Azi[0, :]
-    Array_Ele_test = np.zeros((3, n_ele), dtype=np.float32)
-    Array_Ele_test[1, :] = ElvPosUse                                  # ElvPosUse → Array_Ele[1, :]
+    Array_Azi = np.zeros((3, n_azi), dtype=np.float32)
+    Array_Azi[0, :] = AzmPosUse
+    Array_Ele = np.zeros((3, n_ele), dtype=np.float32)
+    Array_Ele[1, :] = ElvPosUse
 
-    # 转换为 GPU tensor
-    Array_Azi_test_gpu = torch.from_numpy(Array_Azi_test).to(DEVICE)
-    Array_Ele_test_gpu = torch.from_numpy(Array_Ele_test).to(DEVICE)
-    AzmChUse_gpu = torch.from_numpy(AzmChUse).to(DEVICE)
-    ElvChUse_gpu = torch.from_numpy(ElvChUse).to(DEVICE)
-    # ------------------------------------------
+    # GPU tensor 版本
+    AziIdx_Select_gpu = torch.from_numpy(AzmChUse).to(DEVICE)
+    EleIdx_Select_gpu = torch.from_numpy(ElvChUse).to(DEVICE)
+    Array_Azi_gpu = torch.from_numpy(Array_Azi).to(DEVICE)
+    Array_Ele_gpu = torch.from_numpy(Array_Ele).to(DEVICE)
 
-    total_start = time.perf_counter()
+    # 初始化 DOA 环境
+    if not doa_env.is_initialized:
+        doa_env.prepare_mapping_indices(Array_Azi, Array_Ele)
+        doa_env.cache_selection_indices(AziIdx_Select_gpu, EleIdx_Select_gpu)
 
-    # ----- 1. 读取二进制数据 -----
+    # ----- 1. 读取数据 -----
     raw_data = readRawBinCasc(
-        ".",
-        frameNr=0,
-        nSamples=cfg.n_samples,
-        nRamps=cfg.n_chirps,
-        nChannels=cfg.n_rx
-    )
+        ".", frameNr=0,
+        nSamples=cfg.n_samples, nRamps=cfg.n_chirps, nChannels=cfg.n_rx)
     print(f"原始数据形状: {raw_data.shape}")
 
-    # ----- 2. GPU 预热（执行三次，消除首次编译/显存分配开销）-----
+    # ----- 2. GPU 预热 -----
     for _ in range(3):
-        cube, dc, nof = radar_signal_process_final(
-            raw_data, cfg.n_samples, cfg.n_rx, cfg.n_chirps, threshold_scale=cfg.threshold_scale
-        )
-        rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci = doppler_processing_gpu(
-            cube, cfg.n_rx, cfg.n_chirps, 1025, cfg.tx_ddma_idx, cfg.n_subbands, noise_est_ratio=cfg.noise_est_ratio
-        )
+        cube, dc, _ = radar_signal_process_final(
+            raw_data, cfg.n_samples, cfg.n_rx, cfg.n_chirps,
+            threshold_scale=cfg.threshold_scale)
+        rd, rx, noise, vch, ms_idx, mv = doppler_processing_gpu(
+            cube, cfg.n_rx, cfg.n_chirps, cube.shape[2],
+            cfg.tx_ddma_idx, cfg.n_subbands, cfg.noise_est_ratio)
         peaks = peak_search_gpu(
-            rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise_est,
-            cfg.tx_ddma_idx, 1025, cfg.n_chirps, cfg.n_subbands,
+            rd, mv, ms_idx, rx, noise,
+            cfg.tx_ddma_idx, cube.shape[2], cfg.n_chirps, cfg.n_subbands,
             ps_scale=cfg.ps_scale, max_peaks_per_rb=cfg.max_peaks_per_rb,
-            max_total_peaks=cfg.max_total_peaks
-        )
-        for peak in peaks:
-            channel_data = torch.from_numpy(peak['channel']).to(DEVICE, non_blocking=True)
-            _ = doa_main_ultra_separated(
-                channel_data,
-                Array_Azi_test_gpu,
-                AzmChUse_gpu,
-                Array_Ele_test_gpu,
-                ElvChUse_gpu
-            )
+            max_total_peaks=cfg.max_total_peaks)
+        if peaks:
+            ch_batch = torch.stack([p['channel_gpu'] for p in peaks])
+            doa_main_batch(ch_batch, 28.0)
     torch.cuda.synchronize()
 
-    # ----- 3. 正式处理并计时 -----
-    t_start = time.perf_counter()
+    # ----- 3. 正式处理 + 计时 -----
+    t0 = time.perf_counter()
 
-    # 距离处理 + 多普勒处理 + 峰值检测
-    cube, dc, nof = radar_signal_process_final(
-        raw_data, cfg.n_samples, cfg.n_rx, cfg.n_chirps, threshold_scale=cfg.threshold_scale
-    )
-    rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci = doppler_processing_gpu(
-        cube, cfg.n_rx, cfg.n_chirps, 1025, cfg.tx_ddma_idx, cfg.n_subbands, noise_est_ratio=cfg.noise_est_ratio
-    )
+    cube, dc, _ = radar_signal_process_final(
+        raw_data, cfg.n_samples, cfg.n_rx, cfg.n_chirps,
+        threshold_scale=cfg.threshold_scale)
+    rd_cube, rx_nci, noise_est, vch_nci, max_subband_idx, max_vch_nci = \
+        doppler_processing_gpu(
+            cube, cfg.n_rx, cfg.n_chirps, cube.shape[2],
+            cfg.tx_ddma_idx, cfg.n_subbands, cfg.noise_est_ratio)
     peaks = peak_search_gpu(
         rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise_est,
-        cfg.tx_ddma_idx, 1025, cfg.n_chirps, cfg.n_subbands,
+        cfg.tx_ddma_idx, cube.shape[2], cfg.n_chirps, cfg.n_subbands,
         ps_scale=cfg.ps_scale, max_peaks_per_rb=cfg.max_peaks_per_rb,
-        max_total_peaks=cfg.max_total_peaks
-    )
+        max_total_peaks=cfg.max_total_peaks)
 
-    # ----- 4. DOA 估计与点云生成 -----
-
+    # ====== 4a. 新方法: 批量 DOA (doa_main_batch) ======
     doa_threshold_db = 28.0
     range_res = cfg.range_resolution
     doppler_res = cfg.doppler_resolution
     ambgt = cfg.ambgt
 
-    points = []
-    doa_env.prepare_mapping_indices(Array_Azi_test_gpu, Array_Ele_test_gpu)
+    t_batch = time.perf_counter()
+    channel_batch = torch.stack([p['channel_gpu'] for p in peaks])  # (N, 256)
+    # Debug: 找出 rb==16, db==63 的 peak 索引
+    debug_idx = [i for i, p in enumerate(peaks) if p['rb'] == 16 and p['db'] == 63]
+    all_azi, all_ele, azi_snr, ele_snr = doa_main_batch(
+        channel_batch, doa_threshold_db, debug_indices=debug_idx)
+    torch.cuda.synchronize()
+    t_batch = (time.perf_counter() - t_batch) * 1000.0
 
+    points_batch = []
+    for i, peak in enumerate(peaks):
+        azi_results = all_azi[i]
+        ele_results = all_ele[i]
+        if len(azi_results) == 0 or len(ele_results) == 0:
+            continue
+
+        rb, db = peak['rb'], peak['db']
+        rng = rb * range_res
+        vel = db * doppler_res
+        pow_linear = peak['f32PeakPowVchNci_Q7dB']
+        noise_val = peak['noise']
+        snr_db = (20.0 * np.log10(pow_linear / noise_val) if noise_val > 0 else 0.0)
+        rcs_db = 20.0 * np.log10(pow_linear)
+
+        valid_azi = [t for t in azi_results if t[0] == 1]
+        valid_ele = [t for t in ele_results if t[0] == 1]
+        valid_azi.sort(key=lambda t: t[2], reverse=True)
+        valid_ele.sort(key=lambda t: t[2], reverse=True)
+
+        if len(valid_azi) == 2 and len(valid_ele) == 2:
+            pairs = [(valid_azi[0], valid_ele[0]), (valid_azi[1], valid_ele[1])]
+        else:
+            pairs = [(a, e) for a in valid_azi for e in valid_ele]
+
+        n_pairs = len(pairs)
+        for p_idx, (a_target, e_target) in enumerate(pairs):
+            azi_rad, ele_rad = np.deg2rad(a_target[4]), np.deg2rad(e_target[4])
+            x = rng * np.cos(ele_rad) * np.cos(azi_rad)
+            y = rng * np.cos(ele_rad) * np.sin(azi_rad)
+            z = rng * np.sin(ele_rad)
+
+            points_batch.append({
+                'x': x, 'y': y, 'z': z,
+                'range': rng,
+                'azimuth': azi_rad, 'elevation': ele_rad,
+                'rcs': rcs_db, 'snr': snr_db, 'power_db': rcs_db,
+                'ambgt': ambgt,
+                'exist_prob': 100, 'multi_tgt_prob': 100, 'ambgt_prob': 100,
+                'raw_doppler': vel,
+                'doppler_idx': int(db),
+                'azimuth_idx': int(a_target[1]),
+                'elevation_idx': int(e_target[1]),
+                'obj_same_rv': (p_idx + 1) if n_pairs > 1 else 0,
+                'rd_cell_idx': 0, 'range_idx': rb,
+                'peak_val': int(np.clip(pow_linear, 0, 65535)),
+                'sin_azim_snr_lin': int(azi_snr[i]) if i < len(azi_snr) else 0,
+                'sin_elev_snr_lin': int(ele_snr[i]) if i < len(ele_snr) else 0,
+                'vel_amb_fac': 0, 'det_ambig_state': 0, 'det_motion_pat': 0,
+            })
+
+    # ====== 4b. 旧方法: 逐峰 DOA (doa_main_ultra_separated) ======
+    t_sep = time.perf_counter()
+    points_sep = []
     for peak in peaks:
-        rb = peak['rb']
-        db = peak['db']
-        channel_data = torch.from_numpy(peak['channel']).to(DEVICE, non_blocking=True)
+        rb, db = peak['rb'], peak['db']
+        channel_data = peak['channel_gpu']
 
         azi_results, ele_results = doa_main_ultra_separated(
-            channel_data, Array_Azi_test_gpu, AzmChUse_gpu, Array_Ele_test_gpu, ElvChUse_gpu, doa_threshold_db
-        )
+            channel_data, Array_Azi_gpu, AziIdx_Select_gpu,
+            Array_Ele_gpu, EleIdx_Select_gpu,rb, db, doa_threshold_db)
 
         if azi_results.shape[0] == 0 or ele_results.shape[0] == 0:
             continue
@@ -176,52 +175,121 @@ def main():
         rng = rb * range_res
         vel = db * doppler_res
         pow_linear = peak['f32PeakPowVchNci_Q7dB']
-        snr_db = 10 * np.log10(pow_linear / peak['noise']) if peak['noise'] > 0 else 0
-        rcs_db = 10 * np.log10(pow_linear)
+        noise_val = peak['noise']
+        snr_db = (20.0 * np.log10(pow_linear / noise_val) if noise_val > 0 else 0.0)
+        rcs_db = 20.0 * np.log10(pow_linear)
 
-        # 交叉配对方位与俯仰（简单笛卡尔积）
         for a_target in azi_results:
             if a_target[0] != 1:
                 continue
-            azi_deg = a_target[4]
-            azi_rad = np.deg2rad(azi_deg)
             for e_target in ele_results:
                 if e_target[0] != 1:
                     continue
-                ele_deg = e_target[4]
-                ele_rad = np.deg2rad(ele_deg)
-
+                azi_rad, ele_rad = np.deg2rad(a_target[4]), np.deg2rad(e_target[4])
                 x = rng * np.cos(ele_rad) * np.cos(azi_rad)
                 y = rng * np.cos(ele_rad) * np.sin(azi_rad)
                 z = rng * np.sin(ele_rad)
 
-                points.append({
+                points_sep.append({
                     'x': x, 'y': y, 'z': z,
                     'range': rng,
-                    'azimuth': azi_rad,
-                    'elevation': ele_rad,
-                    'RCS': rcs_db,
-                    'SNR': snr_db,
+                    'azimuth': azi_rad, 'elevation': ele_rad,
+                    'rcs': rcs_db, 'snr': snr_db, 'power_db': rcs_db,
                     'ambgt': ambgt,
-                    'exist_prob': 100,
-                    'multi_tgt_prob': 100,
-                    'ambgt_prob': 100,
+                    'exist_prob': 100, 'multi_tgt_prob': 100, 'ambgt_prob': 100,
                     'raw_doppler': vel,
-                    'idx': 128 if vel != 0 else 0
+                    'doppler_idx': int(db),
+                    'azimuth_idx': int(a_target[1]),
+                    'elevation_idx': int(e_target[1]),
+                    'obj_same_rv': 0,
+                    'rd_cell_idx': 0, 'range_idx': rb,
+                    'peak_val': int(np.clip(pow_linear, 0, 65535)),
+                    'sin_azim_snr_lin': 0,
+                    'sin_elev_snr_lin': 0,
+                    'vel_amb_fac': 0, 'det_ambig_state': 0, 'det_motion_pat': 0,
                 })
-
-    timestamp_us = int(time.time() * 1e6)
     torch.cuda.synchronize()
-    t_end = time.perf_counter()
+    t_sep = (time.perf_counter() - t_sep) * 1000.0
 
-    print(f"GPU 纯运算耗时: {(t_end - t_start) * 1000:.2f} ms")
-    print(f"检测到 {len(peaks)} 个峰值")
+    t_total = (time.perf_counter() - t0) * 1000.0
 
-    if points:
-        save_pointcloud_pcd(points, "radar_pointcloud", timestamp_us)
-        save_pointcloud_csv(points, "radar_pointcloud", timestamp_us)
-    else:
-        print("DOA 未产生有效点云，跳过保存")
+    # ---- 对比输出 ----
+    print(f"\n{'='*60}")
+    print(f"峰值数: {len(peaks)}")
+    print(f"新方法 (批量 batch):   {len(points_batch):4d} 个点云,  DOA 耗时 {t_batch:.1f} ms")
+    print(f"旧方法 (逐峰 separated): {len(points_sep):4d} 个点云,  DOA 耗时 {t_sep:.1f} ms")
+    print(f"GPU 总耗时: {t_total:.1f} ms")
+    print(f"{'='*60}\n")
+
+    # ---- 保存 PCD ----
+    timestamp_us = int(time.time() * 1e6)
+    if points_batch:
+        _save_pcd(points_batch, f"radar_pointcloud_batch_{timestamp_us}.pcd")
+    if points_sep:
+        _save_pcd(points_sep, f"radar_pointcloud_sep_{timestamp_us}.pcd")
+
+
+def _save_pcd(points, filepath):
+    """保存为 PCD v0.7 ASCII 格式 (22 字段)。"""
+    fields = [
+        ('u32TimeStamp',     4, 'U'),
+        ('u16FrameID',       2, 'U'),
+        ('u16DetObjNum',     2, 'U'),
+        ('f32XPos',          4, 'F'),
+        ('f32YPos',          4, 'F'),
+        ('f32ZPos',          4, 'F'),
+        ('f32Range',         4, 'F'),
+        ('f32Speed',         4, 'F'),
+        ('f32AzimuthAng',    4, 'F'),
+        ('f32EleAng',        4, 'F'),
+        ('f32SNRdB',         4, 'F'),
+        ('f32RcsdB',         4, 'F'),
+        ('f32PowerdB',       4, 'F'),
+        ('u32ObjSameRV',     4, 'U'),
+        ('u16RdCellIdx',     2, 'U'),
+        ('u16RangeIdx',      2, 'U'),
+        ('u16DopplerIdx',    2, 'U'),
+        ('u8AzimuthIdx',     1, 'U'),
+        ('u8ElevationIdx',   1, 'U'),
+        ('u16PeakVal',       2, 'U'),
+        ('u16SinAzimSNRLin', 2, 'U'),
+        ('u16SinElevSNRLin', 2, 'U'),
+    ]
+    fields_str = ' '.join(f[0] for f in fields)
+    size_str   = ' '.join(str(f[1]) for f in fields)
+    type_str   = ' '.join(f[2] for f in fields)
+    n = len(points)
+
+    keys = ['x', 'y', 'z', 'range', 'raw_doppler', 'azimuth', 'elevation',
+            'snr', 'rcs', 'power_db', 'obj_same_rv', 'rd_cell_idx', 'range_idx',
+            'doppler_idx', 'azimuth_idx', 'elevation_idx', 'peak_val',
+            'sin_azim_snr_lin', 'sin_elev_snr_lin']
+
+    with open(filepath, 'w') as f:
+        f.write("# .PCD v0.7 - Point Cloud Data file format\n"
+                "VERSION 0.7\n"
+                f"FIELDS {fields_str}\n"
+                f"SIZE {size_str}\n"
+                f"TYPE {type_str}\n"
+                "COUNT " + " ".join("1" for _ in fields) + "\n"
+                f"WIDTH {n}\nHEIGHT 1\n"
+                "VIEWPOINT 0 0 0 1 0 0 0\n"
+                f"POINTS {n}\nDATA ascii\n")
+        for p in points:
+            row = (
+                f"0 0 {n} "   # timestamp, frame_id, det_obj_num
+                f"{p['x']:.6f} {p['y']:.6f} {p['z']:.6f} "
+                f"{p['range']:.6f} {abs(p['raw_doppler']):.6f} "
+                f"{p['azimuth']:.6f} {p['elevation']:.6f} "
+                f"{p['snr']:.6f} {p['rcs']:.6f} {p.get('power_db', 0):.6f} "
+                f"{p.get('obj_same_rv', 0)} "
+                f"{p.get('rd_cell_idx', 0)} {p.get('range_idx', 0)} {p.get('doppler_idx', 0)} "
+                f"{p.get('azimuth_idx', 0)} {p.get('elevation_idx', 0)} "
+                f"{p.get('peak_val', 0)} "
+                f"{p.get('sin_azim_snr_lin', 0)} {p.get('sin_elev_snr_lin', 0)}\n"
+            )
+            f.write(row)
+    print(f"PCD 已保存: {filepath}")
 
 
 if __name__ == "__main__":

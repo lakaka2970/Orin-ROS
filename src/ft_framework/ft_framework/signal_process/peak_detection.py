@@ -5,9 +5,12 @@ TopK 截断，同时提取对应通道的复数据用于 DOA 估计。
 
 import torch
 import numpy as np
-from  ft_framework.signal_process.calibration import apply_calibration
+from  ft_framework.signal_process.calibration import apply_calibration, _CAL_VEC as CAL_VEC_NP
 
 DEVICE = torch.device('cuda')
+
+# 校准系数 GPU 版本 (256,), complex, 在 GPU 上常驻
+_CAL_VEC_GPU = torch.from_numpy(CAL_VEC_NP.astype(np.complex64)).to(DEVICE)
 
 
 @torch.inference_mode()
@@ -153,6 +156,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     # 通道校准
     if do_calibrate:
         channel_list = [apply_calibration(ch) for ch in channel_list]
+        channel_gpu_list = [ch * _CAL_VEC_GPU for ch in channel_gpu_list]
 
     # ----- 7. 组装返回字典（移至 CPU）-----
     rb_cpu = final_rb.cpu().numpy()

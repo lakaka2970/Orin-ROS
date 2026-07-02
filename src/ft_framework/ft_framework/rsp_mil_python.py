@@ -393,7 +393,7 @@ class RspMilPythonNode(Node):
             pt.elevation_idx = int(dp.get('elevation_idx', 0))     # 31. u8ElevationIdx
 
             # -- 峰值与 SNR --
-            pt.peak_val         = int(dp.get('peak_val', 0)*32)   # 32. u16PeakVal
+            pt.peak_val         = int(dp.get('peak_val', 0)*128)   # 32. u16PeakVal
             pt.sin_azim_snr_lin = int(dp.get('sin_azim_snr_lin', 0))  # 33. u16SinAzimSNRLin
             pt.sin_elev_snr_lin = int(dp.get('sin_elev_snr_lin', 0))  # 34. u16SinElevSNRLin
 

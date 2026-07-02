@@ -116,7 +116,7 @@ def main():
         doa_main_ultra_separated(
             peaks_warm[0]['channel'],
             Array_Azi_test, AzmChUse,
-            Array_Ele_test, ElvChUse, 0,
+            Array_Ele_test, ElvChUse, 0,0,0
         )
 
     # ----- 正式计时处理 -----
@@ -185,7 +185,7 @@ def main():
         azi_results, ele_results , azi_snr_lin, ele_snr_lin= doa_main_ultra_separated(
             channel_data,
             Array_Azi_test, AzmChUse,
-            Array_Ele_test, ElvChUse,
+            Array_Ele_test, ElvChUse,rb,db,
             doa_threshold_db
         )
         if len(azi_results) == 0 or len(ele_results) == 0:

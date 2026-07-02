@@ -5,7 +5,7 @@ TopK 截断，同时提取对应通道的复数据用于 DOA 估计。
 
 import torch
 import numpy as np
-from ft_framework.signal_process.calibration import apply_calibration
+from  ft_framework.signal_process.calibration import apply_calibration
 
 DEVICE = torch.device('cuda')
 
@@ -131,6 +131,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     # ----- 6. 提取每个峰值的通道数据（256 个虚拟通道）-----
     n_peaks = final_rb.shape[0]
     channel_list = []
+    channel_gpu_list = []
     for i in range(n_peaks):
         rb = final_rb[i]
         db = final_db[i]
@@ -145,6 +146,7 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
         if invalid.any():
             channel_vec[invalid] = 0.0
 
+        channel_gpu_list.append(channel_vec)                         # (256,) GPU tensor — DOA 直通, 零拷贝
         channel_flat = channel_vec.cpu().numpy()                     # (256,)
         channel_list.append(channel_flat)
 

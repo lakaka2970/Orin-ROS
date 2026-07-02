@@ -116,7 +116,7 @@ def main():
         doa_main_ultra_separated(
             peaks_warm[0]['channel'],
             Array_Azi_test, AzmChUse,
-            Array_Ele_test, ElvChUse, 0, 0,0
+            Array_Ele_test, ElvChUse, 0,
         )
 
     # ----- 正式计时处理 -----
@@ -182,10 +182,10 @@ def main():
         db = peak['db']
         channel_data = peak['channel']           # 形状 (256,)
 
-        azi_results, ele_results = doa_main_ultra_separated(
+        azi_results, ele_results , azi_snr_lin, ele_snr_lin= doa_main_ultra_separated(
             channel_data,
             Array_Azi_test, AzmChUse,
-            Array_Ele_test, ElvChUse, rb, db,
+            Array_Ele_test, ElvChUse,
             doa_threshold_db
         )
         if len(azi_results) == 0 or len(ele_results) == 0:
@@ -193,7 +193,7 @@ def main():
 
         rng = rb * range_res
         vel = (db - rb*4)* doppler_res
-        pow_linear = peak['pow_vch']
+        pow_linear = peak['f32PeakPowVchNci_Q7dB']
         snr_db = 10 * np.log10(pow_linear / peak['noise']) if peak['noise'] > 0 else 0.0
         rcs_db = 10 * np.log10(pow_linear)
 

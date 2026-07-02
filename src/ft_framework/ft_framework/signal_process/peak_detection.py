@@ -130,52 +130,63 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
         # 单次 GPU→CPU 批量传输
         channels_np = channel_flat_all.cpu().numpy()              # (N, 256)
         calibrated_np = [apply_calibration(ch) for ch in channels_np]
-        # 单次 CPU→GPU 批量回传
+        # ★ 单次 CPU→GPU 批量回传: 替代 N 次 torch.from_numpy().to(DEVICE)
+        #   原来: N 次独立 cudaMemcpy (每次 ~2KB), 累积 launch 开销 ~2ms
+        #   现在: 1 次 cudaMemcpy (N×2KB), launch 开销 ~5μs
         channel_list = calibrated_np
-        channel_gpu_list = [torch.from_numpy(ch).to(DEVICE) for ch in calibrated_np]
+        if calibrated_np:
+            calibrated_batch = torch.from_numpy(np.stack(calibrated_np)).to(DEVICE)
+            channel_gpu_list = [calibrated_batch[i] for i in range(len(calibrated_np))]
+        else:
+            channel_gpu_list = []
     else:
         channel_list = [ch.cpu().numpy() for ch in channel_flat_all]
         channel_gpu_list = [ch for ch in channel_flat_all]        # 保持 GPU tensor 引用
 
-    # ----- 7. 组装返回字典（移至 CPU）-----
-    rb_cpu = final_rb.cpu().numpy()
-    db_cpu = final_db.cpu().numpy()
-    noise_cpu = noise.cpu().numpy()
-    p_up_c = p_up.cpu().numpy()
-    p_down_c = p_down.cpu().numpy()
-    p_left_c = p_left.cpu().numpy()
-    p_right_c = p_right.cpu().numpy()
-    rx_nci_c = rx_nci_rd.cpu().numpy()
+    # ----- 8. GPU 稀疏 gather: 仅提取峰值位置的邻域值, 避免传输完整 2D 数组 -----
+    # 原方案: 8 × (512×1025) float32 ≈ 16 MB GPU→CPU
+    # 优化后: ~200 peaks × 8 值 × 4B ≈ 6 KB (2500x 传输量减少)
+    rb_g = final_rb  # (N,) int64 on GPU
+    db_g = final_db  # (N,) int64 on GPU
 
-    # ----- 8. 组装返回字典（字段与 RDCell 结构体对齐）-----
+    p_up_vals   = p_up[rb_g, db_g].cpu().numpy()      # (N,) float32
+    p_down_vals = p_down[rb_g, db_g].cpu().numpy()
+    p_left_vals = p_left[rb_g, db_g].cpu().numpy()
+    p_right_vals= p_right[rb_g, db_g].cpu().numpy()
+    rx_nci_vals = rx_nci_rd[rb_g, db_g].cpu().numpy() # (N,) float32
+    noise_vals  = noise[rb_g].cpu().numpy()            # (N,) float32
+    rb_cpu = rb_g.cpu().numpy()
+    db_cpu = db_g.cpu().numpy()
+
+    # ----- 9. 组装返回字典（字段与 RDCell 结构体对齐）-----
     rdcell_list = []
     for i in range(len(rb_cpu)):
-        r, d = rb_cpu[i], db_cpu[i]
+        r, d = int(rb_cpu[i]), int(db_cpu[i])
 
         rdcell_list.append({
             'u32FrameTimeStamp':   int(frame_timestamp_us),
             'u16FrameId':          int(frame_id),
             'u16NofRdCell':        0,
             'u8Index_Idletime':    0,
-            'u16Rb':               int(r),
-            'u16Db':               int(d),
-            'f32PowRbNci_Q7dB':    [float(p_up_c[r, d]),
-                                     float(rx_nci_c[r, d]),
-                                     float(p_down_c[r, d])],
-            'f32PowDbNci_Q7dB':    [float(p_left_c[r, d]),
-                                     float(rx_nci_c[r, d]),
-                                     float(p_right_c[r, d])],
-            'f32PeakPowVchNci_Q7dB': float(rx_nci_c[r, d]),  # RX NCI 功率 (实际信号功率)
-            'f32NoiseNci_Q7dB':     float(noise_cpu[r]),
+            'u16Rb':               r,
+            'u16Db':               d,
+            'f32PowRbNci_Q7dB':    [float(p_up_vals[i]),
+                                     float(rx_nci_vals[i]),
+                                     float(p_down_vals[i])],
+            'f32PowDbNci_Q7dB':    [float(p_left_vals[i]),
+                                     float(rx_nci_vals[i]),
+                                     float(p_right_vals[i])],
+            'f32PeakPowVchNci_Q7dB': float(rx_nci_vals[i]),  # RX NCI 功率 (实际信号功率)
+            'f32NoiseNci_Q7dB':     float(noise_vals[i]),
             'u8RdValidFlag':       1,
             'u8RdPeakFlag':        1,
             'sVch':                channel_list[i],        # complex64(256,) numpy
             # 兼容旧字段
-            'rb':      int(r),
-            'db':      int(d),
-            'pow_rb':  [float(p_up_c[r, d]), float(rx_nci_c[r, d]), float(p_down_c[r, d])],
-            'pow_db':  [float(p_left_c[r, d]), float(rx_nci_c[r, d]), float(p_right_c[r, d])],
-            'noise':   float(noise_cpu[r]),
+            'rb':      r,
+            'db':      d,
+            'pow_rb':  [float(p_up_vals[i]), float(rx_nci_vals[i]), float(p_down_vals[i])],
+            'pow_db':  [float(p_left_vals[i]), float(rx_nci_vals[i]), float(p_right_vals[i])],
+            'noise':   float(noise_vals[i]),
             'channel':       channel_list[i],              # (256,) numpy — 兼容旧代码
             'channel_gpu':   channel_gpu_list[i],          # (256,) GPU tensor — DOA 直通, 零拷贝
         })

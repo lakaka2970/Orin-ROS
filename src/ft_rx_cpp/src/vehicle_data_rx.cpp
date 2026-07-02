@@ -13,7 +13,11 @@
 // 用法: vehicle_data_rx_cpp, 由 launch 文件自动启动.
 // ============================================================================
 
+#include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -39,6 +43,7 @@ public:
     declare_parameter("defaults.ay", 0.0);
     declare_parameter("defaults.gear", 1);
     declare_parameter("can_interface", "can0");
+    declare_parameter("ego_data_file", "data/ego_motion.csv");
 
     fps_            = get_parameter("fps").as_double();
     timeout_cycles_ = get_parameter("timeout_cycles").as_int();
@@ -77,8 +82,14 @@ public:
   {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     if (buffer_valid_) {
-      // 从 buffer 拷贝最新 CAN 数据
-      msg = latest_ego_;
+      // 从 buffer 拷贝最新 CAN 数据 (仅拷贝数据字段, 保留 header 由 execute_frame 设置)
+      msg.vx              = latest_ego_.vx;
+      msg.yaw_rate        = latest_ego_.yaw_rate;
+      msg.steering_angle  = latest_ego_.steering_angle;
+      msg.ax              = latest_ego_.ax;
+      msg.ay              = latest_ego_.ay;
+      msg.gear            = latest_ego_.gear;
+      msg.is_default      = false;
       // 超时检测: 超过 timeout_cycles 周期未收到 CAN 数据 → 切换默认值
       int64_t now_ns = this->now().nanoseconds();
       int64_t elapsed = now_ns - last_can_update_ns_;
@@ -106,29 +117,70 @@ public:
     msg.is_default      = true;
   }
 
-  // ── CAN 读取线程: 持续轮询 CAN 总线, 更新 buffer ──
+  // ── 数据读取线程: 从 CSV 文件读取 ego-motion 假数据, 持续循环 ──
+  // 文件格式:  vx,yaw_rate,steering_angle,ax,ay,gear (CSV with header)
+  // 按 fps 速率逐行读取 → 更新 buffer → timer 发布时附上当前时间戳.
+  // EOF 时回到数据首行继续循环.  文件缺失时回退为静默等待.
   void can_read_loop()
   {
+    std::string ego_file = get_parameter("ego_data_file").as_string();
+    auto period = std::chrono::duration<double>(1.0 / fps_);
+
     while (rclcpp::ok() && !stop_read_) {
-#ifdef USE_REAL_CAN
-      // TODO: 接入真实 CAN 总线后, 使用 poll() + read() 阻塞读取 CAN 帧
-      // struct pollfd pfd = {can_fd_, POLLIN, 0};
-      // int ret = poll(&pfd, 1, 1);  // 1ms timeout for responsive shutdown
-      // if (ret > 0) {
-      //   struct can_frame frame;
-      //   ssize_t n = read(can_fd_, &frame, sizeof(frame));
-      //   if (n == sizeof(frame)) {
-      //     std::lock_guard<std::mutex> lock(buffer_mutex_);
-      //     parse_can_frame(frame, latest_ego_);
-      //     buffer_valid_ = true;
-      //     last_can_update_ns_ = this->now().nanoseconds();
-      //   }
-      // }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-#else
-      // CAN 未接入: 短暂休眠避免忙等, 等待 CAN 接入后启用 USE_REAL_CAN
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-#endif
+      std::ifstream file(ego_file);
+      if (!file.is_open()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "ego-motion 数据文件未找到: %s, 1s 后重试...", ego_file.c_str());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      // 跳过表头
+      std::string header;
+      std::getline(file, header);
+
+      RCLCPP_INFO(get_logger(),
+        "ego-motion 数据文件已打开: %s", ego_file.c_str());
+
+      std::string line;
+      while (rclcpp::ok() && !stop_read_) {
+        if (!std::getline(file, line)) {
+          // EOF — 回到数据首行继续循环
+          file.clear();
+          file.seekg(0);
+          std::getline(file, header);  // 跳过表头
+          continue;
+        }
+
+        if (line.empty()) continue;
+
+        // 解析: vx,yaw_rate,steering_angle,ax,ay,gear
+        // 将逗号替换为空格以简化解析
+        std::replace(line.begin(), line.end(), ',', ' ');
+        double vx = 0, yaw = 0, steering = 0, ax = 0, ay = 0;
+        int gear = 1;
+        std::istringstream iss(line);
+        if (!(iss >> vx >> yaw >> steering >> ax >> ay >> gear)) {
+          continue;  // 格式错误, 跳过
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(buffer_mutex_);
+          latest_ego_.vx             = vx;
+          latest_ego_.yaw_rate       = yaw;
+          latest_ego_.steering_angle = steering;
+          latest_ego_.ax             = ax;
+          latest_ego_.ay             = ay;
+          latest_ego_.gear           = gear;
+          latest_ego_.is_default     = false;
+          buffer_valid_              = true;
+          last_can_update_ns_        = this->now().nanoseconds();
+        }
+
+        // 等待下一个帧间隔
+        std::this_thread::sleep_for(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(period));
+      }
     }
   }
 

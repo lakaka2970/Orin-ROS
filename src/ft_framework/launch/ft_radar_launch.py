@@ -192,7 +192,7 @@ def generate_launch_description():
     ld.add_action(Node(
         package=adc_pkg, executable=adc_exe, name='adc_rx',
         output='screen',
-        parameters=[{**adc_cfg, 'fps': 15.0}]))
+        parameters=[{**adc_cfg, 'fps': 10.0}]))
     ld.add_action(Node(
         package=cam_pkg, executable=cam_exe, name='camera_rx',
         output='screen',

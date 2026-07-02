@@ -49,7 +49,7 @@ system:
 #   ctrx1: 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB (RX 4-7)
 #   合并:  1024 chirps × 8 RX × 2048 samples × 2B = 32 MiB
 adc_rx:
-  fps: 15
+  fps: 10
   num_rows: 1024                           # 总 chirp: 512 chirps/group × 2 groups
   num_chirps_per_row: 8                    # RX 天线数: ctrx0(4) + ctrx1(4) = 8
   num_samples_per_chirp: 2048
@@ -59,9 +59,10 @@ adc_rx:
   data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
   max_preload_files: 30                    # 最多预加载文件数 (~960 MB)
   use_noise_pool: true                     # 无文件时自动回退到噪声池
-  device_path: "/dev/radar_ctrx0"           # V4L2 设备 (udev 持久化, ctrx0 半集)
-  capture_width: 8192                       # V4L2 帧宽度: 4 RX × 2048 samples (逐像素交错)
-  capture_height: 1024                      # V4L2 帧高度: 512 chirps × 2 groups
+  device_path_ctrx0: "/dev/radar_ctrx0"    # V4L2 设备 ctrx0 (udev 持久化, 4 RX)
+  device_path_ctrx1: "/dev/radar_ctrx1"    # V4L2 设备 ctrx1 (udev 持久化, 4 RX)
+  capture_width: 8192                      # V4L2 帧宽度: 4 RX × 2048 samples (逐像素交错)
+  capture_height: 1024                     # V4L2 帧高度: 512 chirps × 2 groups
 
 # ====================================================================
 # 节点: Camera Rx — 相机数据接收
@@ -89,6 +90,7 @@ vehicle_data_rx:
   fps: 50
   timeout_cycles: 1                        # 超时周期数 (1周期 = 20ms @ 50Hz)
   can_interface: "can0"                     # CAN 接口名 (接入总线后启用)
+  ego_data_file: "data/ego_motion.csv"      # ego-motion 假数据文件 (循环读取)
   defaults:
     vx: 0.0                               # 车速 (m/s)
     yaw_rate: 0.0                         # 偏航角速度 (rad/s)
@@ -210,7 +212,7 @@ rviz_image:
 #   Obj_List:  1000 帧
 # 达到上限后循环覆盖（删除最旧文件，保留最新 N 帧）
 logging:
-  output_dir: "output/ft_dataset"            # 输出根目录（相对路径基于工作区根）
+  output_dir: "/home/zhengyuanliu/Desktop/Orin-ROS/output/ft_dataset"  # 输出根目录（绝对路径，指向外部存储）
   max_frames:
     adc: 100                              # ADC 原始数据最大帧数
     image: 1000                           # 相机图像最大帧数

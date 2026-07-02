@@ -47,6 +47,7 @@ FIXED_FRAME = 'base_link'
 # 以下为程序实现，一般无需修改
 # ============================================================================
 
+import os
 import rclpy
 from rclpy.node import Node
 import threading
@@ -86,6 +87,7 @@ class VehicleDataRxNode(Node):
         self.declare_parameter('defaults.ay', DEFAULT_AY)
         self.declare_parameter('defaults.gear', DEFAULT_GEAR)
         self.declare_parameter('fixed_frame', FIXED_FRAME)
+        self.declare_parameter('ego_data_file', 'data/ego_motion.csv')
 
         self.fps            = float(self.get_parameter('fps').value)
         self.timeout_cycles = int(self.get_parameter('timeout_cycles').value)
@@ -198,19 +200,85 @@ class VehicleDataRxNode(Node):
     # ------------------------------------------------------------------
 
     def _can_read_loop(self):
-        """持续轮询 CAN 总线, 将最新数据更新到线程安全 buffer.
+        """从 CSV 文件读取 ego-motion 假数据, 持续循环.
 
-        TODO: 接入真实 CAN/ETH 总线后替换为实际读取逻辑.
-        当前: CAN 未接入, 短暂休眠避免忙等.
+        文件格式 (CSV with header):
+            vx,yaw_rate,steering_angle,ax,ay,gear
+            0.0,0.0,0.0,0.0,0.0,1
+            ...
+
+        按 fps 速率逐行读取并更新线程安全 buffer,
+        到达文件末尾后回到数据首行继续循环.
+        文件缺失时回退为静默等待, 定时器持续发布默认值.
         """
+        ego_data_file = self.get_parameter('ego_data_file').value
+        period = 1.0 / self.fps
+
         while rclpy.ok() and not self._can_stop_event.is_set():
-            # TODO: 接入真实 CAN 后替换为:
-            #   can_data = can_socket.recv()
-            #   with self._buffer_lock:
-            #       self._latest_ego = parse_can(can_data)
-            #       self._buffer_valid = True
-            #       self._last_can_update_ns = self.get_clock().now().nanoseconds
-            self._can_stop_event.wait(timeout=0.001)  # 1ms
+            try:
+                with open(ego_data_file, 'r') as f:
+                    # 跳过表头
+                    header = f.readline()
+                    if not header:
+                        self.get_logger().warn(
+                            f'ego-motion 数据文件为空: {ego_data_file}')
+                        self._can_stop_event.wait(timeout=1.0)
+                        continue
+
+                    self.get_logger().info(
+                        f'ego-motion 数据文件已打开: {ego_data_file}')
+
+                    while rclpy.ok() and not self._can_stop_event.is_set():
+                        line = f.readline()
+                        if not line:
+                            # EOF — 回到数据首行继续循环
+                            f.seek(0)
+                            f.readline()  # 跳过表头
+                            continue
+
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        parts = line.split(',')
+                        if len(parts) < 6:
+                            continue
+
+                        try:
+                            vx = float(parts[0])
+                            yaw_rate = float(parts[1])
+                            steering = float(parts[2])
+                            ax = float(parts[3])
+                            ay = float(parts[4])
+                            gear = int(parts[5])
+                        except (ValueError, IndexError):
+                            continue
+
+                        with self._buffer_lock:
+                            self._latest_ego = {
+                                'vx': vx,
+                                'yaw_rate': yaw_rate,
+                                'steering_angle': steering,
+                                'ax': ax,
+                                'ay': ay,
+                                'gear': gear,
+                            }
+                            self._buffer_valid = True
+                            self._last_can_update_ns = \
+                                self.get_clock().now().nanoseconds
+
+                        # 等待下一个帧间隔
+                        self._can_stop_event.wait(timeout=period)
+
+            except FileNotFoundError:
+                self.get_logger().warn(
+                    f'ego-motion 数据文件未找到: {ego_data_file}, '
+                    f'1s 后重试…')
+                self._can_stop_event.wait(timeout=1.0)
+            except Exception as e:
+                self.get_logger().error(
+                    f'读取 ego-motion 数据文件异常: {e}')
+                self._can_stop_event.wait(timeout=1.0)
 
     # ------------------------------------------------------------------
     # 销毁

@@ -1,19 +1,24 @@
 // ============================================================================
-// adc_rx.cpp — ADC 真实数据采集节点 (V4L2 mmap streaming)
+// adc_rx.cpp — ADC 真实数据采集节点 (双设备 V4L2 mmap streaming)
 // ============================================================================
-// 使用 V4L2 mmap streaming 从 Infineon CTRX 雷达 sensor 逐帧采集原始 ADC 数据.
-// 替换旧的 open()/read() 字符设备模式.
+// 同时从 ctrx0 (/dev/radar_ctrx0) 和 ctrx1 (/dev/radar_ctrx1) 两个 V4L2 设备
+// 捕获原始 ADC 数据, 逐帧拼接为完整 16T16R (8 RX) 32 MiB 消息。
 //
-// 数据格式: RG12 (12-bit padded to 16-bit), 分辨率可配置
-// 设备: /dev/video0 (可通过 device_path 参数配置)
+// 修复历史:
+//   2026-07-02: 增加 ctrx1 设备支持, ctrx0+ctrx1 拼接 → 32 MiB/帧, num_chirps_per_row=8
+//               (修复: 单设备 16 MiB 导致 RSP reshape 失败, 点云/rdCell/rxNci 无输出)
+//
+// 数据格式: RG12 (12-bit padded to 16-bit), 8192×1024 per device
+//   单设备:  8192 × 1024 × 2B = 16 MiB (4 RX, ctrx0 或 ctrx1)
+//   双设备拼接: 16 MiB × 2 = 32 MiB (8 RX, ctrx0+ctrx1)
 //
 // 用法: adc_rx_cpp (默认), 由 launch 文件通过 adc_source:=real 选择.
 //
-// V4L2 流程:
+// V4L2 流程 (per device):
 //   open → QUERYCAP → S_FMT → S_CTRL(bypass_mode) → REQBUFS → QUERYBUF×N →
 //   mmap×N → QBUF×N → STREAMON → (DQBUF→copy→QBUF)×… → STREAMOFF → munmap → close
 //
-// 设计目标: 30 Hz, FastDDS SHM 共享内存传输.
+// 设计目标: 15 Hz, FastDDS SHM 共享内存传输.
 // ============================================================================
 
 #include <chrono>
@@ -42,212 +47,163 @@ namespace {
   constexpr uint32_t DEFAULT_WIDTH  = 8192;   // 4 RX × 2048 samples (pixel-interleaved)
   constexpr uint32_t DEFAULT_HEIGHT = 1024;   // 512 chirps × 2 groups
   constexpr uint32_t NUM_V4L2_BUFS  = 4;
+  // bypass_mode V4L2 control ID (NVIDIA 自定义)
+  constexpr uint32_t BYPASS_MODE_CID = 0x009a2064;
 }
 
-class AdcRxNode : public ft_rx::RxNodeBase<AdcRawData, AdcRxNode>
-{
-public:
-  AdcRxNode()
-    : RxNodeBase("adc_rx", "/adc/raw_data", 10, true)
-  {
-    declare_parameter("fps", FPS);
-    declare_parameter("capture_width", static_cast<int>(DEFAULT_WIDTH));
-    declare_parameter("capture_height", static_cast<int>(DEFAULT_HEIGHT));
-    declare_parameter("device_path", "/dev/video0");
-    declare_parameter("fixed_frame", "radar");
-
-    width_       = static_cast<uint32_t>(get_parameter("capture_width").as_int());
-    height_      = static_cast<uint32_t>(get_parameter("capture_height").as_int());
-    device_path_ = get_parameter("device_path").as_string();
-    frame_id_    = get_parameter("fixed_frame").as_string();
-
-    // RG12: 每个像素 2 字节 (12-bit 数据 + 4-bit 零填充)
-    frame_bytes_ = static_cast<size_t>(width_) * height_ * 2;
-
-    // ── 静态 TF (成员变量 — 生命周期必须覆盖整个节点) ──
-    tf_bc_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
-    {
-      geometry_msgs::msg::TransformStamped tf;
-      tf.header.stamp    = builtin_interfaces::msg::Time();  // timestamp=0 → 永久有效
-      tf.header.frame_id = "map";
-      tf.child_frame_id  = frame_id_;
-      tf.transform.translation.z = 0.5;
-      tf.transform.rotation.w    = 1.0;
-      tf_bc_->sendTransform(tf);
-    }
-
-    // ── 打开 V4L2 数据源 ──
-    open_device();
-
-    RCLCPP_INFO(get_logger(),
-      "ADC Rx [V4L2]: %.0f Hz, %ux%u RG12, %.1f KB/帧, 设备=%s (%s)",
-      fps_, width_, height_, frame_bytes_ / 1024.0,
-      device_path_.c_str(),
-      v4l2_fd_ >= 0 ? "已连接" : "未连接 — 将发布空帧");
-
-    start_polling_loop(fps_);
-  }
-
-  ~AdcRxNode() override
-  {
-    stop_polling_ = true;     // signal polling thread to exit
-    stop_streaming();         // STREAMOFF unblocks any pending DQBUF
-    close_device();
-  }
-
-  std::string frame_id() const { return frame_id_; }
-
-  bool fill_message(AdcRawData &msg)
-  {
-    if (v4l2_fd_ < 0) {
-      // 设备未连接: 每隔 N 帧尝试重连, 避免忙等
-      if (++reconnect_counter_ >= RECONNECT_INTERVAL) {
-        reconnect_counter_ = 0;
-        open_device();
-        if (v4l2_fd_ >= 0)
-          RCLCPP_INFO(get_logger(), "V4L2 重连成功");
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      return false;  // 无数据 — 不发布, 避免下游收到空帧
-    }
-
-    uint8_t *buf = nullptr;
-    size_t   bytes_used = 0;
-
-    // Blocking DQBUF: waits until hardware has a frame ready
-    if (!dequeue_buffer(buf, bytes_used)) {
-      // Device error (e.g. disconnected) — 清理并等待下次重连
-      stop_streaming();
-      close_device();
-      return false;
-    }
-
-    msg.data.assign(buf, buf + bytes_used);
-    enqueue_buffer(v4l2_buf_index_);
-    prof_.checkpoint("v4l2_dequeue");
-
-    // V4L2 帧: width=8192(4RX×2048samples 逐像素交错), height=1024 chirps
-    // AdcRawData 约定: num_rows=总chirp数, num_chirps_per_row=RX数, num_samples_per_chirp=每RX采样数
-    msg.num_rows              = height_;                   // 1024 chirps
-    msg.num_chirps_per_row    = 4;                         // 4 RX per CTRX (RX0-3)
-    msg.num_samples_per_chirp = width_ / 4;                // 2048 samples/RX/chirp
-
-    return true;
-  }
-
-private:
-  // ──────────────────────────────────────────────────────────────────────────
-  // V4L2 buffer 元数据
-  // ──────────────────────────────────────────────────────────────────────────
-  struct V4l2Buffer {
+// ============================================================================
+// V4L2 单设备管理器 — 封装一个 CTRX 设备的完整生命周期
+// ============================================================================
+struct V4L2Device {
+  struct Buffer {
     void   *start  = nullptr;
     size_t  length = 0;
   };
 
-  // ──────────────────────────────────────────────────────────────────────────
-  // V4L2 设备管理
-  // ──────────────────────────────────────────────────────────────────────────
+  std::string path;
+  std::string label;       // 日志标签, 如 "ctrx0"
+  int         fd          = -1;
+  bool        streaming   = false;
+  uint32_t    width       = DEFAULT_WIDTH;
+  uint32_t    height      = DEFAULT_HEIGHT;
+  size_t      frame_bytes = 0;
+  uint32_t    buf_index   = 0;
+  std::vector<Buffer> buffers;
 
-  void open_device()
+  // ── 打开设备 → 配置格式 → 设置 bypass → mmap → streamon ──
+  bool init()
   {
-    if (v4l2_fd_ >= 0) close_device();
+    if (fd >= 0) close_noexcept();
 
-    v4l2_fd_ = open(device_path_.c_str(), O_RDWR);  // blocking I/O — DQBUF waits for hardware
-    if (v4l2_fd_ < 0) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "无法打开 V4L2 设备 '%s': %s", device_path_.c_str(), strerror(errno));
-      return;
+    fd = ::open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+      fprintf(stderr, "[adc_rx] %s: 无法打开 '%s': %s\n",
+              label.c_str(), path.c_str(), strerror(errno));
+      return false;
     }
 
-    // ── QUERYCAP: 验证设备能力 ──
-    struct v4l2_capability cap;
-    std::memset(&cap, 0, sizeof(cap));
-    if (ioctl(v4l2_fd_, VIDIOC_QUERYCAP, &cap) < 0) {
-      RCLCPP_WARN(get_logger(), "VIDIOC_QUERYCAP 失败: %s", strerror(errno));
-      close_device();
-      return;
-    }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-      RCLCPP_WARN(get_logger(), "设备 '%s' 不支持 video capture", device_path_.c_str());
-      close_device();
-      return;
-    }
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-      RCLCPP_WARN(get_logger(), "设备 '%s' 不支持 streaming I/O", device_path_.c_str());
-      close_device();
-      return;
+    if (!query_cap() || !set_format() || !set_bypass() || !init_mmap() || !start_streaming()) {
+      close_noexcept();
+      return false;
     }
 
-    RCLCPP_DEBUG(get_logger(),
-      "V4L2 设备: driver='%s' card='%s' bus='%s'",
-      cap.driver, cap.card, cap.bus_info);
-
-    // ── S_FMT: 设置像素格式 ──
-    if (!init_format()) { close_device(); return; }
-
-    // ── S_CTRL: bypass_mode=0 (绕过 NVIDIA ISP, 直出原始数据) ──
-    {
-      struct v4l2_control ctrl;
-      std::memset(&ctrl, 0, sizeof(ctrl));
-      ctrl.id    = 0x009a2064;   // bypass_mode (NVIDIA 自定义 V4L2 control)
-      ctrl.value = 0;
-      if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-        RCLCPP_DEBUG(get_logger(), "设置 bypass_mode 失败 (非致命): %s", strerror(errno));
-    }
-
-    // ── REQBUFS + QUERYBUF + mmap ──
-    if (!init_mmap()) { close_device(); return; }
-
-    // ── QBUF × N + STREAMON ──
-    if (!start_streaming()) { close_device(); return; }
-
-    RCLCPP_INFO(get_logger(),
-      "V4L2 设备已连接: %s fd=%d (%ux%u RG12, %.1f KB/帧)",
-      device_path_.c_str(), v4l2_fd_,
-      width_, height_, frame_bytes_ / 1024.0);
+    fprintf(stderr, "[adc_rx] %s: 已连接 fd=%d (%ux%u RG12, %.1f KB/帧)\n",
+            label.c_str(), fd, width, height, frame_bytes / 1024.0);
+    return true;
   }
 
-  bool init_format()
+  // ── 阻塞出队: 等待硬件帧就绪 ──
+  bool dequeue(uint8_t *&data, size_t &bytes_used)
+  {
+    struct v4l2_buffer buf;
+    std::memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_DQBUF 失败: %s\n",
+              label.c_str(), strerror(errno));
+      return false;
+    }
+
+    buf_index  = buf.index;
+    data       = static_cast<uint8_t *>(buffers[buf.index].start);
+    bytes_used = buf.bytesused;
+    return true;
+  }
+
+  // ── 归还 buffer ──
+  void enqueue(uint32_t index)
+  {
+    struct v4l2_buffer buf;
+    std::memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index  = index;
+    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0)
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_QBUF 失败: %s\n",
+              label.c_str(), strerror(errno));
+  }
+
+  // ── STREAMOFF + munmap + close ──
+  void stop_and_close()
+  {
+    if (fd >= 0 && streaming) {
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      ioctl(fd, VIDIOC_STREAMOFF, &type);
+      streaming = false;
+    }
+    for (auto &b : buffers) {
+      if (b.start && b.start != MAP_FAILED)
+        munmap(b.start, b.length);
+    }
+    buffers.clear();
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+
+private:
+  void close_noexcept()
+  {
+    if (fd >= 0) { ::close(fd); fd = -1; }
+  }
+
+  bool query_cap()
+  {
+    struct v4l2_capability cap;
+    std::memset(&cap, 0, sizeof(cap));
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_QUERYCAP 失败: %s\n",
+              label.c_str(), strerror(errno));
+      return false;
+    }
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+        !(cap.capabilities & V4L2_CAP_STREAMING)) {
+      fprintf(stderr, "[adc_rx] %s: 不支持 video capture/streaming\n", label.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  bool set_format()
   {
     struct v4l2_format fmt;
     std::memset(&fmt, 0, sizeof(fmt));
     fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width       = width_;
-    fmt.fmt.pix.height      = height_;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SRGGB12;  // RG12
+    fmt.fmt.pix.width       = width;
+    fmt.fmt.pix.height      = height;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SRGGB12;
     fmt.fmt.pix.field       = V4L2_FIELD_NONE;
 
-    if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt) < 0) {
-      RCLCPP_WARN(get_logger(), "VIDIOC_S_FMT 失败: %s", strerror(errno));
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_S_FMT 失败: %s\n",
+              label.c_str(), strerror(errno));
       return false;
     }
 
-    // 驱动可能调整分辨率: 以实际值为准
-    if (fmt.fmt.pix.width != width_ || fmt.fmt.pix.height != height_) {
-      RCLCPP_INFO(get_logger(),
-        "驱动调整了分辨率: 请求 %ux%u → 实际 %ux%u",
-        width_, height_, fmt.fmt.pix.width, fmt.fmt.pix.height);
-      width_  = fmt.fmt.pix.width;
-      height_ = fmt.fmt.pix.height;
+    if (fmt.fmt.pix.width != width || fmt.fmt.pix.height != height) {
+      fprintf(stderr, "[adc_rx] %s: 驱动调整分辨率 %ux%u → %ux%u\n",
+              label.c_str(), width, height, fmt.fmt.pix.width, fmt.fmt.pix.height);
+      width  = fmt.fmt.pix.width;
+      height = fmt.fmt.pix.height;
     }
 
-    // 以驱动返回的 sizeimage 为准 (可能大于 width×height×2)
-    if (fmt.fmt.pix.sizeimage > 0)
-      frame_bytes_ = fmt.fmt.pix.sizeimage;
-    else
-      frame_bytes_ = static_cast<size_t>(width_) * height_ * 2;
+    frame_bytes = (fmt.fmt.pix.sizeimage > 0)
+                    ? fmt.fmt.pix.sizeimage
+                    : static_cast<size_t>(width) * height * 2;
+    return true;
+  }
 
-    RCLCPP_INFO(get_logger(),
-      "V4L2 格式: %ux%u %c%c%c%c stride=%u sizeimage=%u (%.1f KB/帧)",
-      fmt.fmt.pix.width, fmt.fmt.pix.height,
-      static_cast<char>((fmt.fmt.pix.pixelformat >> 0)  & 0xFF),
-      static_cast<char>((fmt.fmt.pix.pixelformat >> 8)  & 0xFF),
-      static_cast<char>((fmt.fmt.pix.pixelformat >> 16) & 0xFF),
-      static_cast<char>((fmt.fmt.pix.pixelformat >> 24) & 0xFF),
-      fmt.fmt.pix.bytesperline,
-      fmt.fmt.pix.sizeimage,
-      frame_bytes_ / 1024.0);
-
+  bool set_bypass()
+  {
+    struct v4l2_control ctrl;
+    std::memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id    = BYPASS_MODE_CID;
+    ctrl.value = 0;
+    // 非致命: 某些驱动不支持 bypass_mode
+    ioctl(fd, VIDIOC_S_CTRL, &ctrl);
     return true;
   }
 
@@ -259,16 +215,17 @@ private:
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
 
-    if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req) < 0) {
-      RCLCPP_WARN(get_logger(), "VIDIOC_REQBUFS 失败: %s", strerror(errno));
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_REQBUFS 失败: %s\n",
+              label.c_str(), strerror(errno));
       return false;
     }
     if (req.count < 2) {
-      RCLCPP_WARN(get_logger(), "驱动缓冲区不足: %u", req.count);
+      fprintf(stderr, "[adc_rx] %s: 驱动缓冲区不足: %u\n", label.c_str(), req.count);
       return false;
     }
 
-    v4l2_bufs_.resize(req.count);
+    buffers.resize(req.count);
     for (uint32_t i = 0; i < req.count; ++i) {
       struct v4l2_buffer buf;
       std::memset(&buf, 0, sizeof(buf));
@@ -276,18 +233,20 @@ private:
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index  = i;
 
-      if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
-        RCLCPP_WARN(get_logger(), "VIDIOC_QUERYBUF[%u] 失败: %s", i, strerror(errno));
+      if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+        fprintf(stderr, "[adc_rx] %s: VIDIOC_QUERYBUF[%u] 失败: %s\n",
+                label.c_str(), i, strerror(errno));
         return false;
       }
 
-      v4l2_bufs_[i].length = buf.length;
-      v4l2_bufs_[i].start = mmap(
+      buffers[i].length = buf.length;
+      buffers[i].start = mmap(
           nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-          v4l2_fd_, buf.m.offset);
+          fd, buf.m.offset);
 
-      if (v4l2_bufs_[i].start == MAP_FAILED) {
-        RCLCPP_WARN(get_logger(), "mmap[%u] 失败: %s", i, strerror(errno));
+      if (buffers[i].start == MAP_FAILED) {
+        fprintf(stderr, "[adc_rx] %s: mmap[%u] 失败: %s\n",
+                label.c_str(), i, strerror(errno));
         return false;
       }
     }
@@ -296,98 +255,170 @@ private:
 
   bool start_streaming()
   {
-    // 将所有 buffer 入队
-    for (uint32_t i = 0; i < v4l2_bufs_.size(); ++i) {
+    for (uint32_t i = 0; i < buffers.size(); ++i) {
       struct v4l2_buffer buf;
       std::memset(&buf, 0, sizeof(buf));
       buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index  = i;
-      if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0) {
-        RCLCPP_WARN(get_logger(), "VIDIOC_QBUF[%u] 失败: %s", i, strerror(errno));
+      if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        fprintf(stderr, "[adc_rx] %s: VIDIOC_QBUF[%u] 失败: %s\n",
+                label.c_str(), i, strerror(errno));
         return false;
       }
     }
 
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &type) < 0) {
-      RCLCPP_WARN(get_logger(), "VIDIOC_STREAMON 失败: %s", strerror(errno));
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+      fprintf(stderr, "[adc_rx] %s: VIDIOC_STREAMON 失败: %s\n",
+              label.c_str(), strerror(errno));
       return false;
     }
-    streaming_ = true;
+    streaming = true;
+    return true;
+  }
+};
+
+// ============================================================================
+// ADC Rx 节点: 双设备 V4L2 → 32 MiB AdcRawData
+// ============================================================================
+class AdcRxNode : public ft_rx::RxNodeBase<AdcRawData, AdcRxNode>
+{
+public:
+  AdcRxNode()
+    : RxNodeBase("adc_rx", "/adc/raw_data", 10, true)
+  {
+    declare_parameter("fps", FPS);
+    declare_parameter("capture_width", static_cast<int>(DEFAULT_WIDTH));
+    declare_parameter("capture_height", static_cast<int>(DEFAULT_HEIGHT));
+    declare_parameter("device_path_ctrx0", "/dev/radar_ctrx0");
+    declare_parameter("device_path_ctrx1", "/dev/radar_ctrx1");
+    declare_parameter("fixed_frame", "radar");
+
+    uint32_t  w = static_cast<uint32_t>(get_parameter("capture_width").as_int());
+    uint32_t  h = static_cast<uint32_t>(get_parameter("capture_height").as_int());
+    frame_id_   = get_parameter("fixed_frame").as_string();
+
+    // ── 初始化两个 V4L2 设备 ──
+    dev0_.path  = get_parameter("device_path_ctrx0").as_string();
+    dev0_.label = "ctrx0";
+    dev0_.width = w;  dev0_.height = h;
+
+    dev1_.path  = get_parameter("device_path_ctrx1").as_string();
+    dev1_.label = "ctrx1";
+    dev1_.width = w;  dev1_.height = h;
+
+    bool ok0 = dev0_.init();
+    bool ok1 = dev1_.init();
+
+    // ── 设备初始化状态日志 (ROS 级别, 替代 fprintf) ──
+    if (!ok0) RCLCPP_ERROR(get_logger(),
+      "ctrx0 (%s) 初始化失败, 将每 %d 帧自动重连", dev0_.path.c_str(), RECONNECT_INTERVAL);
+    if (!ok1) RCLCPP_ERROR(get_logger(),
+      "ctrx1 (%s) 初始化失败, 将每 %d 帧自动重连", dev1_.path.c_str(), RECONNECT_INTERVAL);
+
+    // ── 静态 TF ──
+    tf_bc_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+    {
+      geometry_msgs::msg::TransformStamped tf;
+      tf.header.stamp    = builtin_interfaces::msg::Time();
+      tf.header.frame_id = "map";
+      tf.child_frame_id  = frame_id_;
+      tf.transform.translation.z = 0.5;
+      tf.transform.rotation.w    = 1.0;
+      tf_bc_->sendTransform(tf);
+    }
+
+    // 合并后的帧大小: ctrx0 + ctrx1
+    merged_frame_bytes_ = dev0_.frame_bytes + dev1_.frame_bytes;
+
+    // 读取 fps 参数 (YAML/launch 可覆盖默认值 30Hz)
+    double fps_val = get_parameter("fps").as_double();
+
+    RCLCPP_INFO(get_logger(),
+      "ADC Rx [V4L2 dual]: %.0f Hz, ctrx0=%ux%u + ctrx1=%ux%u → %.1f MB/帧, "
+      "设备: %s (%s), %s (%s)",
+      fps_val,
+      dev0_.width, dev0_.height, dev1_.width, dev1_.height,
+      merged_frame_bytes_ / 1048576.0,
+      dev0_.path.c_str(), ok0 ? "已连接" : "未连接",
+      dev1_.path.c_str(), ok1 ? "已连接" : "未连接");
+
+    start_polling_loop(fps_val);
+  }
+
+  ~AdcRxNode() override
+  {
+    stop_polling_ = true;
+    dev0_.stop_and_close();
+    dev1_.stop_and_close();
+  }
+
+  std::string frame_id() const { return frame_id_; }
+
+  bool fill_message(AdcRawData &msg)
+  {
+    // ── 设备断线重连 ──
+    if (dev0_.fd < 0 || dev1_.fd < 0) {
+      if (++reconnect_counter_ >= RECONNECT_INTERVAL) {
+        reconnect_counter_ = 0;
+        if (dev0_.fd < 0) {
+          RCLCPP_INFO(get_logger(), "ctrx0 重连尝试中...");
+          dev0_.init();
+        }
+        if (dev1_.fd < 0) {
+          RCLCPP_INFO(get_logger(), "ctrx1 重连尝试中...");
+          dev1_.init();
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return false;
+    }
+
+    // ── 双设备阻塞出队 ──
+    uint8_t *buf0 = nullptr, *buf1 = nullptr;
+    size_t   bytes0 = 0, bytes1 = 0;
+
+    if (!dev0_.dequeue(buf0, bytes0)) {
+      // ctrx0 失败 → 清理并等待重连
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+        "ctrx0: VIDIOC_DQBUF 失败, 设备已断开, 等待重连...");
+      dev0_.stop_and_close();
+      return false;
+    }
+    if (!dev1_.dequeue(buf1, bytes1)) {
+      // ctrx1 失败 → 归还 ctrx0 buffer, 清理 ctrx1
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+        "ctrx1: VIDIOC_DQBUF 失败, 设备已断开, 等待重连...");
+      dev0_.enqueue(dev0_.buf_index);
+      dev1_.stop_and_close();
+      return false;
+    }
+
+    // ── 拼接: ctrx0_data || ctrx1_data → 完整 32 MiB ──
+    msg.data.clear();
+    msg.data.reserve(bytes0 + bytes1);
+    msg.data.insert(msg.data.end(), buf0, buf0 + bytes0);
+    msg.data.insert(msg.data.end(), buf1, buf1 + bytes1);
+
+    dev0_.enqueue(dev0_.buf_index);
+    dev1_.enqueue(dev1_.buf_index);
+    prof_.checkpoint("v4l2_dequeue");
+
+    // AdcRawData 维度: ctrx0 (4 RX) + ctrx1 (4 RX) = 8 RX 合并
+    msg.num_rows              = dev0_.height;              // 1024 chirps
+    msg.num_chirps_per_row    = 8;                         // ctrx0:4 + ctrx1:4 = 8 RX
+    msg.num_samples_per_chirp = dev0_.width / 4;           // 2048 samples/RX/chirp
+
     return true;
   }
 
-  void stop_streaming()
-  {
-    if (v4l2_fd_ >= 0 && streaming_) {
-      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &type);
-      streaming_ = false;
-    }
-    for (auto &b : v4l2_bufs_) {
-      if (b.start && b.start != MAP_FAILED)
-        munmap(b.start, b.length);
-    }
-    v4l2_bufs_.clear();
-  }
+private:
+  V4L2Device dev0_;    // ctrx0
+  V4L2Device dev1_;    // ctrx1
 
-  // 阻塞出队: 等待硬件帧就绪后返回. 成功返回 true, 失败返回 false.
-  bool dequeue_buffer(uint8_t *&data, size_t &bytes_used)
-  {
-    struct v4l2_buffer buf;
-    std::memset(&buf, 0, sizeof(buf));
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &buf) < 0) {
-      // 阻塞模式下 EAGAIN 不会发生; 错误来自设备断开或 STREAMOFF
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "VIDIOC_DQBUF 失败: %s", strerror(errno));
-      return false;
-    }
-
-    v4l2_buf_index_ = buf.index;
-    data       = static_cast<uint8_t *>(v4l2_bufs_[buf.index].start);
-    bytes_used = buf.bytesused;
-    return true;
-  }
-
-  // 归还 buffer 到驱动队列
-  void enqueue_buffer(uint32_t index)
-  {
-    struct v4l2_buffer buf;
-    std::memset(&buf, 0, sizeof(buf));
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index  = index;
-    if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0)
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "VIDIOC_QBUF 失败: %s", strerror(errno));
-  }
-
-  void close_device()
-  {
-    if (v4l2_fd_ >= 0) {
-      close(v4l2_fd_);
-      v4l2_fd_ = -1;
-    }
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // 成员变量
-  // ──────────────────────────────────────────────────────────────────────────
-  std::string device_path_;
   std::string frame_id_ = "radar";
-
-  uint32_t  width_       = DEFAULT_WIDTH;
-  uint32_t  height_      = DEFAULT_HEIGHT;
-  size_t    frame_bytes_ = 0;
-
-  int       v4l2_fd_          = -1;
-  bool      streaming_        = false;
-  uint32_t  v4l2_buf_index_   = 0;
-  std::vector<V4l2Buffer> v4l2_bufs_;
+  size_t      merged_frame_bytes_ = 0;
 
   // ── 重连机制 ──
   static constexpr int RECONNECT_INTERVAL = 90;  // 每 N 帧尝试重连 (~3s @ 30fps)
@@ -397,6 +428,7 @@ private:
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_bc_;
 };
 
+// ============================================================================
 int main(int argc, char *argv[])
 {
   rclcpp::init(argc, argv);

@@ -21,13 +21,14 @@ ZERO_INT16 = torch.tensor(0, dtype=torch.int16, device=DEVICE)
 
 
 @torch.inference_mode()
-def radar_signal_process_final(adc_data_np: np.ndarray, n_samples: int, n_rx: int,
+def radar_signal_process_final(adc_data_input, n_samples: int, n_rx: int,
                                n_chirps: int, threshold_scale: int = 6):
     """
     雷达信号预处理主函数。
 
     参数:
-        adc_data_np: 原始 ADC 数据，numpy 数组，形状 (n_chirps, n_rx, n_samples)，数据类型 int16
+        adc_data_input: 原始 ADC 数据，numpy 数组或 pinned CPU torch.Tensor，
+                        形状 (n_chirps, n_rx, n_samples)，数据类型 int16
         n_samples: 采样点数
         n_rx: 接收天线数
         n_chirps: Chirp 数量
@@ -38,12 +39,18 @@ def radar_signal_process_final(adc_data_np: np.ndarray, n_samples: int, n_rx: in
         dc_estimated: 估计的直流分量 (n_rx,)
         status: 状态码（0 表示正常）
     """
-    # ----- 1. 数据转移到 GPU（非阻塞异步传输）-----
-    adc_data = torch.from_numpy(adc_data_np).to(DEVICE, non_blocking=True)   # (chirp, rx, samp)
+    # ----- 1. 数据转移到 GPU, 统一转为 float32 (支持 int16/float32/float64 输入) -----
+    # 优化: 接受 pinned CPU tensor (异步传输) 或 numpy 数组
+    if isinstance(adc_data_input, torch.Tensor):
+        # Pinned CPU tensor → 真正的异步 DMA 传输 (无需先拷贝到 pinned buffer)
+        adc_data = adc_data_input.to(DEVICE, non_blocking=True)
+    else:
+        adc_data = torch.from_numpy(adc_data_input).to(DEVICE, non_blocking=True)
+    adc_float_all = adc_data.float() if adc_data.dtype != torch.float32 else adc_data
 
     # ----- 2. 去直流：计算每个接收天线在所有 chirp 和采样点上的均值，然后减去-----
-    dc_estimated = torch.mean(adc_data.to(torch.float32), dim=(0, 2)).to(torch.int16)  # (rx,)
-    adc_data = adc_data - dc_estimated[None, :, None]   # 广播减去直流
+    dc_estimated = torch.mean(adc_float_all, dim=(0, 2))  # (rx,) float32
+    adc_data = adc_float_all - dc_estimated[None, :, None]   # 广播减去直流
 
     # ----- 3. 时域干扰抑制：检测相邻采样点突变-----
     # 差分绝对值

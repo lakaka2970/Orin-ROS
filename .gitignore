@@ -36,6 +36,7 @@ ros2_ws/log/
 *.db3
 *.json
 *.csv
+*.txt
 
 # Temporary files
 *.tmp
@@ -61,6 +62,7 @@ ft_dataset/
 *.cmd
 docs/terminal_outputs
 docs/terminal_record
+output/
 
 src/integration-carkit88c0-gmsl/src/modules/radar/
 src/integration-carkit88c0-gmsl/src/modules/max929x/

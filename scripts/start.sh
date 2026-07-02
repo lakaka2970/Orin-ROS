@@ -69,6 +69,20 @@ fi
 # ── 3. RMW 检查 ──
 echo "[ft] RMW 实现: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp (默认 FastDDS, 内置 SHM)}"
 
+# ── 3.5 重启 ROS2 daemon (防止上次异常退出导致 DDS 发现失败 → 节点间通信断开) ──
+# 症状: ros2 node list 能看到节点但 topic 无数据, logging 收到 0 条消息
+_ft_daemon_pid=$(pgrep -f "_ros2_daemon" 2>/dev/null || true)
+if [ -n "$_ft_daemon_pid" ]; then
+    ros2 daemon stop 2>/dev/null || true
+    # 等待旧 daemon 完全退出
+    for _ in $(seq 1 10); do
+        kill -0 "$_ft_daemon_pid" 2>/dev/null || break
+        sleep 0.3
+    done
+fi
+ros2 daemon start 2>/dev/null || true
+echo "[ft] ROS2 daemon 已重启"
+
 # ── 4. 确定 rx 实现 ──
 if $USE_PY_RX; then
     RX_IMPL="python"

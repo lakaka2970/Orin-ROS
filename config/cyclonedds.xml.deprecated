@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║  DEPRECATED — 2026-07-02                                                ║
+  ║  本配置已弃用。框架强制使用 FastDDS (rmw_fastrtps_cpp)。               ║
+  ║                                                                          ║
+  ║  弃用原因:                                                               ║
+  ║    1. CycloneDDS 0.7.0 无 SHM (共享内存) 传输支持 (需 0.9.0+)         ║
+  ║    2. 32MB ADC 帧走 UDP loopback → 512 RTPS 分片/帧 → 系统调用开销     ║
+  ║    3. 实测帧率仅 0.8 Hz (设计目标 15 Hz), 性能差距 ~19x                ║
+  ║                                                                          ║
+  ║  迁移指南: 删除 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 环境变量即可。    ║
+  ║  env.sh 已自动覆盖为 FastDDS 并清除 CYCLONEDDS_URI 变量。              ║
+  ║                                                                          ║
+  ║  恢复方法 (仅调试用途):                                                  ║
+  ║    cp config/cyclonedds.xml.deprecated config/cyclonedds.xml             ║
+  ║    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp                          ║
+  ║    export CYCLONEDDS_URI="file://$PWD/config/cyclonedds.xml"             ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+
+  FT Radar Framework — CycloneDDS lo-only 本地传输配置 (已弃用)
+  ============================================================================
+  强制所有 DDS 流量走本地回环 (127.0.0.1), 避免 32MB ADC 帧被发送到 WiFi 网卡.
+
+  CycloneDDS 0.7.0 无 SHM 支持, 但 loopback UDP 在本地足够快:
+  lo MTU=65536, 32MB 消息 = 512 个 RTPS 分片, 每个最大 64KB, 本地传输几乎零丢包.
+
+  注意: ros2 CLI (topic list/echo) 依赖多播发现, lo 接口不支持多播,
+        但节点间的 Simple Participant Discovery 通过 unicast 仍可正常工作.
+
+  用法:
+    export CYCLONEDDS_URI="file://<path>/config/cyclonedds.xml"
+    (由 scripts/env.sh 自动加载)
+  ============================================================================
+-->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <MaxMessageSize>33554432</MaxMessageSize>
+      <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
+    </General>
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

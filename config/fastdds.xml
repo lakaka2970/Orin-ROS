@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  FT Radar Framework — FastDDS SHM 共享内存传输配置
+  FT Radar Framework — FastDDS SHM 共享内存传输配置 (强制 SHM only)
   ============================================================================
   FastDDS (rmw_fastrtps_cpp) 内置 SHM 传输, 同机节点间所有消息走共享内存,
   32MB ADC 帧不经网络栈, 零 UDP 分片.
 
   传输策略:
-    - 本地节点 → SHM (共享内存, 128MB 段)
-    - 远程节点 → UDP (自动回退, builtin transports)
+    - 所有节点 → SHM (共享内存, 512MB 段, 容纳 16 帧)
+    - 无 UDP 回退: SHM 满时阻塞等待 (避免静默性能降级)
 
   用法:
     export FASTRTPS_DEFAULT_PROFILES_FILE="/path/to/config/fastdds.xml"
@@ -16,6 +16,10 @@
   版本要求:
     - eProsima FastDDS 2.1+ (ROS2 Foxy 自带 2.1.4)
     - /dev/shm 挂载且可用 (Jetson 默认 tmpfs, ~3.5GB)
+
+  变更历史:
+    2026-07-02: segment_size 128→512MB, useBuiltinTransports true→false
+               (perf 分析: 128MB 仅容 4 帧, SHM 满→UDP 回退→0.8Hz 帧率塌陷)
   ============================================================================
 -->
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
@@ -25,19 +29,25 @@
     <transport_descriptor>
       <transport_id>ft_shm_transport</transport_id>
       <type>SHM</type>
-      <!-- 128MB 段: 容纳 32MB 帧 + 5MB RnNci + 余量 -->
-      <segment_size>134217728</segment_size>
+      <!-- 512MB 段: 容纳 16 帧 × 32MB + 余量, 避免段满回退 UDP -->
+      <segment_size>536870912</segment_size>
     </transport_descriptor>
   </transport_descriptors>
 
-  <!-- ── 默认 Participant 配置 (SHM 优先 + UDP 回退) ── -->
+  <!-- ── 默认 Participant 配置 (SHM 优先 + UDP 兜底) ── -->
+  <!--
+    策略: userTransports (SHM) 优先, builtinTransports (UDP) 兜底.
+    - SHM 正常时: 所有同机消息走共享内存, 零拷贝, 低延迟
+    - SHM 故障时: 自动回退到 UDP, 节点不崩溃 (健壮性优先)
+    - 512MB 段 + env.sh 自动清理 → SHM 故障概率极低
+  -->
   <participant profile_name="ft_default_participant" is_default_profile="true">
     <rtps>
-      <!-- 自定义 SHM 传输 -->
+      <!-- 优先使用自定义 SHM 传输 -->
       <userTransports>
         <transport_id>ft_shm_transport</transport_id>
       </userTransports>
-      <!-- 保留内置 UDP 传输作为跨机回退 -->
+      <!-- 保留内置 UDP 传输作为兜底 (SHM 故障时节点不崩溃) -->
       <useBuiltinTransports>true</useBuiltinTransports>
     </rtps>
   </participant>

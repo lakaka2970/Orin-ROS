@@ -11,7 +11,7 @@
 # 用法:
 #   bash scripts/install_deps.sh                     # 安装项目依赖（ROS2 已安装时）
 #   bash scripts/install_deps.sh --with-ros2         # 含 ROS2 本体安装（首次）
-#   bash scripts/install_deps.sh --with-cyclonedds    # 安装 CycloneDDS (大消息传输优化)
+#   bash scripts/install_deps.sh --with-cyclonedds    # (已弃用: 框架强制 FastDDS SHM)
 #   bash scripts/install_deps.sh --dry-run           # 仅显示将安装的包，不执行
 #
 # 作者: zhengyuan.liu
@@ -210,9 +210,12 @@ ROS2_PACKAGES=(
     "ros-$ROS2_DISTRO-rviz2"
 )
 
-# CycloneDDS — 大消息 (32MB+) 可靠传输; FastDDS UDP 分片 >500 片/帧会大量丢包
+# CycloneDDS — 已弃用 (2026-07-02).
+# 框架强制使用 FastDDS SHM 共享内存传输, CycloneDDS 0.7.0 无 SHM 支持,
+# 32MB ADC 帧走 UDP loopback 会切分为 512 RTPS 分片, 性能极差.
 if $WITH_CYCLONE; then
-    ROS2_PACKAGES+=("ros-$ROS2_DISTRO-rmw-cyclonedds-cpp")
+    echo "[WARN] CycloneDDS 已弃用, 框架强制使用 FastDDS SHM 传输"
+    echo "       如需安装请手动: sudo apt install ros-$ROS2_DISTRO-rmw-cyclonedds-cpp"
 fi
 
 for pkg in "${ROS2_PACKAGES[@]}"; do

@@ -469,11 +469,11 @@ class RspMilPythonNode(Node):
             ch_bytes_all += interleaved.tobytes()
         msg.channel_data_bytes = ch_bytes_all
 
-        # Rx NCI (float32 raw)
-        rx_nci_f32 = rx_nci.astype(np.float32) if rx_nci.dtype != np.float32 else rx_nci
-        msg.rx_nci_rows = rx_nci_f32.shape[0]
-        msg.rx_nci_cols = rx_nci_f32.shape[1]
-        msg.rx_nci_data = rx_nci_f32.tobytes()
+        # VCH NCI (float32 raw) — 1025×512 range-doppler map
+        vch_nci_f32 = vch_nci.astype(np.float32) if vch_nci.dtype != np.float32 else vch_nci
+        msg.rx_nci_rows = vch_nci_f32.shape[0]
+        msg.rx_nci_cols = vch_nci_f32.shape[1]
+        msg.rx_nci_data = vch_nci_f32.tobytes()
 
         self.pub_rn_nci.publish(msg)
 

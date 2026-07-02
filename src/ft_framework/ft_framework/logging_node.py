@@ -377,6 +377,7 @@ class LoggingNode(Node):
         self._ego_fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
         self._ego_dirty = False          # 批量写入: 有未刷新行时为 True
         self._ego_flush_every = 50       # 每 N 条消息触发一次文件重写
+        self._ego_first_write = True     # 首条消息立即写盘, 不等待 timer
 
         # cv_bridge: Image → OpenCV → JPEG
         self._bridge = CvBridge() if CvBridge is not None else None
@@ -422,8 +423,8 @@ class LoggingNode(Node):
 
         # 状态定时器
         self.create_timer(self._status_interval, self._on_status)
-        # ego_motion 定期刷新定时器 (1 秒, 防止长时间无消息时数据丢失)
-        self._ego_flush_timer = self.create_timer(1.0, self._on_ego_flush)
+        # ego_motion 定期刷新定时器 (0.5 秒, 首条已立即写盘, 定期兜底)
+        self._ego_flush_timer = self.create_timer(0.5, self._on_ego_flush)
         self._start_time = time.time()
 
         self.get_logger().info(
@@ -587,8 +588,8 @@ class LoggingNode(Node):
         CSV 列 (对齐 spec §3.2):
           timestamp_us (uint64)  vx yaw_rate steering_angle  ax ay gear
 
-        优化: 批量写入 — 每 N 条消息 (默认50) 或每 1 秒刷新一次文件,
-              将文件重写频率从 50Hz 降低到 ~1Hz.
+        优化: 首条消息立即写盘, 后续批量写入 (每 N 条或每 0.5s),
+              兼顾短时运行的可靠性和长时运行的 I/O 效率.
         """
         if not self._get_switch('enable_ego_motion', 'ego_motion'):
             return
@@ -601,7 +602,14 @@ class LoggingNode(Node):
         self._frame_counts['ego_motion'] += 1
         self._ego_dirty = True
 
-        # 每 N 条消息触发一次文件重写
+        # 首条消息立即写盘 (不等待 timer), 确保短时运行也能持久化
+        if self._ego_first_write:
+            self._ego_first_write = False
+            self._writer.enqueue_task(self._build_ego_rewrite_task())
+            self._ego_dirty = False
+            return
+
+        # 后续: 每 N 条消息触发一次文件重写
         if len(self._ego_lines) % self._ego_flush_every == 0:
             self._writer.enqueue_task(self._build_ego_rewrite_task())
             self._ego_dirty = False

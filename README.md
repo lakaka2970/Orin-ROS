@@ -143,6 +143,13 @@ bash scripts/start.sh --capture-only --rsps
 
 ### 启动选项
 
+| 参数 | 说明 |
+|------|------|
+| `--analog` | 使用模拟 ADC 数据源 (噪声池/.bin), 默认 real 硬件 |
+| `--no-adc` | **不启动 adc_rx 节点**, logging_node 自动关闭 adc.bin 录制 |
+| `--py-rx` | 使用 Python 版 rx 节点 (默认 C++) |
+| `--rviz` | 同时启动 RViz2 |
+
 ```bash
 # ── 生产管线 (ROS2 框架) ──
 bash scripts/start.sh                   # 默认 cuda + C++ rx
@@ -150,6 +157,8 @@ bash scripts/start.sh python            # Python RSP + C++ rx
 bash scripts/start.sh cuda --rviz       # CUDA + RViz
 bash scripts/start.sh both_compare      # 双路对比
 bash scripts/start.sh python --py-rx    # Python RSP + Python rx (回退)
+bash scripts/start.sh --no-adc          # 不启动 adc_rx (仅 RSP + 其他节点)
+bash scripts/start.sh --no-adc --rviz   # 不启动 adc_rx + RViz
 
 # ── 开发管线 (离线调试, 与 ROS 框架互斥 — 共享 /dev/video0) ──
 bash scripts/start.sh --capture-only           # 仅采集雷达原始数据 (v4l2-ctl)
@@ -206,6 +215,12 @@ bash scripts/start.sh cuda
 
 # Python rx + Python RSP (回退验证)
 bash scripts/start.sh python --py-rx
+
+# 不启动 adc_rx (仅 RSP + camera + vehicle + logging, 无 ADC 数据)
+bash scripts/start.sh --no-adc
+
+# 不启动 adc_rx + CUDA RSP
+bash scripts/start.sh cuda --no-adc
 
 # 仅录制 ADC + 自车数据
 ros2 launch ft_framework ft_radar_launch.py rsp_mode:=cuda \

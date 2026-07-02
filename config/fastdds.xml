@@ -34,21 +34,21 @@
     </transport_descriptor>
   </transport_descriptors>
 
-  <!-- ── 默认 Participant 配置 (SHM 优先 + UDP 兜底) ── -->
+  <!-- ── 默认 Participant 配置 (纯 SHM, 无 UDP 回退) ── -->
   <!--
-    策略: userTransports (SHM) 优先, builtinTransports (UDP) 兜底.
-    - SHM 正常时: 所有同机消息走共享内存, 零拷贝, 低延迟
-    - SHM 故障时: 自动回退到 UDP, 节点不崩溃 (健壮性优先)
-    - 512MB 段 + env.sh 自动清理 → SHM 故障概率极低
+    策略: 仅使用 SHM 共享内存传输.
+    - SHM 段 512MB, 容纳 16 帧 × 32MB
+    - scripts/env.sh 每次 source 时自动清理僵尸段, SHM 不会用完
+    - 如 SHM 初始化失败, 节点将报错退出 (不会静默回退到慢速 UDP)
   -->
   <participant profile_name="ft_default_participant" is_default_profile="true">
     <rtps>
-      <!-- 优先使用自定义 SHM 传输 -->
+      <!-- 仅使用自定义 SHM 传输 -->
       <userTransports>
         <transport_id>ft_shm_transport</transport_id>
       </userTransports>
-      <!-- 保留内置 UDP 传输作为兜底 (SHM 故障时节点不崩溃) -->
-      <useBuiltinTransports>true</useBuiltinTransports>
+      <!-- 关闭内置 UDP 传输: 32MB 帧走 UDP 会被切分为 512 分片, 每帧耗时 ~1s -->
+      <useBuiltinTransports>false</useBuiltinTransports>
     </rtps>
   </participant>
 

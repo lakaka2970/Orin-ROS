@@ -142,6 +142,9 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument(
         'adc_source', default_value='real',
         description='ADC 数据源: real (硬件设备) | analog (噪声池/文件模拟)'))
+    ld.add_action(DeclareLaunchArgument(
+        'no_adc', default_value='false',
+        description='不启动 adc_rx 节点: true | false (default)'))
 
     # ========================================================================
     # 模式引用
@@ -150,6 +153,7 @@ def generate_launch_description():
     rsp_mode   = LaunchConfiguration('rsp_mode')
     rx_impl    = LaunchConfiguration('rx_impl')
     adc_source = LaunchConfiguration('adc_source')
+    no_adc     = LaunchConfiguration('no_adc')
 
     # 条件表达式
     python_enabled = PythonExpression([
@@ -160,6 +164,13 @@ def generate_launch_description():
     ])
     use_cpp = PythonExpression(["'", rx_impl, "' == 'cpp'"])
     use_py  = PythonExpression(["'", rx_impl, "' == 'python'"])
+
+    # adc_rx 启用条件: no_adc 不为 'true' 时才启动
+    adc_enabled = PythonExpression(["'", no_adc, "' != 'true'"])
+    # log_adc 有效值: no_adc 时强制 false (无 adc_rx → 无数据可录)
+    log_adc_effective = PythonExpression([
+        "'false' if '", no_adc, "' == 'true' else '",
+        LaunchConfiguration('log_adc'), "'"])
 
     # ========================================================================
     # 包引用 (根据 rx_impl 选择)
@@ -192,6 +203,7 @@ def generate_launch_description():
     ld.add_action(Node(
         package=adc_pkg, executable=adc_exe, name='adc_rx',
         output='screen',
+        condition=IfCondition(adc_enabled),
         parameters=[{**adc_cfg, 'fps': 10.0}]))
     ld.add_action(Node(
         package=cam_pkg, executable=cam_exe, name='camera_rx',
@@ -241,7 +253,7 @@ def generate_launch_description():
         name='logging_node', output='screen',
         parameters=[{
             **log_cfg,
-            'enable_adc':        LaunchConfiguration('log_adc'),
+            'enable_adc':        log_adc_effective,
             'enable_image':      LaunchConfiguration('log_image'),
             'enable_det_list':   LaunchConfiguration('log_det_list'),
             'enable_ego_motion': LaunchConfiguration('log_ego_motion'),

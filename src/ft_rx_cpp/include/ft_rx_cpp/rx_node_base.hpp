@@ -88,10 +88,10 @@ public:
       prof_.is_enabled() ? "ON" : "OFF");
   }
 
-  /// Start a dedicated polling thread (hardware-driven, rate-limited).
-  /// The thread calls execute_frame() in a loop paced to @p expected_fps Hz.
-  /// After each frame, sleeps for the remainder of the frame period to avoid
-  /// overwhelming DDS with 32MB ADC messages at excessive hardware rates.
+  /// Start a dedicated polling thread (hardware-driven, no artificial rate limiting).
+  /// The thread calls execute_frame() in a loop.  V4L2 DQBUF blocks inside
+  /// fill_message() and naturally paces the loop to the hardware frame rate.
+  /// No timer-based sleep — the hardware IS the clock.
   void start_polling_loop(double expected_fps)
   {
     fps_ = expected_fps;
@@ -110,18 +110,9 @@ public:
     wall_start_ = std::chrono::steady_clock::now();
     stop_polling_ = false;
 
-    auto frame_period = std::chrono::duration<double>(1.0 / fps_);
-    polling_thread_ = std::thread([this, frame_period]() {
+    polling_thread_ = std::thread([this]() {
       while (rclcpp::ok() && !stop_polling_) {
-        auto t0 = std::chrono::steady_clock::now();
-        execute_frame();
-        // 速率限制: 发布后等待到下一帧周期
-        // V4L2 DQBUF 在 execute_frame() 内阻塞, 天然跳过中间帧
-        auto t1 = std::chrono::steady_clock::now();
-        auto elapsed = t1 - t0;
-        if (elapsed < frame_period) {
-          std::this_thread::sleep_for(frame_period - elapsed);
-        }
+        execute_frame();   // fill_message() 内 V4L2 DQBUF 阻塞 → 硬件帧率即为发布帧率
       }
     });
 

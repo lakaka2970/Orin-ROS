@@ -131,43 +131,48 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
     # rx索引 (256,): tx-major, rx 0..15 对每个tx重复
     rx_vec = torch.arange(n_rx, dtype=torch.int64, device=DEVICE).repeat(n_tx)  # (256,)
 
-    # ----- 6. 提取每个峰值的通道数据（256 个虚拟通道）-----
+    # ----- 6. 批量提取所有峰值的通道数据 (GPU 向量化) -----
+    # ★ 性能关键: 避免 per-peak GPU→CPU 同步 (200次 cudaMemcpy → 1次)
     n_peaks = final_rb.shape[0]
-    channel_list = []
-    channel_gpu_list = []
-    for i in range(n_peaks):
-        rb = final_rb[i]
-        db = final_db[i]
 
-        db_vec = (db + db_off_tab) % n_doppler                       # (256,)
-        rb_vec =  rb + rb_off_tab                                    # (256,)
+    # 批量构造索引矩阵: (N, 256) 一次 gather 所有 peaks 的通道
+    db_all = final_db.view(-1, 1)                                    # (N, 1)
+    rb_all = final_rb.view(-1, 1)                                    # (N, 1)
 
-        # Range溢出: clamp后清零越界元素
-        rb_clip = rb_vec.clamp(0, n_range_bins - 1)
-        channel_vec = rd_cube[rx_vec, db_vec, rb_clip]               # (256,) 逐元素索引
-        invalid = rb_vec >= n_range_bins
-        if invalid.any():
-            channel_vec[invalid] = 0.0
+    db_idx = (db_all + db_off_tab.unsqueeze(0)) % n_doppler           # (N, 256)
+    rb_idx = rb_all + rb_off_tab.unsqueeze(0)                          # (N, 256)
+    rx_idx = rx_vec.unsqueeze(0).expand(n_peaks, -1)                   # (N, 256)
 
-        channel_gpu_list.append(channel_vec)                         # (256,) GPU tensor — DOA 直通, 零拷贝
-        channel_flat = channel_vec.cpu().numpy()                     # (256,)
-        channel_list.append(channel_flat)
+    rb_clip = rb_idx.clamp(0, n_range_bins - 1)
+    channel_all = rd_cube[rx_idx, db_idx, rb_clip]                    # (N, 256) ★ 单次 GPU gather
+    invalid = rb_idx >= n_range_bins
+    if invalid.any():
+        channel_all[invalid] = False
 
-    # 通道校准
+    # 批量 GPU→CPU 传输 (1 次 cudaMemcpy 替代 N 次)
+    channel_flat_all_np = channel_all.cpu().numpy()                   # (N, 256) complex64
+
+    # 通道校准: CPU 批量校准 + GPU 批量回传
     if do_calibrate:
-        channel_list = [apply_calibration(ch) for ch in channel_list]
-        channel_gpu_list = [ch * _CAL_VEC_GPU for ch in channel_gpu_list]
+        channel_list = [apply_calibration(ch) for ch in channel_flat_all_np]
+        # GPU 校准向量 (支持 GPU 加速 DOA)
+        channel_gpu_list = [ch * _CAL_VEC_GPU for ch in channel_all]
+    else:
+        channel_list = [ch for ch in channel_flat_all_np]
+        channel_gpu_list = [ch for ch in channel_all]
 
-    # ----- 7. 组装返回字典（移至 CPU）-----
-    rb_cpu = final_rb.cpu().numpy()
-    db_cpu = final_db.cpu().numpy()
-    vch_cpu = final_vch.cpu().numpy()
-    noise_cpu = noise.cpu().numpy()
-    p_up_c = p_up.cpu().numpy()
-    p_down_c = p_down.cpu().numpy()
-    p_left_c = p_left.cpu().numpy()
-    p_right_c = p_right.cpu().numpy()
-    rx_nci_c = rx_nci_rd.cpu().numpy()
+    # ----- 7. GPU 稀疏 gather: 仅传输峰值位置的邻域值 (6KB vs 10MB) -----
+    rb_g = final_rb
+    db_g = final_db
+
+    p_up_vals   = p_up[rb_g, db_g].cpu().numpy()      # (N,) float
+    p_down_vals = p_down[rb_g, db_g].cpu().numpy()
+    p_left_vals = p_left[rb_g, db_g].cpu().numpy()
+    p_right_vals= p_right[rb_g, db_g].cpu().numpy()
+    rx_nci_vals = rx_nci_rd[rb_g, db_g].cpu().numpy()
+    noise_vals  = noise[rb_g].cpu().numpy()
+    rb_cpu = rb_g.cpu().numpy()
+    db_cpu = db_g.cpu().numpy()
 
     # ----- 8. 组装返回字典（字段与 RDCell 结构体对齐）-----
     rdcell_list = []

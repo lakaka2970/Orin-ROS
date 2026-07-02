@@ -9,6 +9,7 @@
 #   bash scripts/start.sh python          # Python RSP 模式
 #   bash scripts/start.sh cuda            # CUDA RSP 模式
 #   bash scripts/start.sh both_compare    # 双路对比模式
+#   bash scripts/start.sh --no-adc        # 不启动 adc_rx, logging 不录 adc.bin
 #
 #   开发管线 (调试/验证雷达硬件, 与 ROS 采集互斥 — 共享 /dev/video0):
 #   bash scripts/start.sh --capture-only           # 仅采集雷达原始数据
@@ -17,6 +18,7 @@
 #
 # 可选参数 (任意顺序):
 #   --analog       使用模拟 ADC 数据源 (噪声池/.bin), 默认 real (硬件设备)
+#   --no-adc       不启动 adc_rx 节点, logging_node 自动关闭 adc.bin 录制
 #   --py-rx        使用 Python 版 rx 节点 (默认 C++)
 #   --rviz         同时启动 RViz2
 #
@@ -38,6 +40,7 @@ RSP_MODE="cuda"
 USE_PY_RX=false
 USE_RVIZ=false
 ADC_SOURCE="real"
+NO_ADC=false
 DO_CAPTURE=false
 DO_RSPS=false
 CAPTURE_ONLY=false
@@ -48,6 +51,7 @@ for arg in "$@"; do
         --analog) ADC_SOURCE="analog" ;;
         --py-rx)  USE_PY_RX=true ;;
         --rviz)   USE_RVIZ=true ;;
+        --no-adc) NO_ADC=true ;;
         --capture) DO_CAPTURE=true ;;
         --capture-only) DO_CAPTURE=true; CAPTURE_ONLY=true ;;
         --rsps)   DO_RSPS=true ;;
@@ -202,13 +206,25 @@ echo "  FT Radar Framework 启动"
 echo "  RSP 模式:   $RSP_MODE"
 echo "  Rx 实现:    $RX_IMPL"
 echo "  ADC 数据源: $ADC_SOURCE"
+if $NO_ADC; then
+    echo "  ADC 节点:   禁用 (--no-adc)"
+fi
 echo "  RMW:        ${RMW_IMPLEMENTATION:-FastDDS (default)}"
 echo "=============================================="
 
-ros2 launch ft_framework ft_radar_launch.py \
-    rsp_mode:=$RSP_MODE \
-    rx_impl:=$RX_IMPL \
-    adc_source:=$ADC_SOURCE &
+# 构建 launch 参数
+_ft_launch_args=(
+    "rsp_mode:=$RSP_MODE"
+    "rx_impl:=$RX_IMPL"
+    "adc_source:=$ADC_SOURCE"
+    "no_adc:=$NO_ADC"
+)
+# --no-adc 时自动关闭 logging 的 ADC 录制 (无 adc_rx → 无数据可录)
+if $NO_ADC; then
+    _ft_launch_args+=("log_adc:=false")
+fi
+
+ros2 launch ft_framework ft_radar_launch.py "${_ft_launch_args[@]}" &
 
 LAUNCH_PID=$!
 

@@ -85,61 +85,77 @@ def peak_search_gpu(rd_cube, max_vch_nci, max_subband_idx, rx_nci, noise,
 
     n_tx = 16
     n_rx = 16
+
+    # 偏移表 (256,), 由 DDMA解调 + tx/rx半阵偏移 预计算
+    rb_off_tab = torch.tensor([
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 0
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 1
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 2
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 3
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 4
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 5
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 6
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 7
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx 8
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx 9
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx10
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx11
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx12
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx13
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx14
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx15
+    ], dtype=torch.int64, device=DEVICE)
+
+    db_off_tab = torch.tensor([
+        0,0,0,0,0,0,0,0,4,4,4,4,4,4,4,4,                           # tx 0
+        496,496,496,496,496,496,496,496,500,500,500,500,500,500,500,500,  # tx 1
+        480,480,480,480,480,480,480,480,484,484,484,484,484,484,484,484,  # tx 2
+        464,464,464,464,464,464,464,464,468,468,468,468,468,468,468,468,  # tx 3
+        448,448,448,448,448,448,448,448,452,452,452,452,452,452,452,452,  # tx 4
+        368,368,368,368,368,368,368,368,372,372,372,372,372,372,372,372,  # tx 5
+        352,352,352,352,352,352,352,352,356,356,356,356,356,356,356,356,  # tx 6
+        320,320,320,320,320,320,320,320,324,324,324,324,324,324,324,324,  # tx 7
+        292,292,292,292,292,292,292,292,296,296,296,296,296,296,296,296,  # tx 8
+        260,260,260,260,260,260,260,260,264,264,264,264,264,264,264,264,  # tx 9
+        212,212,212,212,212,212,212,212,216,216,216,216,216,216,216,216,  # tx10
+        148,148,148,148,148,148,148,148,152,152,152,152,152,152,152,152,  # tx11
+        132,132,132,132,132,132,132,132,136,136,136,136,136,136,136,136,  # tx12
+        84,84,84,84,84,84,84,84,88,88,88,88,88,88,88,88,                 # tx13
+        52,52,52,52,52,52,52,52,56,56,56,56,56,56,56,56,                 # tx14
+        36,36,36,36,36,36,36,36,40,40,40,40,40,40,40,40,                 # tx15
+    ], dtype=torch.int64, device=DEVICE)
+
+    # rx索引 (256,): tx-major, rx 0..15 对每个tx重复
+    rx_vec = torch.arange(n_rx, dtype=torch.int64, device=DEVICE).repeat(n_tx)  # (256,)
+
+    # ----- 6. 提取每个峰值的通道数据（256 个虚拟通道）-----
     n_peaks = final_rb.shape[0]
+    channel_list = []
+    for i in range(n_peaks):
+        rb = final_rb[i]
+        db = final_db[i]
 
-    if n_peaks == 0:
-        return []
+        db_vec = (db + db_off_tab) % n_doppler                       # (256,)
+        rb_vec =  rb + rb_off_tab                                    # (256,)
 
-    # ----- 6. 向量化通道提取: 一次 gather 所有 peaks 的 (16,16) 虚拟通道矩阵 -----
-    # 计算每个 (tx, rx) 位置的 db/rb 偏移量:
-    #   rb_off = (tx >= 8) + (rx >= 8)    → 0, 1, 2
-    #   db_off = rb_off * 4               → 0, 4, 8
-    tx_grid = torch.arange(n_tx, device=DEVICE).view(1, 16, 1)   # (1, 16, 1)
-    rx_grid = torch.arange(n_rx, device=DEVICE).view(1, 1, 16)   # (1, 1, 16)
-    tx_hi  = (tx_grid >= 8).to(torch.int64)                      # (1, 16, 1)
-    rx_hi  = (rx_grid >= 8).to(torch.int64)                      # (1, 1, 16)
-    rb_off = (tx_hi + rx_hi)                                     # (1, 16, 16) 每元素为 0/1/2
-    db_off = rb_off * 4                                           # (1, 16, 16) 每元素为 0/4/8
+        # Range溢出: clamp后清零越界元素
+        rb_clip = rb_vec.clamp(0, n_range_bins - 1)
+        channel_vec = rd_cube[rx_vec, db_vec, rb_clip]               # (256,) 逐元素索引
+        invalid = rb_vec >= n_range_bins
+        if invalid.any():
+            channel_vec[invalid] = 0.0
 
-    # 展开 peak 维度: (N, 1, 1) + (1, 16, 16) → (N, 16, 16)
-    rb_all = final_rb.view(-1, 1, 1)                             # (N, 1, 1)
-    db_all = final_db.view(-1, 1, 1)                             # (N, 1, 1)
+        channel_flat = channel_vec.cpu().numpy()                     # (256,)
+        channel_list.append(channel_flat)
 
-    rb_idx = rb_all + rb_off                                     # (N, 16, 16)
-    # DDMA 解调: doppler = (db + db_off + tx_ddma[tx] * step) % n_doppler
-    tx_ddma_t = torch.tensor(tx_ddma_idx, dtype=torch.int64, device=DEVICE)
-    ddma_step = n_doppler // n_subbands                           # 16
-    ddma_shift = tx_ddma_t[tx_grid] * ddma_step                  # (1, 16, 1)
-    db_idx = (db_all + db_off + ddma_shift) % n_doppler          # (N, 16, 16)
-
-    # range 溢出遮罩
-    overflow = rb_idx >= n_range_bins
-    rb_idx = torch.clamp(rb_idx, 0, n_range_bins - 1)
-
-    # ★ 单次向量化 gather: (N, 16, 16) 一次完成所有 peaks 的通道提取
-    # rd_cube: (n_rx=16, chirp=512, range) — rx_grid 广播到 (N,16,16)
-    rx_batch = rx_grid.expand(n_peaks, -1, -1)                   # (N, 16, 16)
-    channel_all = rd_cube[rx_batch, db_idx, rb_idx]              # (N, 16, 16)
-    channel_all[overflow] = 0j                                    # 溢出位置填零
-
-    # 展平为 (N, 256) GPU tensor
-    channel_flat_all = channel_all.reshape(n_peaks, -1)           # (N, 256)
-
-    # ----- 7. 通道校准 (批量 CPU 传输, 避免 per-peak 往返) -----
+    # 通道校准
     if do_calibrate:
-        # 单次 GPU→CPU 批量传输
-        channels_np = channel_flat_all.cpu().numpy()              # (N, 256)
-        calibrated_np = [apply_calibration(ch) for ch in channels_np]
-        # 单次 CPU→GPU 批量回传
-        channel_list = calibrated_np
-        channel_gpu_list = [torch.from_numpy(ch).to(DEVICE) for ch in calibrated_np]
-    else:
-        channel_list = [ch.cpu().numpy() for ch in channel_flat_all]
-        channel_gpu_list = [ch for ch in channel_flat_all]        # 保持 GPU tensor 引用
+        channel_list = [apply_calibration(ch) for ch in channel_list]
 
     # ----- 7. 组装返回字典（移至 CPU）-----
     rb_cpu = final_rb.cpu().numpy()
     db_cpu = final_db.cpu().numpy()
+    vch_cpu = final_vch.cpu().numpy()
     noise_cpu = noise.cpu().numpy()
     p_up_c = p_up.cpu().numpy()
     p_down_c = p_down.cpu().numpy()

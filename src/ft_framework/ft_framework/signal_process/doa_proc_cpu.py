@@ -88,7 +88,6 @@ def doa_main_ultra_separated(
     mag_ele_db = 20.0 * np.log10(np.abs(fft_ele) + 1e-12)
 
     # 可选绘图
-    if False:   # 改为False避免干扰，如需绘图置True
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1); plt.plot(mag_azi_db); plt.title('Azimuth Spectrum'); plt.grid(True)
         plt.subplot(1, 2, 2); plt.plot(mag_ele_db); plt.title('Elevation Spectrum'); plt.grid(True)

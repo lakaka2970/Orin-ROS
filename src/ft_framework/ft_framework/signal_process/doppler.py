@@ -4,7 +4,6 @@
 """
 
 import torch
-import matplotlib.pyplot as plt
 
 DEVICE = torch.device('cuda')
 _n_chirps = 512      # Chirp 数量（与 RadarConfig 保持一致）
@@ -42,12 +41,11 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
 
     # ----- 2. RX 非相干积累：rx 0-7 正常, rx 8-15 偏移累加 -----
     n_rx_half = n_rx // 2
-    rx_nci_pre = torch.sum(torch.abs(rd_cube), dim=0)                      # (chirp, range) — 全 rx 正常累加 (对比用)
-    rx_nci = torch.sum(torch.abs(rd_cube[:n_rx_half]), dim=0)              # (chirp, range)
-    rd_shifted = torch.abs(rd_cube[n_rx_half:])                            # (8, chirps, range)
-    rd_shifted = torch.roll(rd_shifted, shifts=-4, dims=1)                 # doppler+4
-    rd_shifted = torch.roll(rd_shifted, shifts=-1, dims=2)                 # range+1
-    rd_shifted[:, :, -1] = 0.0                                             # 防 range 溢出
+    rx_nci = torch.sum(torch.abs(rd_cube[:n_rx_half]), dim=0)           # (chirp, range)
+    rd_shifted = torch.abs(rd_cube[n_rx_half:])                         # (8, chirps, range)
+    rd_shifted = torch.roll(rd_shifted, shifts=-4, dims=1)              # doppler+4
+    rd_shifted = torch.roll(rd_shifted, shifts=-1, dims=2)              # range+1
+    rd_shifted[:, :, -1] = 0.0                                          # 防 range 溢出
     rx_nci += torch.sum(rd_shifted, dim=0)
     # 转换为对数域（近似 dB，系数 4096 为经验缩放）
 
@@ -62,10 +60,6 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
     doppler_indices = torch.arange(n_chirps, dtype=torch.int64, device=DEVICE)[None, :]
     doppler_step = n_chirps // n_subbands
 
-    # 全 tx 正常 DDMA (对比用)
-    db_idx_all = (doppler_indices + tx_ddma[:, None] * doppler_step) % n_chirps
-    vch_nci_pre = torch.sum(rx_nci[db_idx_all, :], dim=0).t().contiguous()  # (range, chirp)
-
     # 前一半 tx: 正常多普勒索引
     db_idx_first = (doppler_indices + tx_ddma[:n_tx_half, None] * doppler_step) % n_chirps
     vch_first = rx_nci[db_idx_first, :]                                    # (n_tx_half, chirp, range)
@@ -77,33 +71,6 @@ def doppler_processing_gpu(radarcube, n_rx, n_chirps, n_range_bins,
     vch_second[:, :, -1] = 0.0                                             # 防 range 溢出
 
     vch_nci = (torch.sum(vch_first, dim=0) + torch.sum(vch_second, dim=0)).t().contiguous()
-
-    # ---- 对比绘图 (默认关闭, 改为 True 可显示) ----
-    if False:
-        rangebin_idx = 16
-        doppler_axis = torch.arange(n_chirps, device=DEVICE)
-
-        # rx_nci: 全 rx 正常 vs split 累加
-        plt.figure(figsize=(10, 5))
-        plt.plot(doppler_axis.cpu(), rx_nci_pre[:, rangebin_idx].cpu(), label='rx_nci_pre (all rx normal)', alpha=0.7)
-        plt.plot(doppler_axis.cpu(), rx_nci[:, rangebin_idx].cpu(), label='rx_nci (split accumulation)', alpha=0.7)
-        plt.xlabel('Doppler bin')
-        plt.ylabel('Power')
-        plt.title(f'GPU rx_nci comparison at rangebin={rangebin_idx}')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.show()
-
-        # vch_nci: 全 tx 正常 DDMA vs split DDMA
-        plt.figure(figsize=(10, 5))
-        plt.plot(doppler_axis.cpu(), vch_nci_pre[rangebin_idx, :].cpu(), label='vch_nci_pre (all tx normal)', alpha=0.7)
-        plt.plot(doppler_axis.cpu(), vch_nci[rangebin_idx, :].cpu(), label='vch_nci (split tx accumulation)', alpha=0.7)
-        plt.xlabel('Doppler bin')
-        plt.ylabel('Power')
-        plt.title(f'GPU vch_nci comparison at rangebin={rangebin_idx}')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.show()
 
     # ----- 5. 子带最大值提取（避免 view 导致的不连续内存错误）-----
     subband_step = n_chirps // n_subbands

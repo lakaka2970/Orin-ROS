@@ -54,19 +54,9 @@ class DOA_Ultra_Initializer:
                 return torch.full_like(positions, self.fft_len // 2, dtype=torch.int64)
             return ((positions - min_pos) / (max_pos - min_pos) * (self.fft_len - 1)).to(torch.int64)
 
-        self.azi_map_idx = get_map_indices_gpu(Array_Azi[0, :])   # 方位子阵 x 坐标 → FFT bin
-        self.ele_map_idx = get_map_indices_gpu(Array_Ele[1, :])   # 俯仰子阵 y 坐标 → FFT bin
-        # 保留旧名兼容
-        self.azi_indices = self.azi_map_idx
-        self.ele_indices = self.ele_map_idx
+        self.azi_indices = get_map_indices_gpu(Array_Azi[0, :])   # 方位子阵 x 坐标
+        self.ele_indices = get_map_indices_gpu(Array_Ele[1, :])   # 俯仰子阵 y 坐标
         self.is_initialized = True
-
-    def cache_selection_indices(self, AziIdx_Select, EleIdx_Select):
-        """缓存子阵选择索引 (GPU tensors), 供批量 DOA 使用。"""
-        self.azi_sel_idx = (AziIdx_Select.to(DEVICE) if isinstance(AziIdx_Select, torch.Tensor)
-                            else torch.from_numpy(AziIdx_Select).to(DEVICE))
-        self.ele_sel_idx = (EleIdx_Select.to(DEVICE) if isinstance(EleIdx_Select, torch.Tensor)
-                            else torch.from_numpy(EleIdx_Select).to(DEVICE))
 
 
 # 全局 DOA 环境（单例）

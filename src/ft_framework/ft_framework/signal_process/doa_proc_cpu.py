@@ -4,7 +4,7 @@ DOA（到达角）估计模块
 """
 import numpy as np
 import matplotlib.pyplot as plt
-from ft_framework.signal_process.multTarget_cpu import MultiTargetEVT
+from  ft_framework.signal_process.multTarget_cpu import MultiTargetEVT
 
 
 class DOAUltraInitializer:
@@ -88,7 +88,7 @@ def doa_main_ultra_separated(
     mag_ele_db = 20.0 * np.log10(np.abs(fft_ele) + 1e-12)
 
     # 可选绘图
-    if False:   # 改为False避免干扰，如需绘图置True
+    if False:
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1); plt.plot(mag_azi_db); plt.title('Azimuth Spectrum'); plt.grid(True)
         plt.subplot(1, 2, 2); plt.plot(mag_ele_db); plt.title('Elevation Spectrum'); plt.grid(True)

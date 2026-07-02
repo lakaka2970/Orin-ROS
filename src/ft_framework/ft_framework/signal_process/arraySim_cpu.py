@@ -5,7 +5,7 @@ import numpy as np
 import time
 from dataclasses import dataclass, asdict
 from scipy.io import savemat
-from ft_framework.signal_process.doa_proc_cpu import doa_main_ultra_separated
+from  ft_framework.signal_process.doa_proc_cpu import doa_main_ultra_separated
 
 
 @dataclass

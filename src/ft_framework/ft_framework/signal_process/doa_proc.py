@@ -6,7 +6,7 @@ DOA 估计模块：利用方位/俯仰分离子阵，通过 FFT 与峰值插值�
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from ft_framework.signal_process.multTarget import MultiTargetEVT_GPU
+from  ft_framework.signal_process.multTarget import MultiTargetEVT_GPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -38,26 +38,18 @@ class DOA_Ultra_Initializer:
 
     def prepare_mapping_indices(self, Array_Azi, Array_Ele):
         """
-        预计算方位/俯仰子阵元素到 FFT 网格的映射索引（线性映射，基于最小/最大值）。
-        此方法需在首次 DOA 处理前调用一次。
+        预计算方位/俯仰子阵元素到 FFT 网格的映射索引。
+        将阵元物理位置 (λ/2 单位) 直接作为 FFT bin 索引, clamp 到 [0, fft_len-1]。
+        与 doa_main_ultra_separated 保持一致。
         """
-        def get_map_indices_gpu(positions):
-            """将一维阵元位置线性映射到 [0, fft_len-1] 的整数索引。"""
-            if not isinstance(positions, torch.Tensor):
-                positions = torch.from_numpy(positions).to(DEVICE)
-            else:
-                positions = positions.to(DEVICE)
-            if positions.numel() == 0:
-                return torch.tensor([], dtype=torch.int64, device=DEVICE)
-            min_pos, max_pos = torch.min(positions), torch.max(positions)
-            if max_pos == min_pos:
-                return torch.full_like(positions, self.fft_len // 2, dtype=torch.int64)
-            return ((positions - min_pos) / (max_pos - min_pos) * (self.fft_len - 1)).to(torch.int64)
+        def _to_gpu_int64(arr):
+            if isinstance(arr, torch.Tensor):
+                return arr.to(dtype=torch.int64, device=DEVICE)
+            return torch.from_numpy(arr).to(dtype=torch.int64, device=DEVICE)
 
-        self.azi_map_idx = get_map_indices_gpu(Array_Azi[0, :])   # 方位子阵 x 坐标 → FFT bin
-        self.ele_map_idx = get_map_indices_gpu(Array_Ele[1, :])   # 俯仰子阵 y 坐标 → FFT bin
-        # 保留旧名兼容
-        self.azi_indices = self.azi_map_idx
+        self.azi_map_idx = torch.clamp(_to_gpu_int64(Array_Azi[0, :]), 0, self.fft_len - 1)
+        self.ele_map_idx = torch.clamp(_to_gpu_int64(Array_Ele[1, :]), 0, self.fft_len - 1)
+        self.azi_indices = self.azi_map_idx                        # 兼容旧名
         self.ele_indices = self.ele_map_idx
         self.is_initialized = True
 

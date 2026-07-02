@@ -98,12 +98,33 @@ class RspMilPythonNode(Node):
 
         # ---------- 雷达参数与阵列初始化 ----------
         self.cfg = RadarConfig()
-        self.array_env = RadarArrayInitializer()
+
+        # ---- 天线阵列定义（用户指定）----
+        AzmChUse = np.array([0,1,2,8,9,10,11,12,13,14,15,16,17,18,24,25,26,27,28,31,32,33,34,40,
+                             42,43,45,46,48,49,50,56,58,59,61,62,64,65,66,72,74,75,77,78,80,81,82,
+                             88,90,91,93,94,96,97,98,106,107,110,112,113,114,126,208,216,217,218,219,
+                             220,221,224,232,234,235,236,237,248,249,251], dtype=np.int64)
+        AzmPosUse = np.array([34,29,24,76,70,62,57,52,48,39,43,38,33,28,80,74,66,61,56,47,30,25,20,
+                              72,58,53,44,35,26,21,16,68,54,49,40,31,22,17,12,64,50,45,36,27,18,13,8,
+                              60,46,41,32,23,14,9,4,42,37,19,10,5,0,15,63,105,99,91,86,81,77,55,97,83,
+                              78,73,69,90,84,71], dtype=np.float32)
+        ElvChUse = np.array([43,130,131,132,133,134,135,146,147,148,149,150,151,162,163,164,165,166,167,
+                             178,179,180,181,182,183,194,195,196,197,198,199,211,212,213,214,215], dtype=np.int64)
+        ElvPosUse = np.array([40,74,66,58,50,34,42,81,73,65,57,41,49,67,59,51,43,27,35,54,46,38,30,
+                              14,22,47,39,31,23,7,15,32,24,16,0,8], dtype=np.float32)
+
+        n_azi = len(AzmPosUse)
+        n_ele = len(ElvPosUse)
+        self.Array_Azi = np.zeros((3, n_azi), dtype=np.float32)
+        self.Array_Azi[0, :] = AzmPosUse
+        self.Array_Ele = np.zeros((3, n_ele), dtype=np.float32)
+        self.Array_Ele[1, :] = ElvPosUse
+        self.AziIdx_Select = AzmChUse
+        self.EleIdx_Select = ElvChUse
 
         # 初始化 DOA 环境（预先准备 FFT 索引映射，避免每帧重复计算）
         if not doa_env.is_initialized:
-            doa_env.prepare_mapping_indices(
-                self.array_env.Array_Azi, self.array_env.Array_Ele)
+            doa_env.prepare_mapping_indices(self.Array_Azi, self.Array_Ele)
 
         self.get_logger().info(
             f'雷达参数初始化完成: '
@@ -253,8 +274,8 @@ class RspMilPythonNode(Node):
 
                 azi_results, ele_results, azi_snr, ele_snr = doa_main_ultra_separated(
                     channel_data,
-                    self.array_env.Array_Azi, self.array_env.AziIdx_Select,
-                    self.array_env.Array_Ele, self.array_env.EleIdx_Select,
+                    self.Array_Azi, self.AziIdx_Select,
+                    self.Array_Ele, self.EleIdx_Select,
                     doa_threshold_db)
 
                 if len(azi_results) == 0 or len(ele_results) == 0:
@@ -372,7 +393,7 @@ class RspMilPythonNode(Node):
             pt.elevation_idx = int(dp.get('elevation_idx', 0))     # 31. u8ElevationIdx
 
             # -- 峰值与 SNR --
-            pt.peak_val         = int(dp.get('peak_val', 0)*32)   # 32. u16PeakVal
+            pt.peak_val         = int(dp.get('peak_val', 0)*128)   # 32. u16PeakVal
             pt.sin_azim_snr_lin = int(dp.get('sin_azim_snr_lin', 0))  # 33. u16SinAzimSNRLin
             pt.sin_elev_snr_lin = int(dp.get('sin_elev_snr_lin', 0))  # 34. u16SinElevSNRLin
 

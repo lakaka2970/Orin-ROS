@@ -64,11 +64,33 @@ def main():
     cfg = RadarConfig()
     array_env = RadarArrayInitializer()
 
+    # ---- 天线阵列定义（用户指定）----
+    AzmChUse = np.array([0,1,2,8,9,10,11,12,13,14,15,16,17,18,24,25,26,27,28,31,32,33,34,40,
+                         42,43,45,46,48,49,50,56,58,59,61,62,64,65,66,72,74,75,77,78,80,81,82,
+                         88,90,91,93,94,96,97,98,106,107,110,112,113,114,126,208,216,217,218,219,
+                         220,221,224,232,234,235,236,237,248,249,251], dtype=np.int64)
+    AzmPosUse = np.array([34,29,24,76,70,62,57,52,48,39,43,38,33,28,80,74,66,61,56,47,30,25,20,
+                          72,58,53,44,35,26,21,16,68,54,49,40,31,22,17,12,64,50,45,36,27,18,13,8,
+                          60,46,41,32,23,14,9,4,42,37,19,10,5,0,15,63,105,99,91,86,81,77,55,97,83,
+                          78,73,69,90,84,71], dtype=np.float32)
+    ElvChUse = np.array([43,130,131,132,133,134,135,146,147,148,149,150,151,162,163,164,165,166,167,
+                         178,179,180,181,182,183,194,195,196,197,198,199,211,212,213,214,215], dtype=np.int64)
+    ElvPosUse = np.array([40,74,66,58,50,34,42,81,73,65,57,41,49,67,59,51,43,27,35,54,46,38,30,
+                          14,22,47,39,31,23,7,15,32,24,16,0,8], dtype=np.float32)
+
+    n_azi = len(AzmPosUse)
+    n_ele = len(ElvPosUse)
+    Array_Azi_test = np.zeros((3, n_azi), dtype=np.float32)
+    Array_Azi_test[0, :] = AzmPosUse                                  # AzmPosUse → Array_Azi[0, :]
+    Array_Ele_test = np.zeros((3, n_ele), dtype=np.float32)
+    Array_Ele_test[1, :] = ElvPosUse                                  # ElvPosUse → Array_Ele[1, :]
+    # ------------------------------------------
+
     total_start = time.perf_counter()
 
     # ----- 读取数据 -----
     raw_data = readRawBinCasc(
-        os.path.dirname(os.path.abspath(__file__)),
+        ".",
         frameNr=0,
         nSamples=cfg.n_samples,
         nRamps=cfg.n_chirps,
@@ -93,8 +115,8 @@ def main():
         # 预热DOA环境（准备映射）
         doa_main_ultra_separated(
             peaks_warm[0]['channel'],
-            array_env.Array_Azi, array_env.AziIdx_Select,
-            array_env.Array_Ele, array_env.EleIdx_Select
+            Array_Azi_test, AzmChUse,
+            Array_Ele_test, ElvChUse, 0,0,0
         )
 
     # ----- 正式计时处理 -----
@@ -148,11 +170,11 @@ def main():
     range_res = cfg.range_resolution
     doppler_res = cfg.doppler_resolution
     ambgt = cfg.ambgt
-    doa_threshold_db = 28.0
+    doa_threshold_db = 3.0
 
     # 确保DOA环境已初始化
     if not doa_env.is_initialized:
-        doa_env.prepare_mapping_indices(array_env.Array_Azi, array_env.Array_Ele)
+        doa_env.prepare_mapping_indices(Array_Azi_test, Array_Ele_test)
 
     points = []
     for peak in peaks:
@@ -160,17 +182,17 @@ def main():
         db = peak['db']
         channel_data = peak['channel']           # 形状 (256,)
 
-        azi_results, ele_results = doa_main_ultra_separated(
+        azi_results, ele_results , azi_snr_lin, ele_snr_lin= doa_main_ultra_separated(
             channel_data,
-            array_env.Array_Azi, array_env.AziIdx_Select,
-            array_env.Array_Ele, array_env.EleIdx_Select,
+            Array_Azi_test, AzmChUse,
+            Array_Ele_test, ElvChUse,rb,db,
             doa_threshold_db
         )
         if len(azi_results) == 0 or len(ele_results) == 0:
             continue
 
         rng = rb * range_res
-        vel = db * doppler_res
+        vel = (db - rb*4)* doppler_res
         pow_linear = peak['f32PeakPowVchNci_Q7dB']
         snr_db = 10 * np.log10(pow_linear / peak['noise']) if peak['noise'] > 0 else 0.0
         rcs_db = 10 * np.log10(pow_linear)

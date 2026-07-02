@@ -2,7 +2,7 @@
 峰值检测模块：在距离-多普勒谱中检测局部极值，并提取对应通道数据
 """
 import numpy as np
-from ft_framework.signal_process.calibration import apply_calibration
+from  ft_framework.signal_process.calibration import apply_calibration
 
 
 def peak_search_numpy(
@@ -112,54 +112,80 @@ def peak_search_numpy(
         final_vch = final_vch[order]
 
     # 8. 提取每个峰值的通道数据（256通道）
+    #    偏移表: rb_off[k], db_off[k] — 预计算 (tx,rx) 相对偏移
+    #    排布: tx-major (C-order), 每16元素 = 一个tx的16个rx
     n_tx = 16
     n_rx = 16
-    tx_ddma = np.asarray(tx_ddma_idx, dtype=np.int64)
-    tx_grid = np.arange(n_tx)[:, np.newaxis]       # (16,1)
-    rx_grid = np.arange(n_rx)[np.newaxis, :]       # (1,16)
 
-    n_tx_half = n_tx // 2                                           # 8
-    n_rx_half = n_rx // 2                                           # 8
+    # 偏移表 (256,), 由 DDMA解调 + tx/rx半阵偏移 预计算
+    rb_off_tab = np.array([
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 0
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 1
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 2
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 3
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 4
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 5
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 6
+        0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,                           # tx 7
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx 8
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx 9
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx10
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx11
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx12
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx13
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx14
+        1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,                           # tx15
+    ], dtype=np.int64)
 
-    # 4 象限定义: (tx_slice, rx_slice, db_offset, rb_offset)
-    #   Q1: tx 0-7, rx 0-7   → 正常
-    #   Q2: tx 8-15, rx 0-7  → doppler+4, range+1
-    #   Q3: tx 0-7, rx 8-15  → doppler+4, range+1
-    #   Q4: tx 8-15, rx 8-15 → doppler+8, range+2
-    tx_slices = [slice(0, n_tx_half), slice(n_tx_half, n_tx),
-                 slice(0, n_tx_half), slice(n_tx_half, n_tx)]
-    rx_slices = [slice(0, n_rx_half), slice(0, n_rx_half),
-                 slice(n_rx_half, n_rx), slice(n_rx_half, n_rx)]
-    db_offsets = [0, 4, 4, 8]
-    rb_offsets = [0, 1, 1, 2]
-
+    db_off_tab = np.array([
+        0,0,0,0,0,0,0,0,4,4,4,4,4,4,4,4,                           # tx 0
+        496,496,496,496,496,496,496,496,500,500,500,500,500,500,500,500,  # tx 1
+        480,480,480,480,480,480,480,480,484,484,484,484,484,484,484,484,  # tx 2
+        464,464,464,464,464,464,464,464,468,468,468,468,468,468,468,468,  # tx 3
+        448,448,448,448,448,448,448,448,452,452,452,452,452,452,452,452,  # tx 4
+        368,368,368,368,368,368,368,368,372,372,372,372,372,372,372,372,  # tx 5
+        352,352,352,352,352,352,352,352,356,356,356,356,356,356,356,356,  # tx 6
+        320,320,320,320,320,320,320,320,324,324,324,324,324,324,324,324,  # tx 7
+        292,292,292,292,292,292,292,292,296,296,296,296,296,296,296,296,  # tx 8
+        260,260,260,260,260,260,260,260,264,264,264,264,264,264,264,264,  # tx 9
+        212,212,212,212,212,212,212,212,216,216,216,216,216,216,216,216,  # tx10
+        148,148,148,148,148,148,148,148,152,152,152,152,152,152,152,152,  # tx11
+        132,132,132,132,132,132,132,132,136,136,136,136,136,136,136,136,  # tx12
+        84,84,84,84,84,84,84,84,88,88,88,88,88,88,88,88,                 # tx13
+        52,52,52,52,52,52,52,52,56,56,56,56,56,56,56,56,                 # tx14
+        36,36,36,36,36,36,36,36,40,40,40,40,40,40,40,40,                 # tx15
+    ], dtype=np.int64)
+    # rx索引 (256,): tx-major, rx 0..15 对每个tx重复
+    rx_vec = np.tile(np.arange(n_rx, dtype=np.int64), n_tx)          # (256,)
     channel_list = []
+    rb_used_list  = []                                               # 每个通道实际使用的 rb
+    db_used_list  = []                                               # 每个通道实际使用的 db
     for i in range(len(final_rb)):
         rb = final_rb[i]
         db = final_db[i]
 
-        quadrants = []
-        for tx_sl, rx_sl, db_off, rb_off in zip(tx_slices, rx_slices, db_offsets, rb_offsets):
-            db_q = (db + db_off) % n_doppler                           # doppler 取模防溢出
-            rb_q = rb + rb_off
-            if rb_q >= n_range_bins:                                   # range 防溢出 → 填零
-                n_tx_q = tx_sl.stop - tx_sl.start
-                n_rx_q = rx_sl.stop - rx_sl.start
-                chan_q = np.zeros((n_tx_q, n_rx_q), dtype=np.complex64)
-            else:
-                idx_dop_q = (db_q + tx_ddma[tx_sl, np.newaxis] * 16) % n_doppler
-                chan_q = rd_cube[rx_grid[:, rx_sl], idx_dop_q, rb_q]   # (n_tx_q, n_rx_q)
-            quadrants.append(chan_q)
+        db_vec = (db + db_off_tab) % n_doppler                       # (256,) 实际doppler
+        rb_vec =  rb + rb_off_tab                                    # (256,) 实际range
 
-        # 拼接: [Q1|Q3] 上, [Q2|Q4] 下 → (16,16)
-        top    = np.hstack([quadrants[0], quadrants[2]])
-        bottom = np.hstack([quadrants[1], quadrants[3]])
-        channel_mat = np.vstack([top, bottom])
-        channel_list.append(channel_mat.flatten().astype(np.complex64))
+        # 重塑为 (16,16) 用于 rd_cube 索引
+        #db_mat = db_vec.reshape(n_tx, n_rx)                          # (16,16)
+        #rb_mat = rb_vec.reshape(n_tx, n_rx)                          # (16,16)
+
+        rb_clip = np.clip(rb_vec, 0, n_range_bins - 1)
+        channel_vec = rd_cube[rx_vec, db_vec, rb_clip]               # (256,) 逐元素索引
+        invalid = rb_vec >= n_range_bins
+        if invalid.any():
+            channel_vec[invalid] = 0.0
+
+        channel_vec = channel_vec.astype(np.complex64)
+        channel_list.append(channel_vec)
+        rb_used_list.append(rb_vec.copy())
+        db_used_list.append(db_vec.copy())
 
     # 通道校准
     if do_calibrate:
         channel_list = [apply_calibration(ch) for ch in channel_list]
+
 
     # 9. 构造返回列表（字段与 RDCell 结构体对齐）
     rdcell_list = []

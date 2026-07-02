@@ -11,12 +11,14 @@ FT 3D 目标检测节点 (3D Object Detection)
   - 算法: 欧氏聚类模拟 AI 检测
 
 话题:
-  订阅: /processing/radar/det_list    ft_radar_msgs/DetList
+  订阅: /processing/radar/det_list_cuda  ft_radar_msgs/DetList (优先)
+        /processing/radar/det_list       ft_radar_msgs/DetList (回退)
   发布: /perception/objects            ft_radar_msgs/ObjList
         /visualization/radar/boxes     visualization_msgs/MarkerArray (RViz 显示用)
 
 连接关系:
-  ← RSP MIL Python (sub)
+  ← RSP Cuda (优先订阅, 超时 1s 后回退 Python)
+  ← RSP MIL Python (回退订阅)
   → Rviz_radar (pub)
   → Logging (pub)
 
@@ -35,6 +37,9 @@ MIN_CLUSTER_SIZE = 3          # 最小簇大小（点数）
 DEFAULT_BOX_H   = 2.0         # 默认目标框高度 (m)
 MARKER_LIFETIME = 1.0         # RViz Marker 生命周期 (s)
 
+# ---------- RSP 订阅优先级 ----------
+CUDA_FALLBACK_TIMEOUT = 1.0   # CUDA 无数据超过此秒数后回退到 Python RSP
+
 # ---------- RViz 坐标系 ----------
 FIXED_FRAME = 'radar'
 
@@ -43,6 +48,7 @@ FIXED_FRAME = 'radar'
 # ============================================================================
 
 import numpy as np
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -214,9 +220,18 @@ class ObjectDetection3DNode(Node):
         self.marker_lifetime  = float(self.get_parameter('marker_lifetime').value)
         self.fixed_frame      = self.get_parameter('fixed_frame').value
 
-        # ---------- 订阅 ----------
+        # ---------- RSP 订阅优先级: CUDA 优先, 超时后回退 Python ----------
+        self.declare_parameter('cuda_fallback_timeout', CUDA_FALLBACK_TIMEOUT)
+        self._cuda_timeout = float(
+            self.get_parameter('cuda_fallback_timeout').value)
+        self._last_cuda_time = 0.0  # 最后一次收到 CUDA 数据的时间
+
+        self.sub_det_cuda = self.create_subscription(
+            DetList, '/processing/radar/det_list_cuda',
+            self._on_det_list_cuda, 10)
         self.sub_det = self.create_subscription(
-            DetList, '/processing/radar/det_list', self._on_det_list, 10)
+            DetList, '/processing/radar/det_list',
+            self._on_det_list_python, 10)
 
         # ---------- 发布（数据 + 可视化） ----------
         self.pub_objects = self.create_publisher(
@@ -237,15 +252,28 @@ class ObjectDetection3DNode(Node):
     # 检测回调
     # ------------------------------------------------------------------
 
-    def _on_det_list(self, msg: DetList):
+    def _on_det_list_cuda(self, msg: DetList):
+        """CUDA RSP 回调 (优先): 记录时间戳并处理。"""
+        self._last_cuda_time = time.time()
+        self._process_det_list(msg, source='cuda')
+
+    def _on_det_list_python(self, msg: DetList):
+        """Python RSP 回调 (回退): 仅当 CUDA 无数据超时后才处理。"""
+        elapsed = time.time() - self._last_cuda_time
+        if elapsed < self._cuda_timeout:
+            return  # CUDA 活跃, 跳过 Python 数据
+        self._process_det_list(msg, source='python')
+
+    def _process_det_list(self, msg: DetList, source: str = ''):
         """
-        处理检测列表:
+        处理检测列表 (CUDA 优先 / Python 回退):
           1. 解析 DetPoint 数组
           2. 欧氏聚类（模拟 AI 检测）
           3. 过滤小簇
           4. 生成 ObjList 14 字段 + MarkerArray
           5. 发布
         """
+        _ = source  # 预留扩展
         self.frame_count += 1
 
         n_points = len(msg.points)

@@ -1,0 +1,37 @@
+# ============================================================================
+# FT Radar Framework — 传感器 udev 持久化命名规则
+# ============================================================================
+# 安装: sudo cp scripts/99-ft-sensors.rules /etc/udev/rules.d/
+# 生效: sudo udevadm control --reload-rules && sudo udevadm trigger
+# 验证: ls -la /dev/camera_capture /dev/radar_ctrx0 /dev/radar_ctrx1
+#
+# ============================================================================
+# 设备识别依据:
+#   USB 摄像头: USB VID/PID (0801:0101), v4l index=0 (排除 metadata 接口)
+#   雷达 ctrx0: platform tegra-capture-vi, ID_V4L_PRODUCT="vi-output, Radar 2-0030"
+#   雷达 ctrx1: platform tegra-capture-vi, ID_V4L_PRODUCT="vi-output, Radar 2-0031"
+#
+# 调试: udevadm info --query=all --name=/dev/videoN
+# ============================================================================
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1. USB 摄像头 (Rmoncam A2 1080P) → /dev/camera_capture
+#    匹配: USB vendor 0801 + product 0101 + v4l2 index 0 (仅 capture)
+#    排除: index 1 (metadata 接口, 无视频采集能力)
+# ────────────────────────────────────────────────────────────────────────────
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0801", ATTRS{idProduct}=="0101", \
+    ATTR{index}=="0", SYMLINK+="camera_capture"
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2. GMSL 雷达 (Infineon CTRX, NVIDIA Tegra VI) → /dev/radar_ctrx0, /dev/radar_ctrx1
+#    匹配: platform tegra-capture-vi + V4L product 名称
+#    雷达是 NVIDIA Tegra Video Input 平台设备, 驱动为 tegra-video
+# ────────────────────────────────────────────────────────────────────────────
+
+# 2a. 雷达 ctrx0 (8192×1024 RG12) → /dev/radar_ctrx0
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="platform-tegra-capture-vi", \
+    ENV{ID_V4L_PRODUCT}=="vi-output, Radar 2-0030", SYMLINK+="radar_ctrx0"
+
+# 2b. 雷达 ctrx1 (8192×1024 RG12) → /dev/radar_ctrx1
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="platform-tegra-capture-vi", \
+    ENV{ID_V4L_PRODUCT}=="vi-output, Radar 2-0031", SYMLINK+="radar_ctrx1"

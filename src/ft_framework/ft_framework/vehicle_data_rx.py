@@ -30,7 +30,7 @@ FT 车辆数据接收节点 (Vehicle Data Rx)
 
 # ---------- 采集参数 ----------
 VEHICLE_FPS         = 50        # 车辆数据更新率 (Hz)
-TIMEOUT_CYCLES      = 3         # 超时周期数
+TIMEOUT_CYCLES      = 1         # 超时周期数 (1周期 = 20ms @ 50Hz)
 
 # ---------- 默认值（车辆总线未连接时使用的预设值） ----------
 DEFAULT_VX           = 0.0      # 车速 (m/s)
@@ -49,9 +49,9 @@ FIXED_FRAME = 'base_link'
 
 import rclpy
 from rclpy.node import Node
+import threading
 
 from ft_radar_msgs.msg import EgoMotion
-from ft_framework.common import monotonic_us_stamp
 
 
 # ============================================================================
@@ -107,15 +107,34 @@ class VehicleDataRxNode(Node):
         # ---------- 发布者 ----------
         self.pub_ego = self.create_publisher(EgoMotion, '/vehicle/ego_motion', 10)
 
-        # ---------- 定时器 ----------
+        # ---------- CAN buffer (线程安全, 读取线程更新, 定时器发布) ----------
+        self._buffer_lock = threading.Lock()
+        self._latest_ego = {
+            'vx': self._defaults['vx'],
+            'yaw_rate': self._defaults['yaw_rate'],
+            'steering_angle': self._defaults['steering_angle'],
+            'ax': self._defaults['ax'],
+            'ay': self._defaults['ay'],
+            'gear': self._defaults['gear'],
+        }
+        self._buffer_valid = False
+        self._last_can_update_ns = 0  # 上次 CAN 更新时间 (用于超时检测)
+
+        # ---------- 定时器 (按 fps 频率发布, 不控制硬件读取) ----------
         period = 1.0 / self.fps
         self.timer = self.create_timer(period, self._on_timer)
         self.frame_count = 0
 
+        # ---------- CAN 读取线程 (持续轮询, 更新 buffer) ----------
+        self._can_stop_event = threading.Event()
+        self._can_thread = threading.Thread(target=self._can_read_loop, daemon=True)
+        self._can_thread.start()
+
         self.get_logger().info(
-            f'Vehicle Data Rx 启动: {self.fps:.0f} Hz, '
+            f'Vehicle Data Rx 启动: 发布 {self.fps:.0f} Hz, '
             f'超时检测: {self.timeout_cycles} 周期 '
-            f'({self._timeout_ns / 1e9:.1f}s)')
+            f'({self._timeout_ns / 1e9:.1f}s), '
+            f'CAN read-thread → buffer → timer publish')
 
     # ------------------------------------------------------------------
     # 定时器回调
@@ -123,28 +142,50 @@ class VehicleDataRxNode(Node):
 
     def _on_timer(self):
         """
-        车辆数据采集 (待接入 CAN/ETH 总线)。
+        定时器回调: 从 buffer 取最新 CAN 数据并发布 (按 fps 频率).
 
-        TODO: 接入真实 CAN/ETH 总线解析，参见 docs/详细化开发方案.md
-          当前状态: 发布默认值 + is_default=True，
-                   下游节点可根据 is_default 标志判断数据有效性。
+        CAN 读取线程持续更新 buffer, 定时器定时发布快照.
         """
         self.frame_count += 1
-        sec, nsec = monotonic_us_stamp()
+        stamp = self.get_clock().now().to_msg()
 
         msg = EgoMotion()
-        msg.header.stamp.sec = sec
-        msg.header.stamp.nanosec = nsec
+        msg.header.stamp = stamp
         msg.header.frame_id = self.fixed_frame
 
-        # 车辆总线未接入 → 发布默认值
-        msg.vx = self._defaults['vx']
-        msg.yaw_rate = self._defaults['yaw_rate']
-        msg.steering_angle = self._defaults['steering_angle']
-        msg.ax = self._defaults['ax']
-        msg.ay = self._defaults['ay']
-        msg.gear = self._defaults['gear']
-        msg.is_default = True
+        with self._buffer_lock:
+            if self._buffer_valid:
+                # 超时检测: 超过 timeout_cycles 周期未收到 CAN 数据 → 切换默认值
+                now_ns = self.get_clock().now().nanoseconds
+                elapsed = now_ns - self._last_can_update_ns
+                if elapsed > self._timeout_ns:
+                    self.get_logger().warn(
+                        f'CAN 数据超时 ({elapsed / 1e9:.1f}s), 切换为默认值')
+                    self._buffer_valid = False
+                    msg.vx = self._defaults['vx']
+                    msg.yaw_rate = self._defaults['yaw_rate']
+                    msg.steering_angle = self._defaults['steering_angle']
+                    msg.ax = self._defaults['ax']
+                    msg.ay = self._defaults['ay']
+                    msg.gear = self._defaults['gear']
+                    msg.is_default = True
+                else:
+                    msg.vx = self._latest_ego['vx']
+                    msg.yaw_rate = self._latest_ego['yaw_rate']
+                    msg.steering_angle = self._latest_ego['steering_angle']
+                    msg.ax = self._latest_ego['ax']
+                    msg.ay = self._latest_ego['ay']
+                    msg.gear = self._latest_ego['gear']
+                    msg.is_default = False
+            else:
+                # CAN 未接入 → 发布默认值
+                msg.vx = self._defaults['vx']
+                msg.yaw_rate = self._defaults['yaw_rate']
+                msg.steering_angle = self._defaults['steering_angle']
+                msg.ax = self._defaults['ax']
+                msg.ay = self._defaults['ay']
+                msg.gear = self._defaults['gear']
+                msg.is_default = True
 
         self.pub_ego.publish(msg)
 
@@ -153,10 +194,32 @@ class VehicleDataRxNode(Node):
                 'Vehicle Data Rx: CAN/ETH 总线未接入, 发布默认值 (is_default=True)')
 
     # ------------------------------------------------------------------
+    # CAN 读取线程 (持续轮询, 更新 buffer)
+    # ------------------------------------------------------------------
+
+    def _can_read_loop(self):
+        """持续轮询 CAN 总线, 将最新数据更新到线程安全 buffer.
+
+        TODO: 接入真实 CAN/ETH 总线后替换为实际读取逻辑.
+        当前: CAN 未接入, 短暂休眠避免忙等.
+        """
+        while rclpy.ok() and not self._can_stop_event.is_set():
+            # TODO: 接入真实 CAN 后替换为:
+            #   can_data = can_socket.recv()
+            #   with self._buffer_lock:
+            #       self._latest_ego = parse_can(can_data)
+            #       self._buffer_valid = True
+            #       self._last_can_update_ns = self.get_clock().now().nanoseconds
+            self._can_stop_event.wait(timeout=0.001)  # 1ms
+
+    # ------------------------------------------------------------------
     # 销毁
     # ------------------------------------------------------------------
 
     def destroy_node(self):
+        self._can_stop_event.set()
+        if hasattr(self, '_can_thread') and self._can_thread.is_alive():
+            self._can_thread.join(timeout=2.0)
         self.get_logger().info(f'Vehicle Data Rx 已停止（共处理 {self.frame_count} 帧）')
         super().destroy_node()
 

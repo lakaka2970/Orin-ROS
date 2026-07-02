@@ -60,7 +60,7 @@ Obj      enable_obj_list     /perception/objects          1000   <ts>.csv
 OUTPUT_DIR      = "output/ft_dataset"    # 数据集根目录 (相对路径 = 相对 CWD)
 STATUS_INTERVAL = 5.0                    # 状态日志输出间隔 (秒)
 
-# ── 帧数上限 (达到即停止, 不循环覆盖) ──
+# ── 帧数上限 (达到后循环覆盖, 删除旧文件保留最新 N 帧) ──
 FRAME_LIMIT_ADC   = 100                  # ADC: 32 MiB/帧 × 100 = ~3.2 GB
 FRAME_LIMIT_OTHER = 1000                 # 其他 5 个通道统一上限
 
@@ -84,6 +84,7 @@ import os
 import time
 import threading
 import queue
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
@@ -248,17 +249,47 @@ class LoggingNode(Node):
             'obj_list':     os.path.join(self._root, 'obj_csv_radar'),
             'calib':        os.path.join(self._root, 'calibration'),
         }
+
+        # 先确保根目录可写, 给出明确错误提示
+        try:
+            os.makedirs(self._root, exist_ok=True)
+        except OSError as e:
+            self.get_logger().fatal(
+                f'无法创建输出根目录 {self._root}: {e}\n'
+                f'  请检查目录权限: ls -la {self._root}\n'
+                f'  若属主为 root, 执行: sudo chown -R $USER:$USER {self._root}\n'
+                f'  或修改 output_dir 参数指向可写路径.')
+            raise
+
+        # 验证根目录可写
+        test_file = os.path.join(self._root, '.ft_write_test')
+        try:
+            with open(test_file, 'w') as f:
+                f.write('')
+            os.remove(test_file)
+        except OSError as e:
+            self.get_logger().fatal(
+                f'输出根目录不可写 {self._root}: {e}\n'
+                f'  请检查目录权限: ls -la {self._root}\n'
+                f'  若属主为 root, 执行: sudo chown -R $USER:$USER {self._root}')
+            raise
+
         for _, d in self._dirs.items():
             try:
                 os.makedirs(d, exist_ok=True)
             except OSError as e:
-                self.get_logger().error(f'无法创建目录 {d}: {e}')
+                self.get_logger().error(f'无法创建子目录 {d}: {e}')
                 raise
 
-        # 运行时状态
+        # 运行时状态 — 循环覆盖
         self._writer = AsyncWriter()
-        self._frame_counts        = {k: 0     for k in self._max_frames}
-        self._frame_reached_limit = {k: False for k in self._max_frames}
+        self._frame_counts = {k: 0 for k in self._max_frames}
+        # 每个通道维护一个文件路径 deque, 达到上限后删除最旧文件
+        self._frame_files = {k: deque(maxlen=self._max_frames[k])
+                             for k in self._max_frames}
+        # ego_motion 行缓冲 (单文件追加, 满 N 行后重写)
+        self._ego_lines: deque = deque(maxlen=self._max_frames['ego_motion'])
+        self._ego_fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
 
         # cv_bridge: Image → OpenCV → JPEG
         self._bridge = CvBridge() if CvBridge is not None else None
@@ -327,6 +358,7 @@ class LoggingNode(Node):
         payload = bytes(msg.data)
         fpath = os.path.join(self._dirs['adc'], f'{ts}.bin')
         self._writer.enqueue(fpath, hdr + payload, 'wb')
+        self._register_frame_file('adc', fpath)
         self._frame_counts['adc'] += 1
 
     # ── 2.3.3  Image 回调 ────────────────────────────────────────────────
@@ -347,6 +379,7 @@ class LoggingNode(Node):
             if success:
                 fpath = os.path.join(self._dirs['image'], f'{ts}.jpg')
                 self._writer.enqueue(fpath, jpg.tobytes(), 'wb')
+                self._register_frame_file('image', fpath)
                 self._frame_counts['image'] += 1
         except Exception as e:
             self.get_logger().error(f'Image 写入失败: {e}')
@@ -369,6 +402,12 @@ class LoggingNode(Node):
         ts = get_timestamp_us(msg)
         if len(msg.points) == 0:
             return
+
+        # 注册 PCD + CSV 两个文件路径 (循环覆盖用)
+        pcd_path = os.path.join(self._dirs['det_list_pcd'], f'{ts}{source}.pcd')
+        csv_path = os.path.join(self._dirs['det_list_csv'], f'{ts}{source}.csv')
+        self._register_frame_file(channel, pcd_path)
+        self._register_frame_file(channel, csv_path)
 
         self._writer.enqueue_task(self._build_det_list_task(ts, msg, source))
         self._frame_counts[channel] += 1
@@ -455,9 +494,13 @@ class LoggingNode(Node):
         line = (f'{ts},'
                 f'{msg.vx:.6f},{msg.yaw_rate:.6f},{msg.steering_angle:.6f},'
                 f'{msg.ax:.6f},{msg.ay:.6f},{msg.gear}\n')
-        fpath = os.path.join(self._dirs['ego_motion'], 'ego_motion.csv')
-        self._writer.enqueue(fpath, line.encode(), 'ab')
+
+        # 循环覆盖: 行缓冲满 N 行后重写整个文件
+        # _get_switch() 已在达到上限时重置计数器, 此处只需追加并递增
+        self._ego_lines.append(line)
         self._frame_counts['ego_motion'] += 1
+
+        self._writer.enqueue_task(self._build_ego_rewrite_task())
 
     # ── 2.3.6  ObjList 回调 (3D 目标) ────────────────────────────────────
 
@@ -476,6 +519,9 @@ class LoggingNode(Node):
         ts = get_timestamp_us(msg)
         if len(msg.objects) == 0:
             return
+
+        fpath = os.path.join(self._dirs['obj_list'], f'{ts}.csv')
+        self._register_frame_file('obj_list', fpath)
 
         self._writer.enqueue_task(self._build_obj_csv_task(ts, msg))
         self._frame_counts['obj_list'] += 1
@@ -512,7 +558,7 @@ class LoggingNode(Node):
 
         门控 1 — 开关:  读取 ROS2 参数, str→bool 转换
                         'true'/'1'/'yes' → True, 其余 → False
-        门控 2 — 帧数:  已达上限 → 自动停止并告警 (仅一次)
+        门控 2 — 帧数:  已达上限 → 循环覆盖 (删除最旧文件, 保留最新 N 帧)
 
         返回:  True = 允许录制, False = 跳过
         """
@@ -523,15 +569,45 @@ class LoggingNode(Node):
         if not enabled:
             return False
 
-        # 门 2: 帧数上限
-        if self._frame_reached_limit[channel]:
-            return False
-        if self._frame_counts[channel] >= self._max_frames[channel]:
-            self._frame_reached_limit[channel] = True
+        # 门 2: 帧数上限 → 循环覆盖
+        limit = self._max_frames[channel]
+        if self._frame_counts[channel] >= limit:
+            self._frame_counts[channel] = 0  # 重置计数器
             self.get_logger().warning(
-                f'{channel} 已达上限 ({self._max_frames[channel]} 帧), 停止录制')
-            return False
+                f'{channel} 已达上限 ({limit} 帧), '
+                f'循环覆盖 — 旧文件将被删除')
         return True
+
+    def _register_frame_file(self, channel: str, filepath: str):
+        """记录帧文件路径; deque 满时自动删除最旧文件。"""
+        files = self._frame_files[channel]
+        # deque maxlen 会在 append 时自动丢弃最旧元素,
+        # 但我们需要先删除磁盘上的文件
+        if len(files) >= files.maxlen and files:
+            oldest = files[0]
+            try:
+                if os.path.exists(oldest):
+                    os.remove(oldest)
+            except OSError:
+                pass
+        files.append(filepath)
+
+    def _build_ego_rewrite_task(self):
+        """构建 ego_motion.csv 重写闭包 (AsyncWriter 线程执行)。
+
+        每次追加新行后, 将行缓冲完整重写到文件, 保证文件只保留最新 N 行。
+        """
+        lines = list(self._ego_lines)  # 快照当前缓冲
+
+        def _task():
+            header = 'timestamp_us,vx,yaw_rate,steering_angle,ax,ay,gear\n'
+            fpath = self._ego_fpath
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+            with open(fpath, 'w') as f:
+                f.write(header)
+                f.writelines(lines)
+
+        return _task
 
     # ── 2.3.8  ego_motion 初始化 ─────────────────────────────────────────
 

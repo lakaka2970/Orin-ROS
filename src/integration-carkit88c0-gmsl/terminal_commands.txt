@@ -11,14 +11,17 @@ v4l2-ctl -d /dev/video0 --set-fmt-video=width=8192,height=512,pixelformat=RG12 -
 
 i2cdetect -r -y 2
 
+
+# 1.启动雷达解串板
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl
 sudo python init_jetson.py 
 
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/src/demo_app/boards/carkit_88c0/example/bin
 sudo ./carkit88c0_gmsl_example 
 
+# 2.启动雷达数据获取（需要依据雷达的实际配置选择文件或修改代码）
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts
-bash capture_video0_2048x512.sh
+bash capture_video0_2048x1024.sh
 
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts
 sudo bash tracing.sh
@@ -27,3 +30,4 @@ v4l2-ctl -d /dev/video0 --set-fmt-video=width=8192,height=512,pixelformat=RG12 -
 
 cd ~/Desktop/Orin-ROS/src/integration-carkit88c0-gmsl/scripts 
 sudo dmesg -w
+

@@ -257,7 +257,7 @@ class RspMilPythonNode(Node):
                 db = peak['db']
                 channel_data = peak['channel']  # (256,) complex
 
-                azi_results, ele_results = doa_main_ultra_separated(
+                azi_results, ele_results, azi_snr, ele_snr = doa_main_ultra_separated(
                     channel_data,
                     self.array_env.Array_Azi, self.array_env.AziIdx_Select,
                     self.array_env.Array_Ele, self.array_env.EleIdx_Select,
@@ -267,11 +267,12 @@ class RspMilPythonNode(Node):
                     continue
 
                 rng = rb * range_res
-                vel = db * doppler_res
-                pow_linear = peak['pow_vch']
-                snr_db_val = (10.0 * np.log10(pow_linear / peak['noise'])
+                vel = (db - rb*4)* doppler_res
+                pow_linear = peak['f32PeakPowVchNci_Q7dB']
+                snr_db_val = (20.0 * np.log10(pow_linear / peak['noise'])
                               if peak['noise'] > 0 else 0.0)
-                rcs_db_val = 10.0 * np.log10(pow_linear)
+                rcs_db_val = 20.0 * np.log10(pow_linear)
+                peak_db_val = 20.0 * np.log10(pow_linear)
 
                 # 筛选有效目标 (flag==1), 按能量降序
                 valid_azi = [t for t in azi_results if t[0] == 1]
@@ -285,7 +286,8 @@ class RspMilPythonNode(Node):
                 else:
                     pairs = [(a, e) for a in valid_azi for e in valid_ele]
 
-                for a_target, e_target in pairs:
+                n_pairs = len(pairs)
+                for p_idx, (a_target, e_target) in enumerate(pairs):
                     azi_deg = a_target[4]
                     azi_rad = np.deg2rad(azi_deg)
                     ele_deg = e_target[4]
@@ -307,10 +309,15 @@ class RspMilPythonNode(Node):
                         'multi_tgt_prob': 100,
                         'ambgt_prob': 100,
                         'raw_doppler': vel,
-                        'idx': 128 if vel != 0 else 0,
+                        'doppler_idx': int(db),       # u16DopplerIdx: 实际多普勒 bin
+                        'azimuth_idx': int(a_target[1]),   # u8AzimuthIdx:   DOA 方位 bin
+                        'elevation_idx': int(e_target[1]), # u8ElevationIdx: DOA 俯仰 bin
+                        'obj_same_rv': (p_idx + 1) if n_pairs > 1 else 0,  # i32ObjSameRV: 同RV, 第1个=1, 第2个=2
+                        'sin_azim_snr_lin': int(azi_snr),   # u16SinAzimSNRLin
+                        'sin_elev_snr_lin': int(ele_snr),   # u16SinElevSNRLin
                         'rd_cell_idx': 0,
                         'range_idx': rb,
-                        'peak_val': int(np.clip(pow_linear, 0, 65535)),
+                        'peak_val': peak_db_val,
                         'vel_amb_fac': 0,
                         'det_ambig_state': 0,
                         'det_motion_pat': 0,
@@ -342,18 +349,18 @@ class RspMilPythonNode(Node):
             # -- 雷达原视测量（雷达传感器坐标系） --
             pt.rad_vel_abs  = float(dp['raw_doppler'])    # 7.  f32RadVelAbs  绝对径向速度
             pt.range        = float(dp['range'])          # 8.  f32Range
-            pt.speed        = float(abs(dp['raw_doppler']))# 9.  f32Speed     合速度
+            pt.speed        = float(dp['raw_doppler'])# 9.  f32Speed     合速度
             pt.azimuth_ang  = float(dp['azimuth'])        # 10. f32AzimuthAng
             pt.ele_ang      = float(dp['elevation'])      # 11. f32EleAng
 
             # -- 信号特征 --
             pt.snr_db       = float(dp['snr'])            # 12. f32SNRdB
             pt.rcs_db       = float(dp['rcs'])            # 13. f32RcsdB
-            pt.power_db     = float(dp['snr'] - 10.0)     # 14. f32PowerdB  回波功率 (SNR 近似换算)
+            pt.power_db     = float(dp['peak_val'])     # 14. f32PowerdB  回波功率
 
             # -- 检测标志位 --
             pt.strategy_flag     = 0               # 15. u32StrategyFlag
-            pt.obj_same_rv       = 0               # 16. u32ObjSameRV
+            pt.obj_same_rv       = int(dp.get('obj_same_rv', 0))   # 16. u32ObjSameRV
             pt.obj_quality       = 0               # 17. u32ObjQuality
             pt.obj_track_flag    = 0               # 18. u32ObjTrackFlag
             pt.ele_confident     = 0               # 19. u32EleConfident
@@ -366,14 +373,14 @@ class RspMilPythonNode(Node):
             # -- RD 索引 --
             pt.rd_cell_idx   = int(dp.get('rd_cell_idx', 0))   # 27. u16RdCellIdx
             pt.range_idx     = int(dp.get('range_idx', 0))     # 28. u16RangeIdx
-            pt.doppler_idx   = int(dp['idx'])                  # 29. u16DopplerIdx
-            pt.azimuth_idx   = 0                               # 30. u8AzimuthIdx
-            pt.elevation_idx = 0                               # 31. u8ElevationIdx
+            pt.doppler_idx   = int(dp.get('doppler_idx', 0))       # 29. u16DopplerIdx
+            pt.azimuth_idx   = int(dp.get('azimuth_idx', 0))       # 30. u8AzimuthIdx
+            pt.elevation_idx = int(dp.get('elevation_idx', 0))     # 31. u8ElevationIdx
 
             # -- 峰值与 SNR --
-            pt.peak_val         = int(dp.get('peak_val', 0))   # 32. u16PeakVal
-            pt.sin_azim_snr_lin = 0                            # 33. u16SinAzimSNRLin
-            pt.sin_elev_snr_lin = 0                            # 34. u16SinElevSNRLin
+            pt.peak_val         = int(dp.get('peak_val', 0)*32)   # 32. u16PeakVal
+            pt.sin_azim_snr_lin = int(dp.get('sin_azim_snr_lin', 0))  # 33. u16SinAzimSNRLin
+            pt.sin_elev_snr_lin = int(dp.get('sin_elev_snr_lin', 0))  # 34. u16SinElevSNRLin
 
             # -- 速度解模糊 --
             pt.vel_amb_fac = int(dp.get('vel_amb_fac', 0))     # 35. s8VelAmbFac

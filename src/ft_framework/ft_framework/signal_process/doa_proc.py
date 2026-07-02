@@ -274,17 +274,19 @@ def doa_main_batch(snap_data_batch, threshold_db=6.0):
     mag_ele = 20.0 * torch.log10(torch.abs(fft_ele) + 1e-12)
 
     # ---- 批量峰值检测 (一次 kernel 完成所有行) ----
-    all_azi = _batch_peaks_interp(mag_azi, threshold_db, fft_len, max_targets)
-    all_ele = _batch_peaks_interp(mag_ele, threshold_db, fft_len, max_targets)
+    all_azi, azi_snr = _batch_peaks_interp(mag_azi, threshold_db, fft_len, max_targets)
+    all_ele, ele_snr = _batch_peaks_interp(mag_ele, threshold_db, fft_len, max_targets)
 
-    return all_azi, all_ele
+    return all_azi, all_ele, azi_snr, ele_snr
 
 
 def _batch_peaks_interp(mag_db, threshold_db, fft_len, max_targets):
-    """批量峰值检测 + 插值 + 角度解算 (全向量化, 无 per-row kernel launch)。
+    """批量峰值检测 + 插值 + 角度解算 + sin SNR 计算。
 
     mag_db: (N, 256)
-    返回: List[np.ndarray] 每个形状 (n_det, 5)
+    返回: (results_list, sin_snr_lin)
+      results_list: List[np.ndarray] 每个形状 (n_det, 5)
+      sin_snr_lin:  np.ndarray (N,) uint16, 最强/第二强峰值比 * 1000
     """
     N = mag_db.shape[0]
     DEV = mag_db.device
@@ -334,11 +336,20 @@ def _batch_peaks_interp(mag_db, threshold_db, fft_len, max_targets):
         angle_deg,                                                       # angle_deg
     ], dim=-1)  # (N, K, 5)
 
-    # 6. 拆分为 per-row numpy 列表 (CPU 传输一次完成)
+    # 6. sin SNR: 最强/第二强峰值比 (dB) * 1000 → uint16
+    valid_count = valid.sum(dim=1)                                       # (N,) 每行有效峰值数
+    diff_db = torch.where(
+        valid_count >= 2,
+        topk_vals[:, 0] - topk_vals[:, 1],                               # peak1 - peak2 (dB)
+        torch.zeros(N, device=DEV))
+    sin_snr_lin = torch.clamp(diff_db * 1000.0, 0, 65535).to(torch.int32)
+    sin_snr_np = sin_snr_lin.cpu().numpy().astype(np.uint16)             # (N,) uint16
+
+    # 7. 拆分为 per-row numpy 列表 (CPU 传输一次完成)
     results_np = results_all.cpu().numpy()                               # (N, K, 5)
     all_results = []
     for i in range(N):
         row = results_np[i]                                              # (K, 5)
         valid_rows = row[row[:, 0] > 0.5]                                # 仅 valid
         all_results.append(valid_rows.astype(np.float32, copy=False))
-    return all_results
+    return all_results, sin_snr_np

@@ -171,7 +171,7 @@ def peak_search_numpy(
             'u32FrameTimeStamp':   int(frame_timestamp_us),          # 1  帧时间戳(us)
             'u16FrameId':          int(frame_id),                    # 2  帧ID
             'u16NofRdCell':        0,                                # 3  RD单元总数（调用方回填）
-            'u8Index_Idletime':    int(idle_time_idx),               # 4  空闲时间索引
+            'u8Index_Idletime':    0,               # 4  空闲时间索引
             'u16Rb':               int(r),                           # 5  距离bin
             'u16Db':               int(d),                           # 6  多普勒bin
             'f32PowRbNci_Q7dB':    [float(p_up[r, d]),
@@ -191,7 +191,6 @@ def peak_search_numpy(
             'pow_rb':  [float(p_up[r, d]), float(rx_nci_rd[r, d]), float(p_down[r, d])],
             'pow_db':  [float(p_left[r, d]), float(rx_nci_rd[r, d]), float(p_right[r, d])],
             'noise':   float(noise[r]),
-            'pow_vch': float(final_vch[i]),
             'channel': channel_list[i],
         })
     # 回填 u16NofRdCell

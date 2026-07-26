@@ -24,9 +24,11 @@
 // ============================================================================
 
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -262,6 +264,10 @@ private:
 // ============================================================================
 // ADC Rx 节点 (V2): 双设备 V4L2 → 文件写入 → AdcFilePath 发布
 // ============================================================================
+// V4L2 buffer 生命周期:
+//   DQBUF → 数据落盘(Logging) + 发布文件路径 → 等待 RSP processing_complete → QBUF
+//   buffer 在 RSP 处理完成前不释放, 确保 RSP 读取期间数据不被覆盖.
+// ============================================================================
 class AdcRxNode : public ft_rx::RxNodeBase<AdcFilePath, AdcRxNode>
 {
 public:
@@ -283,6 +289,7 @@ public:
     declare_parameter("logging_max_frames", 100);          // eMMC 模式最大帧数
     declare_parameter("enable_warmup", true);
     declare_parameter("warmup_sec", 5.0);
+    declare_parameter("rsp_timeout_ms", 100);              // 等待 RSP 处理完成的超时 (ms)
 
     // 读取参数
     uint32_t w = static_cast<uint32_t>(get_parameter("capture_width").as_int());
@@ -331,6 +338,16 @@ public:
     // ── 自动停止发布者 ──
     stop_pub_ = this->create_publisher<std_msgs::msg::Bool>(
         "/system/stop_all", ft_rx::rx_qos(10, false));
+
+    // ── RSP 处理完成信号订阅 (buffer 释放同步) ──
+    rsp_timeout_ms_ = static_cast<int>(get_parameter("rsp_timeout_ms").as_int());
+    rsp_complete_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "/system/processing_complete", ft_rx::rx_qos(10, true),
+        [this](std_msgs::msg::Bool::SharedPtr) {
+          std::lock_guard<std::mutex> lock(rsp_mutex_);
+          rsp_done_ = true;
+          rsp_cv_.notify_one();
+        });
 
     double fps_val = get_parameter("fps").as_double();
 
@@ -415,7 +432,7 @@ public:
     // ── 使用 ctrx0 的硬件时间戳作为帧时间戳 ──
     uint64_t frame_ts_us = hw_ts0;
 
-    // ── 内置 Logging: 写入文件 ──
+    // ── 内置 Logging: 写入文件 (与 RSP 读取并行) ──
     std::string file_path;
     uint64_t file_size = 0;
 
@@ -429,12 +446,7 @@ public:
     }
     prof_.checkpoint("file_write");
 
-    // ── 归还 V4L2 buffer ──
-    dev0_.enqueue(dev0_.buf_index);
-    dev1_.enqueue(dev1_.buf_index);
-
-    // ── 填充 AdcFilePath 消息 ──
-    // 硬件时间戳 → ROS header.stamp
+    // ── 填充 AdcFilePath 消息 (发布后 RSP 从文件读取) ──
     msg.header.stamp.sec     = static_cast<int32_t>(frame_ts_us / 1000000ULL);
     msg.header.stamp.nanosec = static_cast<uint32_t>((frame_ts_us % 1000000ULL) * 1000ULL);
     msg.header.frame_id      = frame_id_;
@@ -445,6 +457,21 @@ public:
     msg.num_chirps_per_row    = 8;                      // ctrx0:4 + ctrx1:4
     msg.num_samples_per_chirp = dev0_.width / 4;        // 2048
     msg.file_ready            = !file_path.empty();
+
+    // ── 等待 RSP 处理完成后释放 V4L2 buffer ──
+    // buffer 生命周期: DQBUF → 落盘+发布 → 等待RSP完成 → QBUF
+    {
+      std::unique_lock<std::mutex> lock(rsp_mutex_);
+      rsp_done_ = false;
+      // 消息将由基类发布, RSP 收到后处理并发布 processing_complete
+      rsp_cv_.wait_for(lock, std::chrono::milliseconds(rsp_timeout_ms_),
+                       [this]() { return rsp_done_; });
+    }
+    prof_.checkpoint("rsp_wait");
+
+    // 释放 V4L2 buffer (RSP 已完成或超时)
+    dev0_.enqueue(dev0_.buf_index);
+    dev1_.enqueue(dev1_.buf_index);
 
     return true;
   }
@@ -474,6 +501,13 @@ private:
 
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_bc_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
+
+  // ── RSP 处理完成同步 (buffer 释放控制) ──
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr rsp_complete_sub_;
+  std::mutex rsp_mutex_;
+  std::condition_variable rsp_cv_;
+  bool rsp_done_ = false;
+  int  rsp_timeout_ms_ = 100;
 
   // ── 存储检测 ──
   void detect_storage()

@@ -200,6 +200,11 @@ class RspCudaNode(Node):
         self.timer = self.create_timer(1.0 / self.processing_fps, self._on_process)
         self.frame_count = 0
 
+        # ---------- V2: RSP 处理完成信号 (通知 adc_rx 释放 V4L2 buffer) ----------
+        from std_msgs.msg import Bool
+        self.pub_processing_complete = self.create_publisher(
+            Bool, '/system/processing_complete', 10)
+
         self.get_logger().info(
             f'RSP Cuda 启动: {self.processing_fps:.0f} Hz, '
             f'SNR={self.snr_threshold} dB')
@@ -420,6 +425,12 @@ class RspCudaNode(Node):
         det_list.det_obj_num = len(filtered)        # 更新为过滤后的目标数
 
         self.pub_det.publish(det_list)
+
+        # ---- V2: 通知 adc_rx 处理完成, 释放 V4L2 buffer ----
+        from std_msgs.msg import Bool
+        complete_msg = Bool()
+        complete_msg.data = True
+        self.pub_processing_complete.publish(complete_msg)
 
         # ---- 发布 RnNci 中间数据 (独立异常保护, 不影响 DetList) ----
         try:

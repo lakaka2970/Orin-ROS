@@ -262,11 +262,20 @@ private:
 };
 
 // ============================================================================
-// ADC Rx 节点 (V2): 双设备 V4L2 → 文件写入 → AdcFilePath 发布
+// ADC Rx 节点 (V2): 双设备 V4L2 → DDR 队列(文件) → AdcFilePath 发布
 // ============================================================================
-// V4L2 buffer 生命周期:
-//   DQBUF → 数据落盘(Logging) + 发布文件路径 → 等待 RSP processing_complete → QBUF
-//   buffer 在 RSP 处理完成前不释放, 确保 RSP 读取期间数据不被覆盖.
+// 内存管理分层:
+//   V4L2 buffer (最多8个/设备): DQBUF → memcpy到DDR → 立即QBUF释放
+//   DDR 队列 (文件/内存槽):     持有数据 → 提供地址给RSP → RSP完成后释放
+//
+// 流程:
+//   1. DQBUF (获取 V4L2 buffer)
+//   2. memcpy 到 DDR 位置 (写入文件) + 发布文件路径给 RSP
+//   3. 立即 QBUF (释放 V4L2 buffer, 不受 RSP 处理速度限制)
+//   4. 等待 /system/processing_complete (RSP 处理完成)
+//   5. 释放 DDR 队列槽位 (文件可被后续帧覆盖/清理)
+//
+// 优势: V4L2 buffer 周转不受 RSP 处理延迟影响, 避免 buffer 耗尽.
 // ============================================================================
 class AdcRxNode : public ft_rx::RxNodeBase<AdcFilePath, AdcRxNode>
 {
@@ -432,7 +441,7 @@ public:
     // ── 使用 ctrx0 的硬件时间戳作为帧时间戳 ──
     uint64_t frame_ts_us = hw_ts0;
 
-    // ── 内置 Logging: 写入文件 (与 RSP 读取并行) ──
+    // ── 内置 Logging: memcpy 到 DDR (写入文件) ──
     std::string file_path;
     uint64_t file_size = 0;
 
@@ -444,9 +453,14 @@ public:
         total_bytes_logged_ += file_size;
       }
     }
-    prof_.checkpoint("file_write");
+    prof_.checkpoint("ddr_write");
 
-    // ── 填充 AdcFilePath 消息 (发布后 RSP 从文件读取) ──
+    // ── 立即释放 V4L2 buffer (不受 RSP 处理速度限制) ──
+    dev0_.enqueue(dev0_.buf_index);
+    dev1_.enqueue(dev1_.buf_index);
+    prof_.checkpoint("v4l2_qbuf");
+
+    // ── 填充 AdcFilePath 消息 (DDR 地址索引) ──
     msg.header.stamp.sec     = static_cast<int32_t>(frame_ts_us / 1000000ULL);
     msg.header.stamp.nanosec = static_cast<uint32_t>((frame_ts_us % 1000000ULL) * 1000ULL);
     msg.header.frame_id      = frame_id_;
@@ -458,20 +472,15 @@ public:
     msg.num_samples_per_chirp = dev0_.width / 4;        // 2048
     msg.file_ready            = !file_path.empty();
 
-    // ── 等待 RSP 处理完成后释放 V4L2 buffer ──
-    // buffer 生命周期: DQBUF → 落盘+发布 → 等待RSP完成 → QBUF
+    // ── 等待 RSP 处理完成 → 释放 DDR 队列槽位 ──
+    // V4L2 buffer 已释放, 此处等待仅控制 DDR 槽位回收节奏
     {
       std::unique_lock<std::mutex> lock(rsp_mutex_);
       rsp_done_ = false;
-      // 消息将由基类发布, RSP 收到后处理并发布 processing_complete
       rsp_cv_.wait_for(lock, std::chrono::milliseconds(rsp_timeout_ms_),
                        [this]() { return rsp_done_; });
     }
     prof_.checkpoint("rsp_wait");
-
-    // 释放 V4L2 buffer (RSP 已完成或超时)
-    dev0_.enqueue(dev0_.buf_index);
-    dev1_.enqueue(dev1_.buf_index);
 
     return true;
   }

@@ -62,6 +62,8 @@ ft_dataset/
 *.cmd
 docs/terminal_outputs
 docs/terminal_record
+docs/Introduction/
+docs/produce/
 output/
 
 src/integration-carkit88c0-gmsl/src/modules/radar/

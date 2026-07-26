@@ -1,228 +1,169 @@
 # ============================================================================
-# FT Radar Framework — 全局参数配置
+# FT Radar Framework V2 — 全局参数配置
 # ============================================================================
-# 所有节点的默认参数集中在此管理。可通过以下方式覆盖:
-#   1. 直接编辑此文件
-#   2. ros2 launch 时传入参数:
-#      ros2 launch ft_radar_launch.py rsp_mode:=cuda log_image:=false
+# V2 架构变更:
+#   - 文件路径发布: ADC/Camera 写入文件后发布路径, DDS 带宽降低 99.99%
+#   - Logging 内置化: 数据采集层 C++ 节点内置 Logging, 无独立 logging_node
+#   - 运行模式: FT_DEBUG_MODE / FT_RUNNING_MODE
+#   - Logging 模式: ADC_MODE / RD_CELL_LIST_MODE / DET_LIST_MODE / IDLE_MODE
+#   - NVMe SSD 双存储: 自动检测 NVMe, 回退 eMMC
+#   - V4L2 硬件时间戳: CLOCK_MONOTONIC, 微秒精度
 #
-# ════════════════════════════════════════════════════════════════════════════
-# 话题频率概览 (Hz)
-# ════════════════════════════════════════════════════════════════════════════
-#   /adc/raw_data                    硬件实际频率  ← adc_rx (轮询模式, 阻塞 V4L2 DQBUF)
-#   /camera/image_raw                硬件实际频率  ← camera_rx (轮询模式, 阻塞 camera.read())
-#   /vehicle/ego_motion              50 Hz (可配置) ← vehicle_data_rx (混合模式: CAN线程+buffer+定时发布)
-#   /processing/radar/det_list       10 Hz  ← rsp_*
-#   /processing/radar/det_list_cuda  10 Hz  ← rsp_cuda (双路模式)
-#   /perception/objects             ~10 Hz  ← object_detection_3d (事件驱动)
-#   /visualization/radar/display     10 Hz  ← rviz_radar (定时合成)
-#   /visualization/radar/boxes       10 Hz  ← rviz_radar + object_detection_3d
-#   /visualization/radar/frame_info  10 Hz  ← rviz_radar
-#   /visualization/camera/display    硬件实际频率  ← rviz_image (事件驱动)
+# 话题频率概览 (Hz):
+#   /adc/file_path                   15 Hz  ← adc_rx (V4L2 硬件帧率)
+#   /camera/file_path                15 Hz  ← camera_rx (V4L2 硬件帧率)
+#   /vehicle/ego_motion              50 Hz  ← vehicle_data_rx (SocketCAN)
+#   /processing/radar/det_list_cuda  15 Hz  ← rsp_cuda (GPU, 66ms 时限)
+#   /perception/objects              15 Hz  ← object_detection_3d
+#   /visualization/radar/display     15 Hz  ← rviz_radar
+#   /visualization/camera/display    15 Hz  ← rviz_image
 #   /visualization/ruler              2 Hz  ← rviz_ruler
+#   /system/monitor                   1 Hz  ← system_monitor
+#   /system/stop_all                 事件   ← rx 节点 (自动停止)
 #
-# ════════════════════════════════════════════════════════════════════════════
-# 时间戳机制
-# ════════════════════════════════════════════════════════════════════════════
-#   SOURCE:  Layer-1 Rx 节点 → get_clock().now() (ROS 系统时间) → header.stamp
-#            C++: this->now()  Python: self.get_clock().now().to_msg()
-#   PASSTHR: Layer-2/3/4 下游节点 → 透传上游 header.stamp，禁止重新生成
-#            仅 Rviz_radar / Rviz_Ruler 使用 get_clock().now() 生成可视化时间戳
-#   LOGGING: Logging 节点 → 从 header.stamp 提取微秒整数 → 文件名 + CSV timestamp_us
+# 时间戳机制:
+#   SOURCE:  V4L2 v4l2_buffer.timestamp / SocketCAN SIOCGSTAMP (CLOCK_MONOTONIC)
+#   PASSTHR: 下游节点透传 header.stamp, 禁止重新生成
+#   UNIT:    微秒 (μs), uint64
 #
 # 作者: zhengyuan.liu
-# 日期: 2026.6.9
+# 日期: 2026-07-26 (V2)
 # ============================================================================
 
 # ====================================================================
 # 系统全局配置
 # ====================================================================
 system:
-  global_timestamp_source: "monotonic"    # 时钟源: monotonic | ptp
-  timestamp_unit: "us"                    # 时间戳单位: 微秒 (μs)
+  operation_mode: "FT_DEBUG_MODE"     # FT_DEBUG_MODE | FT_RUNNING_MODE
+  logging_mode: "ADC_MODE"            # ADC_MODE | RD_CELL_LIST_MODE | DET_LIST_MODE | IDLE_MODE
+  logging_output_dir: ""              # 空=自动检测 NVMe/eMMC
+  global_timestamp_source: "monotonic"
+  timestamp_unit: "us"
+  enable_warmup: true                 # V4L2 warm-up 开关
+  warmup_sec: 5.0                     # warm-up 时长 (秒)
 
 # ====================================================================
-# 节点: ADC Rx — 雷达 ADC 数据接收
+# 节点: ADC Rx — 雷达 ADC 数据采集 (C++, V4L2 双设备)
 # ====================================================================
-# 规格: 16T16R 拆分 2×8T8R (ctrx0 + ctrx1 双文件), 32 MiB/帧
-#   ctrx0: 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB (RX 0-3)
-#   ctrx1: 512 chirps × 2 groups × 4 RX × 2048 samples × 2B = 16 MiB (RX 4-7)
-#   合并:  1024 chirps × 8 RX × 2048 samples × 2B = 32 MiB
+# 规格: 16T16R (ctrx0 + ctrx1), 32 MiB/帧, 15 Hz
+# V2: 文件路径发布 + 内置 ADC Logging + V4L2 硬件时间戳
 adc_rx:
-  fps: 10
-  num_rows: 1024                           # 总 chirp: 512 chirps/group × 2 groups
-  num_chirps_per_row: 8                    # RX 天线数: ctrx0(4) + ctrx1(4) = 8
+  fps: 15
+  num_rows: 1024
+  num_chirps_per_row: 8
   num_samples_per_chirp: 2048
-  bin_file_ctrx0: "/home/zhengyuanliu/Desktop/adc_chamber/ant_0630/range5/5deg/ctrx0_raw.bin"     # 8T8R 半集 0
-  bin_file_ctrx1: "/home/zhengyuanliu/Desktop/adc_chamber/ant_0630/range5/5deg/ctrx1_raw.bin"     # 8T8R 半集 1
-  frame_size_bytes: 33554432               # 1024×8×2048×2 = 32 MiB
-  data_dir: "data"                         # .bin 文件目录 (相对路径基于 CWD)
-  max_preload_files: 30                    # 最多预加载文件数 (~960 MB)
-  use_noise_pool: true                     # 无文件时自动回退到噪声池
-  device_path_ctrx0: "/dev/radar_ctrx0"    # V4L2 设备 ctrx0 (udev 持久化, 4 RX)
-  device_path_ctrx1: "/dev/radar_ctrx1"    # V4L2 设备 ctrx1 (udev 持久化, 4 RX)
-  capture_width: 8192                      # V4L2 帧宽度: 4 RX × 2048 samples (逐像素交错)
-  capture_height: 1024                     # V4L2 帧高度: 512 chirps × 2 groups
+  frame_size_bytes: 33554432          # 32 MiB
+  device_path_ctrx0: "/dev/radar_ctrx0"
+  device_path_ctrx1: "/dev/radar_ctrx1"
+  capture_width: 8192                 # 4 RX × 2048 samples
+  capture_height: 1024                # 512 chirps × 2 groups
+  logging_max_frames: 100             # eMMC 模式最大帧数 (NVMe 无限制)
 
 # ====================================================================
-# 节点: Camera Rx — 相机数据接收
+# 节点: Camera Rx — 相机数据采集 (C++, Raw V4L2 mmap)
 # ====================================================================
-# 规格: 30 Hz, 1920×1080 MJPEG (~100-300 KB/帧, 取决于画面复杂度)
-# 摄像头: Rmoncam A2 1080P USB UVC, /dev/video0
-# 格式: MJPEG (高帧率) | YUYV (低帧率, 5fps@1080p)
-# 注意: `line` 和 `nof_line` 参数当前为占位值，具体格式待确认
+# V2: MJPEG 直接写盘, 无 OpenCV 依赖, VIDIOC_S_PARM 硬件帧率控制
 camera_rx:
-  fps: 30
-  image_width: 1920                        # 图像宽度 (px)
-  image_height: 1080                       # 图像高度 (px)
-  device_path: "/dev/camera_capture"       # V4L2 设备路径 (udev 持久化符号链接)
-  pixel_format: "MJPG"                     # 像素格式: MJPG (30fps@1080p) | YUYV
-  reconnect_interval_frames: 90            # 断线重试间隔 (帧数, 90帧≈3s)
-  line: 0                                  # 待确认，预留接口
-  nof_line: 0                              # 待确认，预留接口
+  fps: 15
+  image_width: 1920
+  image_height: 1080
+  device_path: "/dev/camera_capture"
+  pixel_format: "MJPG"
+  reconnect_interval_frames: 90
 
 # ====================================================================
-# 节点: Vehicle Data Rx — 车辆数据接收
+# 节点: Vehicle Data Rx — 车辆数据采集 (C++, SocketCAN)
 # ====================================================================
-# 规格: 50 Hz，含默认值机制
-# 超时: 超过 timeout_cycles 个周期未收到有效数据，自动切换为默认值
+# V2: 5 报文解析, SIOCGSTAMP 硬件时间戳, 内置 Ego Logging
 vehicle_data_rx:
   fps: 50
-  timeout_cycles: 1                        # 超时周期数 (1周期 = 20ms @ 50Hz)
-  can_interface: "can0"                     # CAN 接口名 (接入总线后启用)
-  ego_data_file: "data/ego_motion.csv"      # ego-motion 假数据文件 (循环读取)
+  timeout_cycles: 1
+  can_interface: "can0"
+  ego_data_file: "data/ego_motion.csv"
   defaults:
-    vx: 0.0                               # 车速 (m/s)
-    yaw_rate: 0.0                         # 偏航角速度 (rad/s)
-    steering_angle: 0.0                   # 转向角度 (rad)
-    ax: 0.0                               # 纵向加速度 (m/s²)
-    ay: 0.0                               # 横向加速度 (m/s²)
-    gear: 1                               # 挡位: 1=D
+    vx: 0.0
+    yaw_rate: 0.0
+    steering_angle: 0.0
+    ax: 0.0
+    ay: 0.0
+    gear: 1
 
 # ====================================================================
-# 节点: RSP — 雷达信号处理（双路径）
+# 节点: RSP CUDA — 雷达信号处理 (Python + GPU)
 # ====================================================================
-# default_mode: python | cuda | both | both_compare
-#   python:        仅启动 Python 版 RSP
-#   cuda:          仅启动 CUDA 版 RSP（默认生产模式）
-#   both:          双路并行，独立输出话题
-#   both_compare:  双路并行 + 自动对比输出差异
+# V2: 订阅 /adc/file_path, 66ms 处理时限, DDR 队列机制
 rsp:
   default_mode: "cuda"
 
-  # -- 信号处理流水线参数 (共享) --
-  # FFT 尺寸
-  range_fft_size: 2048                      # Range FFT 点数
-  doppler_fft_size: 512                     # Doppler FFT 点数 (= chirps_per_tx)
-  angle_fft_size: 64                        # 角度 FFT 点数 (零填充超分辨)
+  # 信号处理参数
+  range_fft_size: 2048
+  doppler_fft_size: 512
+  angle_fft_size: 64
+  range_resolution_m: 0.1465
+  velocity_max_ms: 16.0
 
-  # 物理参数 (77 GHz 汽车雷达典型值, 待实测校准)
-  range_resolution_m: 0.1465                # 距离分辨率 (m), c/(2B)
-  velocity_max_ms: 16.0                     # 最大不模糊速度 (m/s), λ/(4*T_chirp)
-
-  # CFAR 检测参数
-  cfar_threshold_db: 12.0                   # CFAR 检测阈值 (dB)
-  cfar_guard_range: 4                       # Range 维保护单元数
-  cfar_guard_doppler: 4                     # Doppler 维保护单元数
-  cfar_train_range: 8                       # Range 维参考单元数
-  cfar_train_doppler: 8                     # Doppler 维参考单元数
+  # CFAR 参数
+  cfar_threshold_db: 12.0
+  cfar_guard_range: 4
+  cfar_guard_doppler: 4
+  cfar_train_range: 8
+  cfar_train_doppler: 8
 
   # 检测后处理
-  min_snr_db: 10.0                          # 最小 SNR 阈值 (dB)
-  min_range_m: 1.0                          # 最小检测距离 (m), 滤除近场耦合
-  max_range_m: 150.0                        # 最大检测距离 (m)
-  max_detections: 200                       # 每帧最大检测点数
-
-  # Python 版参数
-  python:
-    processing_fps: 10.0                    # 处理帧率 (Hz)
-    snr_threshold: 10.0                     # SNR 阈值 (dB)
-    velocity_scale: 0.5                     # 速度估算缩放因子
+  min_snr_db: 10.0
+  min_range_m: 1.0
+  max_range_m: 150.0
+  max_detections: 200
 
   # CUDA 版参数
   cuda:
-    processing_fps: 10.0                    # 处理帧率 (Hz)
-    snr_threshold: 8.0                      # SNR 阈值 (dB), 更低 = 更高灵敏度
-    velocity_scale: 0.5                     # 速度估算缩放因子
+    processing_fps: 15.0              # V2: 15 Hz (匹配 ADC 帧率)
+    snr_threshold: 8.0
+    velocity_scale: 0.5
 
 # ====================================================================
-# 节点: 3D Object Detection — 3D 目标检测（AI 模拟）
+# 节点: 3D Object Detection (可选)
 # ====================================================================
 object_detection_3d:
-  cluster_distance: 5.0                   # 欧氏聚类距离阈值 (m)
-  min_cluster_size: 3                     # 最小簇点数
-  default_box_height: 2.0                 # 默认目标框高度 (m)
+  cluster_distance: 5.0
+  min_cluster_size: 3
+  default_box_height: 2.0
 
 # ====================================================================
 # 节点: Rviz_Ruler — 标尺参考
 # ====================================================================
 rviz_ruler:
-  publish_hz: 2.0                         # 标尺发布频率 (Hz)
-  ruler_axis: "x"                         # 标尺方向: x | y
-  ruler_offset: -50.0                     # 正交偏移量 (m)
-  ruler_interval: 20.0                    # 标记间隔 (m)
-  ruler_length: 300.0                     # 总长度 (m)
-  ruler_font: 0.8                         # 字体大小
-  ruler_color: [0.8, 0.8, 0.8]           # RGB 颜色 (0~1)
+  publish_hz: 2.0
+  ruler_axis: "x"
+  ruler_offset: -50.0
+  ruler_interval: 20.0
+  ruler_length: 300.0
+  ruler_font: 0.8
+  ruler_color: [0.8, 0.8, 0.8]
 
 # ====================================================================
 # 节点: Rviz_radar — 雷达可视化
 # ====================================================================
 rviz_radar:
-  publish_hz: 10.0                        # 可视化发布频率 (Hz)
-  min_z: -5.0                             # 高度色带下限 (m)
-  max_z: 15.0                             # 高度色带上限 (m)
-  marker_lifetime: 1.0                    # Marker 生命周期 (s)
-  fixed_frame: "radar"                    # RViz 固定坐标系
+  publish_hz: 15.0
+  min_z: -5.0
+  max_z: 15.0
+  marker_lifetime: 1.0
+  fixed_frame: "radar"
 
 # ====================================================================
 # 节点: Rviz_Image — 图像可视化
 # ====================================================================
 rviz_image:
-  show_overlay: true                      # 是否显示叠加信息（帧号、时间戳）
-  fixed_frame: "camera"                   # RViz 固定坐标系
+  show_overlay: true
+  fixed_frame: "camera"
 
 # ====================================================================
-# 节点: Logging — 数据日志记录
+# 节点: System Monitor — 系统监控
 # ====================================================================
-# 5 个独立开关分别控制各数据通道的录制启停。
-# 可通过 `ros2 param set /logging_node <param> <value>` 运行时动态切换。
-#
-# 输出目录结构（仅前向中心雷达）:
-#   <output_dir>/
-#   ├── ego_motion.csv                       # 自车运动，单文件追加
-#   ├── calibration/                         # 标定文件
-#   │   └── radar_front_center_ft.yaml
-#   ├── pc_pcd_radar_front_center/          # 雷达点云 PCD（逐帧）
-#   │   └── <timestamp_us>.pcd
-#   ├── pc_csv_radar_front_center/          # 雷达点云 CSV（逐帧）
-#   │   └── <timestamp_us>.csv
-#   ├── obj_csv_radar/                      # 雷达目标 CSV（逐帧）
-#   │   └── <timestamp_us>.csv
-#   ├── camera_front_center/                # 相机图像（逐帧）
-#   │   └── <timestamp_us>.jpg
-#   └── adc_data/                           # ADC 原始数据（逐帧）
-#       └── <timestamp_us>.bin
-#
-# 帧数上限策略:
-#   ADC:     100 帧 → 约 3.2 GB (100 × 32 MiB)
-#   Image:   1000 帧
-#   Det_List: 1000 帧
-#   Ego_Motion: 1000 帧
-#   Obj_List:  1000 帧
-# 达到上限后循环覆盖（删除最旧文件，保留最新 N 帧）
-logging:
-  output_dir: "/home/zhengyuanliu/Desktop/Orin-ROS/output/ft_dataset"  # 输出根目录（绝对路径，指向外部存储）
-  max_frames:
-    adc: 100                              # ADC 原始数据最大帧数
-    image: 1000                           # 相机图像最大帧数
-    det_list: 1000                        # 雷达检测列表最大帧数
-    ego_motion: 1000                      # 自车运动数据最大帧数
-    obj_list: 1000                        # 3D 目标列表最大帧数
-  switches:
-    enable_adc: true                      # 开关1: ADC 原始数据录制
-    enable_image: true                    # 开关2: 相机图像录制
-    enable_det_list: true                 # 开关3: 雷达检测列表录制
-    enable_ego_motion: true               # 开关4: 自车运动数据录制
-    enable_obj_list: true                 # 开关5: 3D 目标列表录制
-  calibration_file: ""                    # 标定文件路径（空字符串=不加载）
+system_monitor:
+  monitor_hz: 1.0
+  frame_history_size: 100
+  adc_expected_period_ms: 66.0
+  camera_expected_period_ms: 66.0
+  drop_threshold_factor: 1.5

@@ -1,47 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FT 图像 RViz 可视化节点 (Rviz_Image)
+FT 图像 RViz 可视化节点 (Rviz_Image) — V2 架构
 ================================================================================
-接收相机原始图像帧，添加叠加信息后发布。
+V2 变更: 订阅 /camera/file_path (CameraFilePath), 从文件读取 JPEG 图像.
+         消除对 /camera/image_raw (sensor_msgs/Image) 的依赖.
 
 话题:
-  订阅: /camera/image_raw          sensor_msgs/Image
+  订阅: /camera/file_path              ft_radar_msgs/CameraFilePath
   发布: /visualization/camera/display  sensor_msgs/Image
 
-连接关系:
-  ← Camera Rx (sub)
-
 作者: zhengyuan.liu
-日期: 2026.6.8
+日期: 2026-07-26 (V2)
 ================================================================================
 """
 
-# ============================================================================
-# ★ 用户配置区 —— 所有常用参数集中在此，修改后重启节点即可生效
-# ============================================================================
-
-SHOW_OVERLAY = True          # 是否显示叠加信息（帧号、时间戳等）
-FIXED_FRAME  = 'camera'
-
-# ============================================================================
-# 以下为程序实现，一般无需修改
-# ============================================================================
-
 import cv2
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+
+from ft_radar_msgs.msg import CameraFilePath
 
 try:
     from cv_bridge import CvBridge
 except ImportError:
     CvBridge = None
 
+SHOW_OVERLAY = True
+FIXED_FRAME  = 'camera'
+
 
 class RvizImageNode(Node):
-    """图像可视化节点"""
 
     def __init__(self):
         super().__init__('rviz_image')
@@ -57,21 +49,27 @@ class RvizImageNode(Node):
             self.get_logger().error('cv_bridge 未安装，Rviz_Image 无法工作！')
             raise RuntimeError('cv_bridge is required')
 
-        self.sub_video = self.create_subscription(
-            Image, '/camera/image_raw', self._on_video, 10)
+        # V2: 订阅 CameraFilePath (文件路径消息)
+        qos = rclpy.qos.QoSProfile(
+            depth=10, reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(
+            CameraFilePath, '/camera/file_path', self._on_file_path, qos)
         self.pub_display = self.create_publisher(
             Image, '/visualization/camera/display', 10)
 
         self.frame_count = 0
-        self.get_logger().info('Rviz_Image 启动')
+        self.get_logger().info('Rviz_Image V2 启动 (订阅 /camera/file_path)')
 
-    def _on_video(self, msg: Image):
+    def _on_file_path(self, msg: CameraFilePath):
+        if not msg.file_ready or not msg.file_path:
+            return
+
         self.frame_count += 1
 
-        try:
-            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f'图像转换失败: {e}')
+        # 从文件读取 JPEG 图像
+        img = cv2.imread(msg.file_path, cv2.IMREAD_COLOR)
+        if img is None:
+            self.get_logger().warn(f'图像读取失败: {msg.file_path}')
             return
 
         if self.show_overlay:
@@ -80,19 +78,14 @@ class RvizImageNode(Node):
             cv2.rectangle(overlay, (0, 0), (w, 45), (0, 0, 0), -1)
             img = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
 
-            timestamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            ts_us = msg.header.stamp.sec * 1_000_000 + msg.header.stamp.nanosec // 1000
             cv2.putText(
-                img, f'Frame: {self.frame_count} | Time: {timestamp_s:.3f}s',
+                img, f'Frame: {self.frame_count} | TS: {ts_us} us',
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(
-                img, 'Camera View (Rviz_Image)',
-                (w - 320, h - 15), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (200, 200, 200), 1)
 
         display_msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         display_msg.header = msg.header
         self.pub_display.publish(display_msg)
-        self.get_logger().debug(f'Rviz_Image 帧 #{self.frame_count}: 发布显示图像')
 
     def destroy_node(self):
         self.get_logger().info('Rviz_Image 已停止')

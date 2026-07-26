@@ -2,9 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ft_rx_cpp</name>
-  <version>0.1.0</version>
-  <description>C++ rewrite of the three rx data-acquisition nodes (ADC / Camera / Vehicle) —
-    zero-copy-optimised for high-throughput 16 MiB/frame ADC streaming on Jetson Orin.</description>
+  <version>2.0.0</version>
+  <description>V2 C++ data-acquisition nodes (ADC / Camera / Vehicle) —
+    file-path publishing, built-in logging, V4L2 hardware timestamps,
+    SocketCAN, NVMe SSD storage. Zero OpenCV dependency.</description>
   <maintainer email="zhengyuan.liu@example.com">zhengyuan.liu</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,11 +13,8 @@
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
-  <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
-  <depend>cv_bridge</depend>
-  <depend>libopencv-dev</depend>
   <depend>ft_radar_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>

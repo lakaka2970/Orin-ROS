@@ -1,34 +1,24 @@
 #!/bin/bash
 # ============================================================================
-# FT Radar Framework — 一键启动脚本
+# FT Radar Framework V2 — 一键启动脚本
 # ============================================================================
 # 封装环境加载 + 构建检查 + ros2 launch, 一行命令启动整个框架.
 #
-# 用法:
-#   bash scripts/start.sh                 # 默认 cuda 模式 + C++ rx 节点 (real ADC)
-#   bash scripts/start.sh python          # Python RSP 模式
-#   bash scripts/start.sh cuda            # CUDA RSP 模式
-#   bash scripts/start.sh both_compare    # 双路对比模式
-#   bash scripts/start.sh --no-adc        # 不启动 adc_rx, logging 不录 adc.bin
+# V2 用法:
+#   bash scripts/start.sh                 # 默认: FT_DEBUG_MODE + ADC_MODE + CUDA RSP
+#   bash scripts/start.sh --running       # FT_RUNNING_MODE (仅实时处理, 无 Logging)
+#   bash scripts/start.sh --rdcell-mode   # RD_CELL_LIST_MODE Logging
+#   bash scripts/start.sh --det-mode      # DET_LIST_MODE Logging
+#   bash scripts/start.sh --idle          # IDLE_MODE (无 Logging)
+#   bash scripts/start.sh --no-adc        # 不启动 adc_rx 节点
+#   bash scripts/start.sh --rviz          # 同时启动 RViz2
 #
-#   开发管线 (调试/验证雷达硬件, 与 ROS 采集互斥 — 共享 /dev/video0):
+#   开发管线 (调试/验证雷达硬件):
 #   bash scripts/start.sh --capture-only           # 仅采集雷达原始数据
 #   bash scripts/start.sh --capture-only --rsps    # 采集 + RSPS 离线点云可视化
-#   bash scripts/start.sh --capture --rsps         # 采集 + RSPS → 自动启动 ROS 框架
-#
-# 可选参数 (任意顺序):
-#   --analog       使用模拟 ADC 数据源 (噪声池/.bin), 默认 real (硬件设备)
-#   --no-adc       不启动 adc_rx 节点, logging_node 自动关闭 adc.bin 录制
-#   --py-rx        使用 Python 版 rx 节点 (默认 C++)
-#   --rviz         同时启动 RViz2
-#
-#   开发管线 (调试/验证雷达硬件, 与 ROS 框架互斥 — 共享 /dev/video0):
-#   --capture      启动 ROS 框架前先采集雷达原始数据 + 可选 RSPS 处理
-#   --capture-only 仅采集雷达数据 + 可选 RSPS 处理 (不启动 ROS 框架)
-#   --rsps         采集后运行 RSPS 点云可视化处理 (需配合 --capture 或 --capture-only)
 #
 # 作者: zhengyuan.liu
-# 日期: 2026-06-18
+# 日期: 2026-07-26 (V2)
 # ============================================================================
 
 set -e
@@ -44,6 +34,8 @@ NO_ADC=false
 DO_CAPTURE=false
 DO_RSPS=false
 CAPTURE_ONLY=false
+OPERATION_MODE="FT_DEBUG_MODE"
+LOGGING_MODE="ADC_MODE"
 
 for arg in "$@"; do
     case "$arg" in
@@ -55,6 +47,12 @@ for arg in "$@"; do
         --capture) DO_CAPTURE=true ;;
         --capture-only) DO_CAPTURE=true; CAPTURE_ONLY=true ;;
         --rsps)   DO_RSPS=true ;;
+        --running) OPERATION_MODE="FT_RUNNING_MODE" ;;
+        --debug)  OPERATION_MODE="FT_DEBUG_MODE" ;;
+        --adc-mode) LOGGING_MODE="ADC_MODE" ;;
+        --rdcell-mode) LOGGING_MODE="RD_CELL_LIST_MODE" ;;
+        --det-mode) LOGGING_MODE="DET_LIST_MODE" ;;
+        --idle)   LOGGING_MODE="IDLE_MODE" ;;
         *)        echo "未知参数: $arg"; exit 1 ;;
     esac
 done
@@ -202,7 +200,9 @@ fi
 #    adc_rx (C++) → /dev/video0 → ROS2 topics → RSP → det_list
 # ══════════════════════════════════════════════════════════════════════════════
 echo "=============================================="
-echo "  FT Radar Framework 启动"
+echo "  FT Radar Framework V2 启动"
+echo "  运行模式:   $OPERATION_MODE"
+echo "  Logging:    $LOGGING_MODE"
 echo "  RSP 模式:   $RSP_MODE"
 echo "  Rx 实现:    $RX_IMPL"
 echo "  ADC 数据源: $ADC_SOURCE"
@@ -212,17 +212,12 @@ fi
 echo "  RMW:        ${RMW_IMPLEMENTATION:-FastDDS (default)}"
 echo "=============================================="
 
-# 构建 launch 参数
+# 构建 launch 参数 (V2)
 _ft_launch_args=(
-    "rsp_mode:=$RSP_MODE"
-    "rx_impl:=$RX_IMPL"
-    "adc_source:=$ADC_SOURCE"
+    "operation_mode:=$OPERATION_MODE"
+    "logging_mode:=$LOGGING_MODE"
     "no_adc:=$NO_ADC"
 )
-# --no-adc 时自动关闭 logging 的 ADC 录制 (无 adc_rx → 无数据可录)
-if $NO_ADC; then
-    _ft_launch_args+=("log_adc:=false")
-fi
 
 ros2 launch ft_framework ft_radar_launch.py "${_ft_launch_args[@]}" &
 

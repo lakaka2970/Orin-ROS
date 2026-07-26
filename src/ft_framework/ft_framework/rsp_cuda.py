@@ -63,7 +63,7 @@ import torch
 import rclpy
 from rclpy.node import Node
 
-from ft_radar_msgs.msg import AdcRawData, DetList, DetPoint, EgoMotion, RnNciData
+from ft_radar_msgs.msg import AdcFilePath, DetList, DetPoint, EgoMotion
 from ft_framework.common import filter_det_points
 from ft_framework.rsp_processor import create_processor
 from ft_framework.signal_process.config import RadarConfig
@@ -179,23 +179,19 @@ class RspCudaNode(Node):
         _qos = rclpy.qos.QoSProfile(depth=10,
             reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
-            AdcRawData, '/adc/raw_data', self._on_adc, _qos)
+            AdcFilePath, '/adc/file_path', self._on_adc, _qos)
         self.create_subscription(
             EgoMotion, '/vehicle/ego_motion', self._on_ego, _qos)
 
         # ---------- 发布（按模式条件切换话题） ----------
         self._pub_enabled = self.rsp_mode in ('cuda', 'both', 'both_compare')
         if self._pub_enabled:
-            # 单路 CUDA 模式 → 主话题; 双路模式 → CUDA 专属话题
             if self.rsp_mode == 'cuda':
                 topic = '/processing/radar/det_list'
-                nci_topic = '/processing/radar/rn_nci_data'
             else:
                 topic = '/processing/radar/det_list_cuda'
-                nci_topic = '/processing/radar/rn_nci_data_cuda'
             self.pub_det = self.create_publisher(DetList, topic, 10)
-            self.pub_rn_nci = self.create_publisher(RnNciData, nci_topic, 10)
-            self.get_logger().info(f'RSP Cuda 发布: {topic}, {nci_topic}')
+            self.get_logger().info(f'RSP Cuda 发布: {topic}')
         else:
             self.get_logger().info(
                 f'RSP Cuda 已禁用 (rsp_mode={self.rsp_mode})')
@@ -212,8 +208,20 @@ class RspCudaNode(Node):
     # 数据回调
     # ------------------------------------------------------------------
 
-    def _on_adc(self, msg: AdcRawData):
-        self._latest_adc = msg
+    def _on_adc(self, msg: AdcFilePath):
+        """V2: 从文件路径读取 ADC 数据 (替代 32MB DDS 传输)."""
+        if not msg.file_ready or not msg.file_path:
+            return
+        try:
+            with open(msg.file_path, 'rb') as f:
+                # 跳过 20 字节文件头 (magic + version + timestamp + data_size)
+                f.seek(20)
+                adc_bytes = f.read()
+            if len(adc_bytes) > 0:
+                self._latest_adc = adc_bytes
+                self._latest_adc_stamp = msg.header.stamp
+        except (IOError, OSError) as e:
+            self.get_logger().warn(f'ADC 文件读取失败: {msg.file_path}: {e}')
 
     def _on_ego(self, msg: EgoMotion):
         self._latest_ego = msg
@@ -273,9 +281,9 @@ class RspCudaNode(Node):
         self.frame_count += 1
         t0 = time.perf_counter()
 
-        # 透传 ADC 时间戳
-        adc_stamp = self._latest_adc.header.stamp
-        adc_bytes = self._latest_adc.data
+        # V2: 透传 ADC 硬件时间戳 (从 AdcFilePath 消息)
+        adc_stamp = getattr(self, '_latest_adc_stamp', self.get_clock().now().to_msg())
+        adc_bytes = self._latest_adc
 
         # ---- 核心 RSP 处理: 完整流水线 (GPU 加速版) ----
         try:

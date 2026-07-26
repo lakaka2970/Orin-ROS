@@ -6,15 +6,22 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
-# 生成所有自定义消息类型
+# V2 架构消息类型:
+#   - AdcFilePath / CameraFilePath: 文件路径发布模式 (替代 AdcRawData 的 32MB DDS 传输)
+#   - SystemMonitor: 系统监控节点输出
+#   - DetPoint / DetList: 雷达检测结果
+#   - EgoMotion: 自车运动数据
+#   - Object3D / ObjList: 3D 目标检测
+# 已移除: AdcRawData.msg (被 AdcFilePath 替代), RnNciData.msg (未使用)
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/AdcRawData.msg"
+  "msg/AdcFilePath.msg"
+  "msg/CameraFilePath.msg"
+  "msg/SystemMonitor.msg"
   "msg/DetPoint.msg"
   "msg/DetList.msg"
   "msg/Object3D.msg"
   "msg/ObjList.msg"
   "msg/EgoMotion.msg"
-  "msg/RnNciData.msg"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

@@ -172,6 +172,35 @@ V4L2 buffer (≤8个/设备)              DDR 队列 (文件)
 
 ---
 
+## RSP GPU 性能优化（2026-08 更新）
+
+针对 15 Hz 帧时限（66 ms/帧）对 GPU RSP 全链路进行了 **profile 驱动的系统性优化**（验证平台 GTX 1660 Ti，合成 32 MB 帧）：
+
+| 版本 | 单帧总耗时 | 说明 |
+|------|---------:|------|
+| 基线（PyTorch CUDA fp32，15 W 功耗墙锁定） | 139.7 ms | 预处理 72.9 + 多普勒 50.8 + 峰值 6.7 + DOA 8.7 |
+| 代码优化后 | 85.3 ms（−39%） | 删除死代码（时域干扰抑制块 −35 ms）、子带峰值循环向量化（13.1→0.24 ms）、RX NCI「先 sum 后 roll」 |
+| 代码优化 + 解除功耗墙 | **21.5 ms** ✅ | 「首选最高性能」解锁后 SM 时钟 300→1875 MHz，全链路达标且余量充足 |
+
+- **正确性全程不变**：25 峰，4/4 真值目标精确检出；同机 CPU 基线（numpy 串行）1462.5 ms，**加速比 ≈ 68×**。
+- **决定性发现**：验证平台 GPU 被固件锁死在 15 W 功耗墙（满 TDP 的 1/5），SM 恒为 300 MHz（满血的 1/7）。fp16 / CUDA Graph / 连续 FFT 布局 / cupy 半精度 FFT 实测均无收益或负收益——瓶颈是硬件时钟而非代码。
+- 目标平台 Jetson AGX Orin 无功耗锁、SM 满频，同代码预期落在 35–60 ms 理想区间。
+
+> 完整策略变更记录与踩坑清单见 [`signal_process/GPU优化策略变更记录.md`](src/ft_framework/ft_framework/signal_process/GPU优化策略变更记录.md)
+
+**Benchmark 工具集**（`ft_framework/signal_process/`）：
+
+| 脚本 | 用途 |
+|------|------|
+| `profile_hotspots.py` | 微操作级热点计时（加窗/rfft/gather/topk…逐项中位数） |
+| `run_timing_gpu.py` / `run_timing_gpu_opt.py` | 原始 vs 优化版单帧全链路耗时（支持 `--graph` CUDA Graph 对照） |
+| `sustained_bench.py` | 持续负载压测 + 后台采样 nvidia-smi 时钟/功耗 |
+| `bench_reps.py` / `summarize_bench.py` | 多轮重复基准与结果汇总 |
+| `test_fp16_fft.py` / `test_opt_variants.py` | 半精度 FFT 与各优化变体的正确性/收益验证 |
+| `preprocessing_opt.py` / `doppler_opt.py` | 优化后的信号处理实现（数值严格等价） |
+
+---
+
 ## 参数配置
 
 配置文件: [`config/ft_radar_params.yaml`](config/ft_radar_params.yaml)（**最高优先级**）
@@ -275,7 +304,10 @@ Orin-ROS/
 │   │       ├── rviz_ruler.py       # 坐标标尺
 │   │       ├── object_detection_3d.py  # 3D 目标检测 (可选)
 │   │       ├── system_monitor.py   # 系统监控
-│   │       └── signal_process/     # RSP 算法库 (GPU+CPU)
+│   │       └── signal_process/     # RSP 算法库 (GPU+CPU) + GPU 性能优化与基准工具
+│   │           ├── preprocessing_opt.py / doppler_opt.py  # 优化版信号处理
+│   │           ├── profile_hotspots.py / run_timing_gpu*.py / sustained_bench.py  # 基准工具
+│   │           └── GPU优化策略变更记录.md  # 优化策略变更记录（139.7→21.5 ms）
 │   └── integration-carkit88c0-gmsl/  # GMSL 雷达硬件驱动
 └── docs/
     ├── orin_sw_architecture_v2.md  # V2 架构文档 (权威)
@@ -320,3 +352,4 @@ Apache-2.0
 **作者**: zhengyuan.liu
 **创建**: 2026-06-08
 **V2 更新**: 2026-07-26
+**性能优化章节更新**: 2026-08-25
